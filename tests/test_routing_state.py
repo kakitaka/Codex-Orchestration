@@ -80,6 +80,8 @@ def genuine_state(schema: int) -> dict[str, object]:
             "model": "gpt-designer",
             "effort": "high",
         }
+    if schema >= 6:
+        state["preset"] = None
     if schema >= 2:
         managed["mcp"] = {
             "fable-advisor-python3": True,
@@ -93,8 +95,8 @@ def genuine_state(schema: int) -> dict[str, object]:
 
 
 class RoutingStateTests(unittest.TestCase):
-    def test_genuine_schemas_one_through_five_are_accepted(self) -> None:
-        for schema in (1, 2, 3, 4, 5):
+    def test_genuine_schemas_one_through_seven_are_accepted(self) -> None:
+        for schema in (1, 2, 3, 4, 5, 6, 7):
             with self.subTest(schema=schema):
                 state = genuine_state(schema)
                 self.assertIs(STATE.validate_routing_state(state), state)
@@ -115,7 +117,7 @@ class RoutingStateTests(unittest.TestCase):
         self.assertIs(STATE.validate_routing_state(state), state)
 
     def test_full_negative_invariant_matrix_fails_closed(self) -> None:
-        baseline = genuine_state(4)
+        baseline = genuine_state(7)
 
         def schema(value: object):
             return lambda state: state.__setitem__("schema", value)
@@ -124,12 +126,15 @@ class RoutingStateTests(unittest.TestCase):
             return lambda state: state.__setitem__("policy_version", value)
 
         mutations = [
-            *( (f"schema {value!r}", schema(value)) for value in (True, 1.0, "4", None, 0, 6) ),
-            *( (f"policy {value!r}", policy(value)) for value in (True, 4.0, "4", None, 0, 6, 3) ),
+            *( (f"schema {value!r}", schema(value)) for value in (True, 1.0, "7", None, 0, 8) ),
+            *( (f"policy {value!r}", policy(value)) for value in (True, 7.0, "7", None, 0, 8, 3) ),
             ("missing top key", lambda state: state.pop("managed_by")),
             ("extra top key", lambda state: state.__setitem__("future", True)),
             ("wrong owner", lambda state: state.__setitem__("managed_by", "other")),
             ("empty config path", lambda state: state.__setitem__("config_file", "")),
+            ("missing preset", lambda state: state.pop("preset")),
+            ("preset boolean", lambda state: state.__setitem__("preset", True)),
+            ("preset unknown", lambda state: state.__setitem__("preset", "future")),
             ("missing managed key", lambda state: state["managed"].pop("metadata")),
             ("extra managed key", lambda state: state["managed"].update(future=True)),
             ("missing previous key", lambda state: state["previous"].pop("mode")),
@@ -222,6 +227,109 @@ class RoutingStateTests(unittest.TestCase):
         with self.assertRaises(STATE.RoutingStateError):
             STATE.validate_routing_state(legacy)
 
+    def test_schema_six_preset_route_is_sealed(self) -> None:
+        state = genuine_state(6)
+        state["preset"] = STATE.TERRA_LUNA_SOL_ESCALATION_PRESET
+        state["executor"] = {
+            "kind": "model",
+            "model": STATE.TERRA_LUNA_SOL_ESCALATION_EXECUTOR_MODEL,
+            "effort": STATE.TERRA_LUNA_SOL_ESCALATION_EXECUTOR_EFFORT,
+        }
+        state["planner"] = None
+        state["advisor"] = None
+        state["designer"] = None
+        for server in state["managed"].get("mcp", {}):
+            state["managed"]["mcp"][server] = False
+        self.assertIs(STATE.validate_routing_state(state), state)
+
+        mutations = {
+            "wrong executor effort": lambda value: value["executor"].update(
+                effort="high"
+            ),
+            "planner route": lambda value: value.update(
+                planner={"kind": "model", "model": "gpt-planner", "effort": "high"}
+            ),
+            "advisor route": lambda value: value.update(
+                advisor={"kind": "model", "model": "gpt-advisor", "effort": "high"}
+            ),
+            "designer route": lambda value: value.update(
+                designer={"kind": "model", "model": "gpt-designer", "effort": "high"}
+            ),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                invalid = deepcopy(state)
+                mutate(invalid)
+                with self.assertRaises(STATE.RoutingStateError):
+                    STATE.validate_routing_state(invalid)
+
+    def test_schema_seven_preset_subagent_route_is_sealed(self) -> None:
+        state = genuine_state(7)
+        state["preset"] = STATE.TERRA_LUNA_SOL_ESCALATION_PRESET
+        state["executor"] = {
+            "kind": "model",
+            "model": STATE.TERRA_LUNA_SOL_ESCALATION_EXECUTOR_MODEL,
+            "effort": STATE.TERRA_LUNA_SOL_ESCALATION_EXECUTOR_EFFORT,
+        }
+        state["planner"] = None
+        state["advisor"] = None
+        state["designer"] = None
+        for server in state["managed"].get("mcp", {}):
+            state["managed"]["mcp"][server] = False
+        state["managed"]["subagent"] = {
+            "feature_enabled": True,
+            "agents_enabled": True,
+            "model": STATE.TERRA_LUNA_SOL_ESCALATION_EXECUTOR_MODEL,
+            "effort": STATE.TERRA_LUNA_SOL_ESCALATION_EXECUTOR_EFFORT,
+        }
+        state["previous"]["subagent"] = {
+            "feature_enabled": snapshot(False, present=True),
+            "agents_enabled": snapshot(),
+            "model": snapshot(),
+            "effort": snapshot(),
+            "agents_table_was_absent": True,
+        }
+        self.assertIs(STATE.validate_routing_state(state), state)
+
+        mutations = {
+            "missing subagent managed": lambda value: value["managed"].pop(
+                "subagent"
+            ),
+            "missing subagent restore": lambda value: value["previous"].pop(
+                "subagent"
+            ),
+            "wrong feature value": lambda value: value["managed"]["subagent"].update(
+                feature_enabled=False
+            ),
+            "wrong agents value": lambda value: value["managed"]["subagent"].update(
+                agents_enabled=False
+            ),
+            "wrong default model": lambda value: value["managed"]["subagent"].update(
+                model="gpt-5.6-terra"
+            ),
+            "wrong default effort": lambda value: value["managed"]["subagent"].update(
+                effort="high"
+            ),
+            "unknown subagent field": lambda value: value["managed"]["subagent"].update(
+                future=True
+            ),
+            "unknown restore field": lambda value: value["previous"]["subagent"].update(
+                future=True
+            ),
+            "table ownership wrong type": lambda value: value["previous"][
+                "subagent"
+            ].update(agents_table_was_absent=1),
+            "absent table had agent enabled": lambda value: value["previous"][
+                "subagent"
+            ].update(agents_enabled=snapshot(False, present=True)),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                invalid = deepcopy(state)
+                mutate(invalid)
+                with self.assertRaises(STATE.RoutingStateError):
+                    STATE.validate_routing_state(invalid)
+
     def test_reserved_claude_models_cannot_use_generic_model_routes(self) -> None:
         seats_by_schema = {
             1: ("executor", "advisor"),
@@ -229,6 +337,8 @@ class RoutingStateTests(unittest.TestCase):
             3: ("executor", "planner", "advisor"),
             4: ("executor", "planner", "advisor", "designer"),
             5: ("executor", "planner", "advisor", "designer"),
+            6: ("executor", "planner", "advisor", "designer"),
+            7: ("executor", "planner", "advisor", "designer"),
         }
         for schema, seats in seats_by_schema.items():
             for seat in seats:
@@ -294,6 +404,15 @@ class RoutingStateTests(unittest.TestCase):
             legacy = genuine_state(schema)
             legacy["designer"] = None
             scenarios.append((f"schema {schema} designer", legacy))
+        for schema in (1, 2, 3, 4, 5):
+            legacy = genuine_state(schema)
+            legacy["preset"] = None
+            scenarios.append((f"schema {schema} preset", legacy))
+        for schema in (1, 2, 3, 4, 5, 6):
+            legacy = genuine_state(schema)
+            legacy["managed"]["subagent"] = {}
+            legacy["previous"]["subagent"] = {}
+            scenarios.append((f"schema {schema} subagent", legacy))
 
         for label, state in scenarios:
             with self.subTest(label=label), self.assertRaises(STATE.RoutingStateError):
