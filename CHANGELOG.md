@@ -1,6 +1,21 @@
 # Changelog
 
-## 0.9.3 — Unreleased
+## 0.10.0 — Unreleased
+
+- Add the strict `terra-luna-sol-escalation` reusable preset: an expected
+  GPT-5.6 Terra @ Max root, persisted GPT-5.6 Luna @ Max Executor, no
+  persisted Planner, Advisor, or Designer, and a reversible callable Luna
+  default-subagent route.
+- Keep GPT-5.6 Sol @ Max outside normal planning. The saved policy permits one
+  no-history, same-provider, callable-capability-checked escalation only for
+  explicitly enumerated high-risk cases, without model substitution.
+- Preserve native setup, status, repair, disable, restore-state validation,
+  capability probing, provider isolation, and conflict-safe rollback. Schema 7
+  snapshots the stable multi-agent and default-subagent controls, rejects profile
+  boundary crossings until disable, writes no worker or concurrency limit, and
+  preserves any pre-existing limit.
+
+## 0.9.3 — 2026-08-08
 
 - Raise the bounded Advisor approval loop from five to eight reviews while
   preserving immediate approval exit and fail-closed plan, ledger, and

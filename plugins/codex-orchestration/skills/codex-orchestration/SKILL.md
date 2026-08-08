@@ -18,6 +18,7 @@ slash commands. Codex's built-in `/skills` discovery may be used to browse and
 select the installed skill. Support these simple forms:
 
 ```text
+$codex-orchestration:codex-orchestration setup preset: Terra-Luna-Sol Escalation
 $codex-orchestration:codex-orchestration setup executor: GPT-5.6 Luna Extra High
 $codex-orchestration:codex-orchestration setup executor: GPT-5.6 Luna Extra High, advisor: Claude Fable 5 High
 $codex-orchestration:codex-orchestration setup planner: Claude Fable 5 High, advisor: GPT-5.6 Sol High, executor: GPT-5.6 Luna Extra High
@@ -72,6 +73,45 @@ lifecycle and a provider-pinned custom agent.
 Explicit seat labels are authoritative. `planner:` configures only Planner, `advisor:` configures only Advisor, `designer:` configures only Designer, and `executor:` configures only Executor. Never infer or change a seat from a model's historical use, default role, cached description, or provider; in particular, never reinterpret a supplied `planner:` model as an Advisor or a supplied `designer:` model as an Executor. Saved defaults may fill only omitted seats and never override a seat supplied in the current invocation.
 
 The executor is required for setup or a task-local override. It is not required for a custom-role creation request. Planner, advisor, and designer are optional: omitted planner means the current root model plans, omitted advisor means `advisor: none`, and omitted designer means `designer: none`. Do not ask separate planner or advisor questions, or a separate designer question, unless the user asks for help choosing them.
+
+### Terra–Luna–Sol escalation preset
+
+Treat the exact request `setup preset: Terra-Luna-Sol Escalation` as a
+persistent native setup for `--preset terra-luna-sol-escalation`. It is the only
+exception to collecting an executor seat: materialize the exact catalog-validated
+`gpt-5.6-luna` at `max` Executor before setup validation. Do not combine this
+preset with individual seat settings, `status`, `repair`, or `disable`.
+
+The current task model remains the root. Tell the user to start the next task
+with `gpt-5.6-terra` at `max`; describe that selection as expected, not persisted
+or runtime-confirmed. The preset saves Luna @ Max only for child defaults and
+reversibly manages `features.multi_agent = true`, `agents.enabled = true`,
+`agents.default_subagent_model = "gpt-5.6-luna"`, and
+`agents.default_subagent_reasoning_effort = "max"`. Planner, Advisor, and
+Designer are `none`, so ordinary work has no Advisor approval loop, review count,
+or Sol call. For an Executor, call the exposed spawn tool with `fork_turns =
+"none"` but omit direct `model` and `reasoning_effort`; the saved Luna defaults
+resolve the child. Explicit spawn overrides can still supersede defaults, so this
+is not a model allowlist. Report the default as configured and effective only after
+readback; reserve live verification for an actual omitted-override spawn.
+
+The root may call one fresh `gpt-5.6-sol` at `max` Advisor with
+`fork_turns = "none"` only for: security, auth, or secrets; a database schema or
+destructive migration; public API or backward-compatibility risk; a
+cross-subsystem architecture change; repeated implementation or test failures; an
+unresolved root cause; a high-risk release; or an explicit user request. Immediately
+before that escalation, verify same-provider inheritance and the exposed callable
+capability. If either check fails, report Sol unavailable and do not substitute a
+model. Sol is not a persistent Advisor, a normal planning gate, an executor, or an
+access-control boundary.
+
+The preset imposes no worker or concurrency limit. Preserve any existing
+user/platform limit and never create, remove, or rewrite a limit as part of this
+preset. Preserve the ordinary setup, status, repair, disable, rollback,
+provider-isolation, capability-probing, restore-state, and secret-handling
+contracts. Profile boundary crossings are never in-place: before changing from
+ordinary setup to this preset, from this preset to ordinary setup, or from an old
+preset state, require `disable --apply`, then one fresh setup.
 
 For both persistent setup and task-local overrides, reject an identical Planner and Advisor route: the same direct model ID, the same custom-agent name, or more than one bundled Claude subscription seat across Fable 5 and Opus 5. Independent critique is required.
 
@@ -360,6 +400,26 @@ python3 <skill-dir>/scripts/configure_native_routing.py \
   --apply
 ```
 
+For the Terra–Luna–Sol escalation preset, preview and apply without individual
+seat flags:
+
+```bash
+python3 <skill-dir>/scripts/configure_native_routing.py \
+  --codex-bin <active-codex-binary> \
+  --preset terra-luna-sol-escalation
+
+python3 <skill-dir>/scripts/configure_native_routing.py \
+  --codex-bin <active-codex-binary> \
+  --preset terra-luna-sol-escalation \
+  --apply
+```
+
+The configurator verifies the exact Luna @ Max catalog capability and the active
+and compatibility clients' parsing of the four callable-subagent controls before
+policy persistence. It does not infer Terra's future root selection and it does not
+probe or persist Sol until a qualifying root-directed escalation is needed. A
+profile parser failure never falls back through `--allow-incompatible-client`.
+
 Add `--advisor-model` and `--advisor-effort` for a same-provider Codex advisor. For Claude Fable 5, use `--advisor-fable`; add `--advisor-effort low|medium|high|xhigh|max` when the user chooses one. Omitting Fable effort defaults to `high`, while user-facing `ultra` is normalized to Claude Code's `max`. The configurator verifies that the installed Claude Code CLI advertises the selected effective effort. It also requires Claude Code to be logged in through a first-party Pro, Max, or Team account, chooses an available Python 3.11+ MCP launcher, and performs only an auth/capability check during setup. It never extracts a token, writes a credential, or makes a model call during setup or status. Omission persists `advisor: none`.
 
 For Claude Opus 5 Advisor, use `--advisor-opus` with an optional exact
@@ -388,9 +448,15 @@ Do not add `enabled = true` for a Sol or Terra root. Their current model metadat
 - `features.multi_agent_v2.multi_agent_mode_hint_text`;
 - `features.multi_agent_v2.usage_hint_text`.
 
+That rule concerns the legacy `features.multi_agent_v2.enabled` root flag. The
+Terra–Luna–Sol escalation preset is a narrow exception that reversibly manages the
+stable `features.multi_agent` and `[agents]` callable-subagent controls listed
+above. It never writes `agents.max_concurrent_threads_per_session` or
+`agents.max_threads`.
+
 When Claude Fable 5 or Claude Opus 5 is selected, it additionally manages only the plugin-scoped `enabled` override for the chosen bundled MCP launcher and any launcher variant already overridden by the user. The historical `fable-advisor-*` launcher IDs are retained as compatibility identifiers for both sealed models. All bundled variants are disabled by default. The original override values are stored and restored by `disable`. Codex's TOML editor may retain an inert empty table header after deleting the last override; never rewrite the file merely to remove that cosmetic header.
 
-It uses Codex App Server's `config/read` and `config/batchWrite` APIs, not a home-grown TOML rewrite. It preserves unrelated settings and comments, validates the whole effective config, and uses the user-layer version to detect races. Restore snapshots cover the four routing fields plus the narrowly scoped MCP overrides only when either bundled Claude model is selected; the namespaced state also records schema/version markers, config path, selected seats, and scalar-conversion metadata when needed. If the user explicitly replaces existing hint text, the exact prior text is stored for restoration; warn them never to place credentials in routing hints.
+It uses Codex App Server's `config/read` and `config/batchWrite` APIs, not a home-grown TOML rewrite. It preserves unrelated settings and comments, validates the whole effective config, and uses the user-layer version to detect races. Restore snapshots cover the four routing fields plus the narrowly scoped MCP overrides only when either bundled Claude model is selected. The Luna preset additionally snapshots the stable multi-agent flag and exact `[agents]` leaves; if it created an absent table, disable removes only that verified profile-owned table. The namespaced state also records schema/version markers, config path, selected seats, and scalar-conversion metadata when needed. If the user explicitly replaces existing hint text, the exact prior text is stored for restoration; warn them never to place credentials in routing hints.
 
 If a user-authored mode or usage hint already exists, do not replace it automatically. Show the conflict. Use `--replace-existing-policy` only after the user explicitly approves replacing and later restoring those exact values.
 

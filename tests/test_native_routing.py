@@ -63,6 +63,7 @@ mutate_after_write = home / ".fake-mutate-after-write"
 mutate_namespace_after_write = home / ".fake-mutate-namespace-after-write"
 mutate_feature_after_write = home / ".fake-mutate-feature-after-write"
 mutate_state_after_write = home / ".fake-mutate-state-after-write"
+mutate_disable_restore = home / ".fake-mutate-disable-restore"
 ok_overridden = home / ".fake-ok-overridden"
 overridden_returned = home / ".fake-overridden-returned"
 fail_overridden_rollback = home / ".fake-fail-overridden-rollback"
@@ -223,6 +224,17 @@ for line in sys.stdin:
                 9,
             )
             mutate_feature_after_write.unlink()
+        if mutate_disable_restore.exists() and any(
+            edit.get("keyPath") == "features.multi_agent_v2.multi_agent_mode_hint_text"
+            and edit.get("value") is None
+            for edit in params["edits"]
+        ):
+            set_path(
+                config,
+                "features.multi_agent_v2.tool_namespace",
+                "collaboration",
+            )
+            mutate_disable_restore.unlink()
         store.write_text(json.dumps(config, sort_keys=True), encoding="utf-8")
         if mutate_state_after_write.exists():
             state_path = home / ".codex-orchestration-routing.json"
@@ -291,6 +303,19 @@ class NativeRoutingTests(unittest.TestCase):
         _, self.codex = _write_test_cli(self.root, "fake-codex", FAKE_CODEX)
         self.bin = self.root / "bin"
         self.bin.mkdir()
+        # Keep launcher selection deterministic on Windows, where a discovered
+        # WindowsApps python3 alias can be present but cannot answer --version.
+        _write_test_cli(
+            self.bin,
+            "python3",
+            """\
+            import sys
+            if sys.argv[1:] == ["--version"]:
+                print("Python 3.12.0")
+                raise SystemExit(0)
+            raise SystemExit(2)
+            """,
+        )
         self.claude, _ = _write_test_cli(
             self.bin,
             "claude",
@@ -524,6 +549,543 @@ class NativeRoutingTests(unittest.TestCase):
         ):
             self.assertNotIn(hard_coded, mode)
 
+    def test_terra_luna_sol_preset_policy_is_escalation_only(self) -> None:
+        executor = {
+            "kind": "model",
+            "model": NATIVE.TERRA_LUNA_SOL_ESCALATION_EXECUTOR_MODEL,
+            "effort": NATIVE.TERRA_LUNA_SOL_ESCALATION_EXECUTOR_EFFORT,
+        }
+        mode, usage = NATIVE.build_policy(
+            executor,
+            None,
+            None,
+            None,
+            preset=NATIVE.TERRA_LUNA_SOL_ESCALATION_PRESET,
+        )
+
+        self.assertIn("expects gpt-5.6-terra@max", mode)
+        self.assertIn("not runtime verification", mode)
+        self.assertIn("no Advisor approval loop", mode)
+        self.assertIn("must not invoke gpt-5.6-sol", mode)
+        self.assertIn("public API or backward-compatibility risk", mode)
+        self.assertIn("no worker or concurrency limit", mode)
+        self.assertNotIn("fresh self-contained review call", mode)
+        self.assertNotIn("PLAN_REVISE", mode)
+        self.assertIn('model = "gpt-5.6-sol"', usage)
+        self.assertIn('reasoning_effort = "max"', usage)
+        self.assertIn("Immediately before that call", usage)
+        self.assertIn("never substitute another model", usage)
+        self.assertNotIn("For an advisor review", usage)
+        self.assertIn("omit model and reasoning_effort", usage)
+        self.assertNotIn('model = "gpt-5.6-luna"', usage)
+
+    def test_preset_setup_status_and_disable_preserve_concurrency(self) -> None:
+        preview = self.run_script("--preset", NATIVE.TERRA_LUNA_SOL_ESCALATION_PRESET)
+        self.assertIn("Preset: terra-luna-sol-escalation", preview.stdout)
+        self.assertIn("setup does not verify it", preview.stdout)
+        self.assertIn("no preset-imposed limit", preview.stdout)
+        self.assertIn("Dry run only", preview.stdout)
+        self.assertFalse((self.home / ".fake-user-config.json").exists())
+
+        applied = self.run_script(
+            "--preset", NATIVE.TERRA_LUNA_SOL_ESCALATION_PRESET, "--apply"
+        )
+        self.assertIn("Native routing preset installed", applied.stdout)
+        state_path = self.home / NATIVE.STATE_FILENAME
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(state["schema"], 7)
+        self.assertEqual(state["policy_version"], 7)
+        self.assertEqual(state["preset"], NATIVE.TERRA_LUNA_SOL_ESCALATION_PRESET)
+        self.assertEqual(
+            state["executor"],
+            {
+                "kind": "model",
+                "model": "gpt-5.6-luna",
+                "effort": "max",
+            },
+        )
+        self.assertIsNone(state["planner"])
+        self.assertIsNone(state["advisor"])
+        self.assertIsNone(state["designer"])
+        self.assertEqual(
+            state["managed"]["subagent"],
+            {
+                "feature_enabled": True,
+                "agents_enabled": True,
+                "model": "gpt-5.6-luna",
+                "effort": "max",
+            },
+        )
+        self.assertTrue(state["previous"]["subagent"]["agents_table_was_absent"])
+        applied_config = self.read_fake_config()
+        self.assertTrue(applied_config["features"]["multi_agent"])
+        self.assertEqual(
+            applied_config["agents"],
+            {
+                "enabled": True,
+                "default_subagent_model": "gpt-5.6-luna",
+                "default_subagent_reasoning_effort": "max",
+            },
+        )
+        self.assertEqual(
+            applied_config["features"]["multi_agent_v2"]
+            ["max_concurrent_threads_per_session"],
+            5,
+        )
+
+        status = self.run_script("--status", "--require-effective")
+        self.assertIn("installed and effective", status.stdout)
+        self.assertIn("Preset: terra-luna-sol-escalation", status.stdout)
+        self.assertIn("Advisor: none", status.stdout)
+        self.assertIn("not a saved Advisor seat or a verified route", status.stdout)
+        self.assertIn("Luna default subagent route", status.stdout)
+        self.assertIn("live spawn not yet verified", status.stdout)
+        self.assertIn("max_concurrent_threads_per_session is 5", status.stdout)
+
+        self.run_script("--disable", "--apply")
+        self.assertEqual(
+            self.read_fake_config()["features"]["multi_agent_v2"],
+            {"max_concurrent_threads_per_session": 5},
+        )
+        self.assertNotIn("multi_agent", self.read_fake_config()["features"])
+        self.assertNotIn("agents", self.read_fake_config())
+        self.assertFalse(state_path.exists())
+
+    def test_schema_six_preset_remains_disableable_without_luna_defaults(self) -> None:
+        self.run_script(
+            "--preset", NATIVE.TERRA_LUNA_SOL_ESCALATION_PRESET, "--apply"
+        )
+        state_path = self.home / NATIVE.STATE_FILENAME
+        legacy_state = json.loads(state_path.read_text(encoding="utf-8"))
+        legacy_state["schema"] = 6
+        legacy_state["policy_version"] = 6
+        legacy_state["managed"].pop("subagent")
+        legacy_state["previous"].pop("subagent")
+        state_path.write_text(json.dumps(legacy_state), encoding="utf-8")
+        historical_config = self.read_fake_config()
+        historical_config["features"].pop("multi_agent")
+        historical_config.pop("agents")
+        (self.home / ".fake-user-config.json").write_text(
+            json.dumps(historical_config), encoding="utf-8"
+        )
+
+        status = self.run_script("--status", "--require-effective", check=False)
+        self.assertEqual(status.returncode, 1)
+        self.assertIn("legacy preset requires disable and fresh setup", status.stdout)
+        self.assertIn("Luna default subagent route: unavailable", status.stdout)
+
+        disabled = self.run_script("--disable", "--apply")
+        self.assertIn("Native routing disabled", disabled.stdout)
+        self.assertEqual(
+            self.read_fake_config()["features"]["multi_agent_v2"],
+            {"max_concurrent_threads_per_session": 5},
+        )
+        self.assertFalse(state_path.exists())
+
+    def test_preset_conflicts_fail_before_binary_or_config_access(self) -> None:
+        missing_binary = self.root / "missing-codex"
+        result = self.run_script(
+            "--preset",
+            NATIVE.TERRA_LUNA_SOL_ESCALATION_PRESET,
+            "--executor-model",
+            "gpt-5.6-luna",
+            "--executor-effort",
+            "max",
+            "--codex-bin",
+            str(missing_binary),
+            check=False,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--preset cannot be combined", result.stderr)
+        self.assertNotIn("Codex binary does not exist", result.stderr)
+        self.assertFalse((self.home / ".fake-user-config.json").exists())
+        self.assertFalse((self.home / NATIVE.STATE_FILENAME).exists())
+
+    def test_preset_requires_luna_capability_and_never_becomes_effective(self) -> None:
+        no_luna_source = FAKE_CODEX.replace(
+            '"gpt-5.6-luna"', '"gpt-5.6-luna-unavailable"'
+        )
+        _, no_luna = _write_test_cli(self.root, "fake-codex-no-luna", no_luna_source)
+        result = self.run_script(
+            "--preset",
+            NATIVE.TERRA_LUNA_SOL_ESCALATION_PRESET,
+            "--codex-bin",
+            str(no_luna),
+            check=False,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("gpt-5.6-luna", result.stderr)
+        self.assertFalse((self.home / NATIVE.STATE_FILENAME).exists())
+        self.assertFalse((self.home / ".fake-user-config.json").exists())
+
+        no_max_source = FAKE_CODEX.replace(
+            'for value in ("low", "medium", "high", "xhigh", "max")',
+            'for value in ("low", "medium", "high", "xhigh")',
+        )
+        _, no_max = _write_test_cli(self.root, "fake-codex-no-luna-max", no_max_source)
+        max_result = self.run_script(
+            "--preset",
+            NATIVE.TERRA_LUNA_SOL_ESCALATION_PRESET,
+            "--codex-bin",
+            str(no_max),
+            check=False,
+        )
+        self.assertEqual(max_result.returncode, 2)
+        self.assertIn("max", max_result.stderr)
+        self.assertFalse((self.home / NATIVE.STATE_FILENAME).exists())
+        self.assertFalse((self.home / ".fake-user-config.json").exists())
+
+        missing_effort_source = FAKE_CODEX.replace(
+            '"supportedReasoningEfforts"', '"omittedReasoningEfforts"'
+        )
+        _, missing_effort = _write_test_cli(
+            self.root,
+            "fake-codex-no-reasoning-catalog",
+            missing_effort_source,
+        )
+        catalog_result = self.run_script(
+            "--preset",
+            NATIVE.TERRA_LUNA_SOL_ESCALATION_PRESET,
+            "--codex-bin",
+            str(missing_effort),
+            check=False,
+        )
+        self.assertEqual(catalog_result.returncode, 2)
+        self.assertIn("did not publish a usable reasoning-effort catalog", catalog_result.stderr)
+        self.assertFalse((self.home / NATIVE.STATE_FILENAME).exists())
+        self.assertFalse((self.home / ".fake-user-config.json").exists())
+
+        status = self.run_script("--status", "--require-effective", check=False)
+        self.assertEqual(status.returncode, 1)
+        self.assertIn("Native policy: inactive", status.stdout)
+
+    def test_preset_parser_and_control_shape_fail_before_any_write(self) -> None:
+        unsupported_source = FAKE_CODEX.replace(
+            'if "features" in sys.argv and "list" in sys.argv:',
+            """if any("default_subagent_model" in value for value in sys.argv):
+    print("unknown default_subagent_model", file=sys.stderr)
+    raise SystemExit(1)
+
+if "features" in sys.argv and "list" in sys.argv:""",
+        )
+        _, unsupported = _write_test_cli(
+            self.root,
+            "fake-codex-no-luna-defaults",
+            unsupported_source,
+        )
+        parser = self.run_script(
+            "--preset",
+            NATIVE.TERRA_LUNA_SOL_ESCALATION_PRESET,
+            "--codex-bin",
+            str(unsupported),
+            check=False,
+        )
+        self.assertEqual(parser.returncode, 2)
+        self.assertIn("Luna default-subagent profile", parser.stderr)
+        self.assertFalse((self.home / ".fake-user-config.json").exists())
+        self.assertFalse((self.home / NATIVE.STATE_FILENAME).exists())
+
+        malformed = {
+            "features": {"multi_agent_v2": {"max_concurrent_threads_per_session": 5}},
+            "agents": False,
+            "unrelated": {"keep": True},
+        }
+        (self.home / ".fake-user-config.json").write_text(
+            json.dumps(malformed), encoding="utf-8"
+        )
+        shape = self.run_script(
+            "--preset",
+            NATIVE.TERRA_LUNA_SOL_ESCALATION_PRESET,
+            check=False,
+        )
+        self.assertEqual(shape.returncode, 2)
+        self.assertIn("[agents] setting is not a table", shape.stderr)
+        self.assertEqual(self.read_fake_config(), malformed)
+        self.assertFalse((self.home / NATIVE.STATE_FILENAME).exists())
+
+    def test_preset_restores_enabled_and_existing_agents_table(self) -> None:
+        initial = {
+            "features": {
+                "multi_agent": False,
+                "multi_agent_v2": {"max_concurrent_threads_per_session": 9},
+            },
+            "agents": {
+                "enabled": False,
+                "default_subagent_model": "gpt-5.6-terra",
+                "default_subagent_reasoning_effort": "high",
+                "max_threads": 11,
+                "custom_reviewer": {"description": "preserve"},
+            },
+            "unrelated": {"keep": True},
+        }
+        (self.home / ".fake-user-config.json").write_text(
+            json.dumps(initial), encoding="utf-8"
+        )
+
+        self.run_script(
+            "--preset", NATIVE.TERRA_LUNA_SOL_ESCALATION_PRESET, "--apply"
+        )
+        state_path = self.home / NATIVE.STATE_FILENAME
+        first = json.loads(state_path.read_text(encoding="utf-8"))
+        previous_subagent = first["previous"]["subagent"]
+        configured = self.read_fake_config()
+        self.assertTrue(configured["features"]["multi_agent"])
+        self.assertTrue(configured["agents"]["enabled"])
+        self.assertEqual(configured["agents"]["default_subagent_model"], "gpt-5.6-luna")
+        self.assertEqual(
+            configured["agents"]["default_subagent_reasoning_effort"], "max"
+        )
+        self.assertEqual(
+            configured["agents"]["custom_reviewer"], {"description": "preserve"}
+        )
+        self.assertEqual(configured["agents"]["max_threads"], 11)
+        self.assertEqual(
+            configured["features"]["multi_agent_v2"]
+            ["max_concurrent_threads_per_session"],
+            9,
+        )
+
+        self.run_script(
+            "--preset", NATIVE.TERRA_LUNA_SOL_ESCALATION_PRESET, "--apply"
+        )
+        repeated = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(repeated["previous"]["subagent"], previous_subagent)
+
+        self.run_script("--disable", "--apply")
+        self.assertEqual(self.read_fake_config(), initial)
+        self.assertFalse(state_path.exists())
+
+    def test_preset_control_drift_and_boundary_transitions_fail_closed(self) -> None:
+        self.run_script("--executor-model", "gpt-5.6-luna", "--apply")
+        generic_state = (self.home / NATIVE.STATE_FILENAME).read_bytes()
+        generic_config = self.read_fake_config()
+        crossing = self.run_script(
+            "--preset",
+            NATIVE.TERRA_LUNA_SOL_ESCALATION_PRESET,
+            "--apply",
+            check=False,
+        )
+        self.assertEqual(crossing.returncode, 2)
+        self.assertIn("preset boundary", crossing.stderr)
+        self.assertEqual(self.read_fake_config(), generic_config)
+        self.assertEqual((self.home / NATIVE.STATE_FILENAME).read_bytes(), generic_state)
+
+        self.run_script("--disable", "--apply")
+        self.run_script(
+            "--preset", NATIVE.TERRA_LUNA_SOL_ESCALATION_PRESET, "--apply"
+        )
+        profile_state = (self.home / NATIVE.STATE_FILENAME).read_bytes()
+        profile_config = self.read_fake_config()
+        reverse = self.run_script(
+            "--executor-model", "gpt-5.6-terra", "--apply", check=False
+        )
+        self.assertEqual(reverse.returncode, 2)
+        self.assertIn("preset boundary", reverse.stderr)
+        self.assertEqual(self.read_fake_config(), profile_config)
+        self.assertEqual((self.home / NATIVE.STATE_FILENAME).read_bytes(), profile_state)
+
+        drifted = self.read_fake_config()
+        drifted["agents"]["enabled"] = False
+        (self.home / ".fake-user-config.json").write_text(
+            json.dumps(drifted), encoding="utf-8"
+        )
+        repair = self.run_script("--repair", "--apply", check=False)
+        self.assertEqual(repair.returncode, 2)
+        self.assertIn("Luna subagent setting", repair.stderr)
+        disable = self.run_script("--disable", "--apply", check=False)
+        self.assertEqual(disable.returncode, 2)
+        self.assertIn("Managed routing fields were edited", disable.stderr)
+        self.assertEqual(self.read_fake_config(), drifted)
+        self.assertEqual((self.home / NATIVE.STATE_FILENAME).read_bytes(), profile_state)
+
+    def test_disable_retains_state_when_any_owned_restore_value_drifts(self) -> None:
+        self.run_script(
+            "--preset", NATIVE.TERRA_LUNA_SOL_ESCALATION_PRESET, "--apply"
+        )
+        state_path = self.home / NATIVE.STATE_FILENAME
+        saved_state = state_path.read_bytes()
+        (self.home / ".fake-mutate-disable-restore").touch()
+
+        disabled = self.run_script("--disable", "--apply", check=False)
+        self.assertEqual(disabled.returncode, 2)
+        self.assertIn("owned restore values could not be verified", disabled.stderr)
+        self.assertEqual(state_path.read_bytes(), saved_state)
+        self.assertEqual(
+            self.read_fake_config()["features"]["multi_agent_v2"]["tool_namespace"],
+            "collaboration",
+        )
+
+    def test_preset_effective_failure_restores_config_and_removes_new_state(self) -> None:
+        initial = {
+            "features": {
+                "multi_agent": False,
+                "multi_agent_v2": {"max_concurrent_threads_per_session": 5},
+            },
+            "agents": {"enabled": False, "custom": {"keep": True}},
+            "unrelated": {"keep": True},
+        }
+        (self.home / ".fake-user-config.json").write_text(
+            json.dumps(initial), encoding="utf-8"
+        )
+        (self.home / ".fake-effective-config.json").write_text(
+            json.dumps(initial), encoding="utf-8"
+        )
+        failed = self.run_script(
+            "--preset",
+            NATIVE.TERRA_LUNA_SOL_ESCALATION_PRESET,
+            "--apply",
+            check=False,
+        )
+        self.assertEqual(failed.returncode, 2)
+        self.assertIn("prior config and restore state were reinstated", failed.stderr)
+        self.assertEqual(self.read_fake_config(), initial)
+        self.assertFalse((self.home / NATIVE.STATE_FILENAME).exists())
+
+    def test_setup_readback_failure_restores_config_and_prior_state(self) -> None:
+        def run_with_readback_failure(arguments: list[str]) -> tuple[int, str]:
+            real_request = NATIVE.AppServer.request
+            reads = 0
+
+            def request(
+                app: object, method: str, params: dict[str, object]
+            ) -> dict[str, object]:
+                nonlocal reads
+                if method == "config/read":
+                    reads += 1
+                    if reads == 2:
+                        raise NATIVE.ConfigurationError("forced readback failure")
+                return real_request(app, method, params)
+
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(sys, "argv", arguments),
+                mock.patch.object(NATIVE.AppServer, "request", new=request),
+                mock.patch.object(sys, "stderr", stderr),
+            ):
+                return NATIVE.main(), stderr.getvalue()
+
+        initial = {
+            "features": {"multi_agent_v2": {"max_concurrent_threads_per_session": 5}},
+            "unrelated": {"keep": True},
+        }
+        profile_arguments = [
+            str(SCRIPT),
+            "--codex-bin",
+            str(self.codex),
+            "--codex-home",
+            str(self.home),
+            "--preset",
+            NATIVE.TERRA_LUNA_SOL_ESCALATION_PRESET,
+            "--apply",
+        ]
+        result, stderr = run_with_readback_failure(profile_arguments)
+        self.assertEqual(result, 2)
+        self.assertIn("configuration readback failed", stderr)
+        self.assertIn("prior config and restore state were reinstated", stderr)
+        self.assertEqual(self.read_fake_config(), initial)
+        state_path = self.home / NATIVE.STATE_FILENAME
+        self.assertFalse(state_path.exists())
+
+        self.run_script(
+            "--executor-model",
+            "gpt-5.6-luna",
+            "--executor-effort",
+            "high",
+            "--apply",
+        )
+        previous_config = self.read_fake_config()
+        previous_state = state_path.read_bytes()
+        update_arguments = [
+            str(SCRIPT),
+            "--codex-bin",
+            str(self.codex),
+            "--codex-home",
+            str(self.home),
+            "--executor-model",
+            "gpt-5.6-terra",
+            "--executor-effort",
+            "high",
+            "--apply",
+        ]
+        result, stderr = run_with_readback_failure(update_arguments)
+        self.assertEqual(result, 2)
+        self.assertIn("configuration readback failed", stderr)
+        self.assertEqual(self.read_fake_config(), previous_config)
+        self.assertEqual(state_path.read_bytes(), previous_state)
+
+    def test_preset_repair_and_effective_rollback_preserve_state(self) -> None:
+        self.run_script(
+            "--preset", NATIVE.TERRA_LUNA_SOL_ESCALATION_PRESET, "--apply"
+        )
+        state_path = self.home / NATIVE.STATE_FILENAME
+        saved_state = state_path.read_bytes()
+        config = self.read_fake_config()
+        feature = config["features"]["multi_agent_v2"]
+        feature["multi_agent_mode_hint_text"] = (
+            f"{NATIVE.MANAGED_MARKER}\nchanged profile mode"
+        )
+        feature["usage_hint_text"] = (
+            f"{NATIVE.MANAGED_MARKER}\nchanged profile usage"
+        )
+        (self.home / ".fake-user-config.json").write_text(
+            json.dumps(config), encoding="utf-8"
+        )
+
+        repaired = self.run_script("--repair", "--apply")
+        self.assertIn("Native routing policy repaired", repaired.stdout)
+        restored = self.read_fake_config()
+        saved = json.loads(saved_state)
+        self.assertEqual(
+            restored["features"]["multi_agent_v2"]["multi_agent_mode_hint_text"],
+            saved["managed"]["mode"],
+        )
+        self.assertEqual(
+            restored["features"]["multi_agent_v2"]["usage_hint_text"],
+            saved["managed"]["usage"],
+        )
+        self.assertEqual(
+            restored["features"]["multi_agent_v2"]
+            ["max_concurrent_threads_per_session"],
+            5,
+        )
+        self.assertEqual(state_path.read_bytes(), saved_state)
+
+        stale_effective = {
+            "features": {"multi_agent_v2": {"max_concurrent_threads_per_session": 5}},
+            "unrelated": {"keep": True},
+        }
+        (self.home / ".fake-effective-config.json").write_text(
+            json.dumps(stale_effective), encoding="utf-8"
+        )
+        rolled_back = self.run_script(
+            "--preset", NATIVE.TERRA_LUNA_SOL_ESCALATION_PRESET, "--apply", check=False
+        )
+        self.assertEqual(rolled_back.returncode, 2)
+        self.assertIn("prior config and restore state were reinstated", rolled_back.stderr)
+        self.assertEqual(self.read_fake_config(), restored)
+        self.assertEqual(state_path.read_bytes(), saved_state)
+
+    def test_preset_tampered_or_missing_state_fails_closed_without_writes(self) -> None:
+        self.run_script(
+            "--preset", NATIVE.TERRA_LUNA_SOL_ESCALATION_PRESET, "--apply"
+        )
+        state_path = self.home / NATIVE.STATE_FILENAME
+        config = self.read_fake_config()
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["preset"] = "forged"
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+
+        tampered = self.run_script("--repair", "--apply", check=False)
+        self.assertEqual(tampered.returncode, 2)
+        self.assertIn("Saved routing state is invalid", tampered.stderr)
+        self.assertEqual(self.read_fake_config(), config)
+
+        state_path.unlink()
+        missing = self.run_script("--repair", "--apply", check=False)
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("requires valid saved plugin state", missing.stderr)
+        self.assertEqual(self.read_fake_config(), config)
+
     def test_policy_root_fallback_planner_without_advisor_and_fable_hints(self) -> None:
         executor = {"kind": "model", "model": "gpt-5.6-luna", "effort": "high"}
         advisor = {"kind": "model", "model": "gpt-5.6-terra", "effort": "high"}
@@ -687,6 +1249,23 @@ class NativeRoutingTests(unittest.TestCase):
         )
         self.assertTrue(any("usage_hint_text" in value for value in argv))
 
+    def test_preset_capability_probe_checks_callable_luna_defaults(self) -> None:
+        completed = subprocess.CompletedProcess([], 0, stdout="supported")
+        with mock.patch.object(NATIVE.subprocess, "run", return_value=completed) as run:
+            supported, _ = NATIVE.supports_native_policy(
+                self.codex,
+                require_luna_subagent_defaults=True,
+            )
+        self.assertTrue(supported)
+        argv = run.call_args.args[0]
+        self.assertIn("features.multi_agent=true", argv)
+        self.assertIn("agents.enabled=true", argv)
+        self.assertIn('agents.default_subagent_model="gpt-5.6-luna"', argv)
+        self.assertIn(
+            'agents.default_subagent_reasoning_effort="max"',
+            argv,
+        )
+
     def test_setup_status_and_disable_round_trip(self) -> None:
         preview = self.run_script(
             "--executor-model",
@@ -753,8 +1332,9 @@ class NativeRoutingTests(unittest.TestCase):
         state = json.loads(
             (self.home / NATIVE.STATE_FILENAME).read_text(encoding="utf-8")
         )
-        self.assertEqual(state["schema"], 5)
-        self.assertEqual(state["policy_version"], 5)
+        self.assertEqual(state["schema"], 7)
+        self.assertEqual(state["policy_version"], 7)
+        self.assertIsNone(state["preset"])
         self.assertEqual(state["planner"]["effort"], "xhigh")
         self.assertEqual(state["designer"]["effort"], "medium")
 
@@ -763,7 +1343,7 @@ class NativeRoutingTests(unittest.TestCase):
         self.assertIn("Designer: gpt-5.6-luna@medium", status.stdout)
         self.assertEqual(status.returncode, 0)
 
-    def test_legacy_state_schemas_upgrade_to_four_without_losing_restore(self) -> None:
+    def test_legacy_state_schemas_upgrade_to_current_without_losing_restore(self) -> None:
         for legacy_schema in (1, 2, 3):
             with self.subTest(schema=legacy_schema):
                 setup_arguments = ["--executor-model", "gpt-5.6-luna"]
@@ -779,6 +1359,7 @@ class NativeRoutingTests(unittest.TestCase):
                 if legacy_schema < 3:
                     legacy.pop("planner", None)
                 legacy.pop("designer", None)
+                legacy.pop("preset", None)
                 legacy["managed"]["mode"] = (
                     f"{NATIVE.MANAGED_MARKER}\nlegacy schema {legacy_schema} mode"
                 )
@@ -805,8 +1386,9 @@ class NativeRoutingTests(unittest.TestCase):
                     "--apply",
                 )
                 upgraded = json.loads(state_path.read_text(encoding="utf-8"))
-                self.assertEqual(upgraded["schema"], 5)
-                self.assertEqual(upgraded["policy_version"], 5)
+                self.assertEqual(upgraded["schema"], 7)
+                self.assertEqual(upgraded["policy_version"], 7)
+                self.assertIsNone(upgraded["preset"])
                 self.assertEqual(upgraded["previous"], original_previous)
                 self.assertEqual(upgraded["planner"]["model"], "gpt-5.6-sol")
                 self.assertEqual(upgraded["designer"]["model"], "gpt-5.6-luna")
@@ -834,6 +1416,8 @@ class NativeRoutingTests(unittest.TestCase):
                     state.pop("planner")
                 if schema < 4:
                     state.pop("designer")
+                if schema < 6:
+                    state.pop("preset")
                 state_path.write_text(json.dumps(state), encoding="utf-8")
 
                 status = self.run_script("--status", check=False)
@@ -2200,7 +2784,7 @@ class NativeRoutingTests(unittest.TestCase):
         state = json.loads(
             (self.home / NATIVE.STATE_FILENAME).read_text(encoding="utf-8")
         )
-        self.assertEqual(state["schema"], 5)
+        self.assertEqual(state["schema"], 7)
         self.assertEqual(
             state["advisor"],
             {

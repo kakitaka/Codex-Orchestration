@@ -17,6 +17,15 @@ FABLE_MODEL = "claude-fable-5"
 FABLE_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
 OPUS_MODEL = "claude-opus-5"
 OPUS_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
+TERRA_LUNA_SOL_ESCALATION_PRESET = "terra-luna-sol-escalation"
+TERRA_LUNA_SOL_ESCALATION_ROOT_MODEL = "gpt-5.6-terra"
+TERRA_LUNA_SOL_ESCALATION_ROOT_EFFORT = "max"
+TERRA_LUNA_SOL_ESCALATION_EXECUTOR_MODEL = "gpt-5.6-luna"
+TERRA_LUNA_SOL_ESCALATION_EXECUTOR_EFFORT = "max"
+TERRA_LUNA_SOL_ESCALATION_ADVISOR_MODEL = "gpt-5.6-sol"
+TERRA_LUNA_SOL_ESCALATION_ADVISOR_EFFORT = "max"
+TERRA_LUNA_SOL_ESCALATION_MULTI_AGENT_ENABLED = True
+TERRA_LUNA_SOL_ESCALATION_SUBAGENT_ENABLED = True
 FABLE_SERVERS = frozenset(
     {
         "fable-advisor-python3",
@@ -25,7 +34,7 @@ FABLE_SERVERS = frozenset(
     }
 )
 
-_SCHEMA_POLICY_PAIRS = {1: 1, 2: 2, 3: 3, 4: 4, 5: 5}
+_SCHEMA_POLICY_PAIRS = {1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6, 7: 7}
 _MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+/@-]{0,199}$")
 _AGENT_RE = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
 _EFFORT_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
@@ -182,6 +191,102 @@ def _validate_route_separation(planner: Any, advisor: Any) -> None:
     _require(not same_route, "Planner and Advisor routes are not independent")
 
 
+def _validate_preset(
+    preset: Any,
+    executor: dict[str, Any],
+    planner: Any,
+    advisor: Any,
+    designer: Any,
+) -> None:
+    """Validate the only persisted preset without making it a model ACL."""
+
+    _require(
+        preset is None or type(preset) is str,
+        "preset must be null or a supported preset name",
+    )
+    if preset is None:
+        return
+    _require(
+        preset == TERRA_LUNA_SOL_ESCALATION_PRESET,
+        "preset is unsupported",
+    )
+    _require(
+        executor
+        == {
+            "kind": "model",
+            "model": TERRA_LUNA_SOL_ESCALATION_EXECUTOR_MODEL,
+            "effort": TERRA_LUNA_SOL_ESCALATION_EXECUTOR_EFFORT,
+        },
+        "preset executor route is forged",
+    )
+    _require(planner is None, "preset cannot persist a Planner route")
+    _require(advisor is None, "preset cannot persist an Advisor route")
+    _require(designer is None, "preset cannot persist a Designer route")
+
+
+def _validate_preset_subagent_state(
+    managed_subagent: Any,
+    previous_subagent: Any,
+) -> None:
+    """Validate the exact profile-only controls that make Luna spawnable."""
+
+    _require(
+        type(managed_subagent) is dict
+        and set(managed_subagent)
+        == {"feature_enabled", "agents_enabled", "model", "effort"},
+        "preset subagent managed state has the wrong shape",
+    )
+    _require(
+        managed_subagent["feature_enabled"]
+        is TERRA_LUNA_SOL_ESCALATION_MULTI_AGENT_ENABLED,
+        "preset multi-agent feature setting is forged",
+    )
+    _require(
+        managed_subagent["agents_enabled"]
+        is TERRA_LUNA_SOL_ESCALATION_SUBAGENT_ENABLED,
+        "preset agents enabled setting is forged",
+    )
+    _require(
+        managed_subagent["model"] == TERRA_LUNA_SOL_ESCALATION_EXECUTOR_MODEL,
+        "preset subagent model is forged",
+    )
+    _require(
+        managed_subagent["effort"] == TERRA_LUNA_SOL_ESCALATION_EXECUTOR_EFFORT,
+        "preset subagent effort is forged",
+    )
+    _require(
+        type(previous_subagent) is dict
+        and set(previous_subagent)
+        == {
+            "feature_enabled",
+            "agents_enabled",
+            "model",
+            "effort",
+            "agents_table_was_absent",
+        },
+        "preset subagent restore state has the wrong shape",
+    )
+    _require(
+        type(previous_subagent["agents_table_was_absent"]) is bool,
+        "preset agents table ownership marker is invalid",
+    )
+    for key, expected_type in (
+        ("feature_enabled", bool),
+        ("agents_enabled", bool),
+        ("model", str),
+        ("effort", str),
+    ):
+        saved = previous_subagent[key]
+        _validate_snapshot(saved, expected_type)
+        _require(saved["known"] is True, "preset snapshot must be explicit")
+    if previous_subagent["agents_table_was_absent"]:
+        for key in ("agents_enabled", "model", "effort"):
+            _require(
+                previous_subagent[key] == {"known": True, "present": False},
+                "absent agents table must have absent profile-control snapshots",
+            )
+
+
 def _validate_scalar_conversion(state: dict[str, Any], managed: dict[str, Any]) -> None:
     scalar_origin = state["scalar_origin"]
     managed_feature = state["managed_feature"]
@@ -230,7 +335,7 @@ def _validate_scalar_conversion(state: dict[str, Any], managed: dict[str, Any]) 
 
 
 def validate_routing_state(value: Any) -> dict[str, Any]:
-    """Validate and return one exact, complete persisted schema 1 through 5.
+    """Validate and return one exact, complete persisted schema 1 through 7.
 
     Unknown keys and future extensions are rejected intentionally. Callers must
     perform their own secure file read and any caller-specific path/seat checks.
@@ -254,6 +359,8 @@ def validate_routing_state(value: Any) -> dict[str, Any]:
         expected_top.add("planner")
     if schema >= 4:
         expected_top.add("designer")
+    if schema >= 6:
+        expected_top.add("preset")
     _require(set(value) == expected_top, "top-level state shape is unsupported")
     _require(value["managed_by"] == "codex-orchestration", "state owner is invalid")
     _require(
@@ -278,6 +385,9 @@ def validate_routing_state(value: Any) -> dict[str, Any]:
             "persistent Designer must use a direct model route",
         )
     _validate_route_separation(planner, advisor)
+    preset = value["preset"] if schema >= 6 else None
+    if schema >= 6:
+        _validate_preset(preset, value["executor"], planner, advisor, designer)
 
     managed = value["managed"]
     previous = value["previous"]
@@ -285,14 +395,27 @@ def validate_routing_state(value: Any) -> dict[str, Any]:
     _require(type(previous) is dict, "previous state must be an object")
     managed_has_mcp = "mcp" in managed
     previous_has_mcp = "mcp" in previous
+    managed_has_subagent = "subagent" in managed
+    previous_has_subagent = "subagent" in previous
     _require(managed_has_mcp == previous_has_mcp, "MCP state and restore data must pair")
+    _require(
+        managed_has_subagent == previous_has_subagent,
+        "preset subagent state and restore data must pair",
+    )
     _require(not managed_has_mcp or schema >= 2, "schema 1 cannot contain MCP state")
+    _require(
+        not managed_has_subagent or schema >= 7,
+        "legacy schema cannot contain preset subagent state",
+    )
 
     expected_managed = set(_BASE_MANAGED_KEYS)
     expected_previous = set(_BASE_PREVIOUS_KEYS)
     if managed_has_mcp:
         expected_managed.add("mcp")
         expected_previous.add("mcp")
+    if managed_has_subagent:
+        expected_managed.add("subagent")
+        expected_previous.add("subagent")
     _require(set(managed) == expected_managed, "managed state has the wrong shape")
     _require(set(previous) == expected_previous, "restore state has the wrong shape")
     _require(_has_marker_first_line(managed["mode"]), "managed mode marker is invalid")
@@ -302,6 +425,16 @@ def validate_routing_state(value: Any) -> dict[str, Any]:
         managed["namespace"] == ROUTING_TOOL_NAMESPACE,
         "managed namespace is invalid",
     )
+    if schema >= 7 and preset == TERRA_LUNA_SOL_ESCALATION_PRESET:
+        _require(
+            managed_has_subagent,
+            "schema 7 preset must manage Luna subagent controls",
+        )
+    else:
+        _require(
+            not managed_has_subagent,
+            "subagent controls are reserved for the schema 7 Luna preset",
+        )
 
     for key, expected_type in (
         ("mode", str),
@@ -310,6 +443,8 @@ def validate_routing_state(value: Any) -> dict[str, Any]:
         ("namespace", str),
     ):
         _validate_snapshot(previous[key], expected_type)
+    if managed_has_subagent:
+        _validate_preset_subagent_state(managed["subagent"], previous["subagent"])
 
     subscription_routes = [
         route
