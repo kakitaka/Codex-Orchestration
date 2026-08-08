@@ -915,6 +915,8 @@ def resolve_model_effort(
     effort: str,
     catalog: dict[str, dict[str, Any]],
     confirm_unlisted: bool,
+    *,
+    require_catalog_effort: bool = False,
 ) -> str:
     item = catalog.get(model)
     if item is None:
@@ -927,14 +929,21 @@ def resolve_model_effort(
                 f"{label} effort must be explicit when using an unlisted model."
             )
         return effort
+    raw_supported = item.get("supportedReasoningEfforts")
     supported = {
-        option.get("reasoningEffort")
-        for option in item.get("supportedReasoningEfforts", [])
+        candidate
+        for option in (raw_supported if isinstance(raw_supported, list) else [])
         if isinstance(option, dict)
+        if isinstance((candidate := option.get("reasoningEffort")), str) and candidate
     }
     resolved = item.get("defaultReasoningEffort") if effort == "auto" else effort
     if not isinstance(resolved, str) or not resolved:
         raise ConfigurationError(f"Could not resolve {label} effort for {model!r}.")
+    if require_catalog_effort and not supported:
+        raise ConfigurationError(
+            f"{label} model {model!r} did not publish a usable reasoning-effort "
+            "catalog; refusing to infer the required effort."
+        )
     if supported and resolved not in supported:
         values = ", ".join(sorted(value for value in supported if isinstance(value, str)))
         raise ConfigurationError(
@@ -1545,6 +1554,15 @@ def _preset_subagent_previous(current: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _preset_manages_callable_subagent(state: dict[str, Any]) -> bool:
+    """Return whether this emitted state owns the schema-7 Luna controls."""
+
+    return (
+        state.get("schema") == STATE_SCHEMA
+        and state.get("preset") == TERRA_LUNA_SOL_ESCALATION_PRESET
+    )
+
+
 def _snapshot_matches(value: Any, saved: dict[str, Any]) -> bool:
     if saved.get("known") is not True:
         return False
@@ -1608,6 +1626,46 @@ def _preset_subagent_restored(
     )
 
 
+def _owned_restore_matches(state: dict[str, Any], current: dict[str, Any]) -> bool:
+    """Verify every known field that disable was authorized to restore."""
+
+    previous = state.get("previous")
+    if not isinstance(previous, dict):
+        return False
+    scalar_origin = state.get("scalar_origin")
+    if isinstance(scalar_origin, bool) and not _strict_equal(
+        current["feature"], scalar_origin
+    ):
+        return False
+    for current_key, snapshot_key in (
+        ("mode", "mode"),
+        ("usage", "usage"),
+        ("metadata", "metadata"),
+        ("namespace", "namespace"),
+    ):
+        saved = previous.get(snapshot_key)
+        if not isinstance(saved, dict):
+            return False
+        if saved.get("known") is True and not _snapshot_matches(
+            current[current_key], saved
+        ):
+            return False
+    previous_mcp = previous.get("mcp")
+    if isinstance(previous_mcp, dict):
+        for server, saved in previous_mcp.items():
+            if not isinstance(saved, dict):
+                return False
+            if saved.get("known") is True and not _snapshot_matches(
+                current["mcp"].get(server, MISSING), saved
+            ):
+                return False
+    if _preset_manages_callable_subagent(state) and not _preset_subagent_restored(
+        previous, current
+    ):
+        return False
+    return True
+
+
 def _managed_matches(
     state: dict[str, Any],
     current: dict[str, Any],
@@ -1625,7 +1683,7 @@ def _managed_matches(
     )
     if not base_matches:
         return False
-    if state.get("preset") == TERRA_LUNA_SOL_ESCALATION_PRESET and not _preset_subagent_matches(
+    if _preset_manages_callable_subagent(state) and not _preset_subagent_matches(
         state,
         current,
         strict_agents_table=strict_agents_table,
@@ -1791,8 +1849,11 @@ def _status(
             state is not None
             and state.get("preset") == TERRA_LUNA_SOL_ESCALATION_PRESET
         )
+        profile_manages_subagent = (
+            state is not None and _preset_manages_callable_subagent(state)
+        )
         profile_effective_matches = (
-            not profile_installed
+            not profile_manages_subagent
             or _preset_subagent_matches(
                 state,
                 effective,
@@ -1805,9 +1866,13 @@ def _status(
             controls_ready = (
                 current["metadata"] is False
                 and current["namespace"] == ROUTING_TOOL_NAMESPACE
-                and (not profile_installed or state_matches)
+                and (not profile_manages_subagent or state_matches)
             )
-            if not controls_ready:
+            if profile_installed and not profile_manages_subagent:
+                routing_state = (
+                    "installed but legacy preset requires disable and fresh setup"
+                )
+            elif not controls_ready:
                 routing_state = "managed hints found but routing controls are incomplete"
             elif (
                 effective["mode"] == current["mode"]
@@ -1843,15 +1908,7 @@ def _status(
             print(f"Planner: {_route_summary(planner) if planner else 'root'}")
             print(f"Advisor: {_route_summary(advisor) if advisor else 'none'}")
             print(f"Designer: {_route_summary(designer) if designer else 'none'}")
-            if state.get("preset") == TERRA_LUNA_SOL_ESCALATION_PRESET:
-                for binary in binaries:
-                    supported, detail = supports_native_policy(
-                        binary,
-                        require_luna_subagent_defaults=True,
-                    )
-                    label = "compatible" if supported else f"incompatible ({detail})"
-                    print(f"Preset Luna client: {binary} — {label}")
-                    preset_clients_compatible = preset_clients_compatible and supported
+            if profile_installed:
                 print(f"Preset: {TERRA_LUNA_SOL_ESCALATION_PRESET}")
                 print(
                     "Preset root: expected "
@@ -1865,12 +1922,30 @@ def _status(
                     f"{TERRA_LUNA_SOL_ESCALATION_ADVISOR_EFFORT} — not a saved "
                     "Advisor seat or a verified route."
                 )
-                print(
-                    "Preset Luna default subagent route: "
-                    f"{TERRA_LUNA_SOL_ESCALATION_EXECUTOR_MODEL}@"
-                    f"{TERRA_LUNA_SOL_ESCALATION_EXECUTOR_EFFORT} — configured; "
-                    "live spawn not yet verified."
-                )
+                if profile_manages_subagent:
+                    for binary in binaries:
+                        supported, detail = supports_native_policy(
+                            binary,
+                            require_luna_subagent_defaults=True,
+                        )
+                        label = (
+                            "compatible" if supported else f"incompatible ({detail})"
+                        )
+                        print(f"Preset Luna client: {binary} — {label}")
+                        preset_clients_compatible = (
+                            preset_clients_compatible and supported
+                        )
+                    print(
+                        "Preset Luna default subagent route: "
+                        f"{TERRA_LUNA_SOL_ESCALATION_EXECUTOR_MODEL}@"
+                        f"{TERRA_LUNA_SOL_ESCALATION_EXECUTOR_EFFORT} — configured; "
+                        "live spawn not yet verified."
+                    )
+                else:
+                    print(
+                        "Preset Luna default subagent route: unavailable — legacy "
+                        "schema state must be disabled and set up again."
+                    )
                 print(
                     "Concurrency: no preset-imposed limit; user-layer "
                     "max_concurrent_threads_per_session is "
@@ -2297,6 +2372,37 @@ def _restore_pre_repair_hints(
         raise ConfigurationError("pre-repair hint restoration could not be verified")
 
 
+def _rollback_setup_transaction(
+    app: AppServer,
+    rollback: list[dict[str, Any]],
+    version: str | None,
+    state_path: Path,
+    previous_state: dict[str, Any] | None,
+    expected_new_state: dict[str, Any],
+) -> None:
+    """Restore config plus the exact prior state after post-write verification fails."""
+
+    rollback_result = _batch_write(
+        app,
+        rollback,
+        version,
+        reload_user_config=True,
+    )
+    if rollback_result.get("status") not in {"ok", "okOverridden"}:
+        raise ConfigurationError(
+            "unexpected rollback status " f"{rollback_result.get('status')!r}"
+        )
+    saved_state = _read_state(state_path)
+    if saved_state != expected_new_state:
+        raise ConfigurationError(
+            "Saved routing state changed concurrently; refusing to replace or remove it."
+        )
+    if previous_state is None:
+        _remove_state(state_path)
+    else:
+        _write_state(state_path, previous_state)
+
+
 def _repair(
     app: AppServer,
     config: dict[str, Any],
@@ -2343,7 +2449,7 @@ def _repair(
         for server, enabled in managed_mcp.items()
     )
     profile_controls_match = (
-        state.get("preset") != TERRA_LUNA_SOL_ESCALATION_PRESET
+        not _preset_manages_callable_subagent(state)
         or _preset_subagent_matches(state, current, strict_agents_table=True)
     )
     if not controls_match or not mcp_matches or not profile_controls_match:
@@ -2592,7 +2698,7 @@ def _disable(
                 )
                 if edit is not None
             )
-        if state.get("preset") == TERRA_LUNA_SOL_ESCALATION_PRESET:
+        if _preset_manages_callable_subagent(state):
             previous_subagent = previous.get("subagent")
             if not isinstance(previous_subagent, dict):
                 raise ConfigurationError(
@@ -2635,20 +2741,16 @@ def _disable(
     result = _batch_write(app, edits, version, reload_user_config=True)
     if result.get("status") not in {"ok", "okOverridden"}:
         raise ConfigurationError(f"Unexpected config write status: {result.get('status')!r}")
-    if state is not None and state.get("preset") == TERRA_LUNA_SOL_ESCALATION_PRESET:
+    if state is not None:
         read_result = app.request(
             "config/read",
             {"includeLayers": True, "cwd": str(Path.cwd().resolve())},
         )
         restored_config, _ = _user_layer(read_result)
-        previous = state.get("previous")
-        if not isinstance(previous, dict) or not _preset_subagent_restored(
-            previous,
-            _current_values(restored_config),
-        ):
+        if not _owned_restore_matches(state, _current_values(restored_config)):
             raise ConfigurationError(
-                "Profile disable write completed but Luna subagent restoration could "
-                "not be verified; saved state was retained."
+                "Disable write completed but owned restore values could not be "
+                "verified; saved state was retained."
             )
     _remove_state(state_path)
     print("Native routing disabled. Start a new Codex task to clear the loaded policy.")
@@ -2727,6 +2829,7 @@ def main() -> int:
                     TERRA_LUNA_SOL_ESCALATION_EXECUTOR_EFFORT,
                     catalog,
                     False,
+                    require_catalog_effort=True,
                 )
                 executor = {
                     "kind": "model",
@@ -2991,16 +3094,41 @@ def main() -> int:
                     f"Could not persist restore state; config write was rolled back: {state_exc}"
                 ) from state_exc
 
-            verify_result = app.request(
-                "config/read",
-                {"includeLayers": True, "cwd": str(workspace)},
-            )
-            verify_config, verify_version = _user_layer(verify_result)
-            verify_current = _current_values(verify_config)
-            effective_config = verify_result.get("config")
-            effective_current = _current_values(
-                effective_config if isinstance(effective_config, dict) else {}
-            )
+            try:
+                verify_result = app.request(
+                    "config/read",
+                    {"includeLayers": True, "cwd": str(workspace)},
+                )
+                verify_config, verify_version = _user_layer(verify_result)
+                if verify_version is None:
+                    raise ConfigurationError(
+                        "Could not obtain the user config version during readback."
+                    )
+                verify_current = _current_values(verify_config)
+                effective_config = verify_result.get("config")
+                effective_current = _current_values(
+                    effective_config if isinstance(effective_config, dict) else {}
+                )
+            except (ConfigurationError, OSError, KeyError, TypeError) as readback_exc:
+                try:
+                    _rollback_setup_transaction(
+                        app,
+                        rollback,
+                        result.get("version"),
+                        state_path,
+                        state,
+                        new_state,
+                    )
+                except (ConfigurationError, OSError) as rollback_exc:
+                    raise ConfigurationError(
+                        "Codex accepted the write but configuration readback failed, "
+                        f"and automatic rollback failed: {rollback_exc}"
+                    ) from readback_exc
+                raise ConfigurationError(
+                    "Codex accepted the write but configuration readback failed; "
+                    "the prior config and restore state were reinstated: "
+                    f"{readback_exc}"
+                ) from readback_exc
             user_matches = _managed_matches(new_state, verify_current)
             effective_matches = _managed_matches(
                 new_state,
@@ -3016,21 +3144,14 @@ def main() -> int:
                 )
             if not effective_matches:
                 try:
-                    rollback_result = _batch_write(
+                    _rollback_setup_transaction(
                         app,
                         rollback,
                         verify_version,
-                        reload_user_config=True,
+                        state_path,
+                        state,
+                        new_state,
                     )
-                    if rollback_result.get("status") not in {"ok", "okOverridden"}:
-                        raise ConfigurationError(
-                            "unexpected rollback status "
-                            f"{rollback_result.get('status')!r}"
-                        )
-                    if state is None:
-                        _remove_state(state_path)
-                    else:
-                        _write_state(state_path, state)
                 except (ConfigurationError, OSError) as rollback_exc:
                     raise ConfigurationError(
                         "Codex accepted the write but current-workspace effective "

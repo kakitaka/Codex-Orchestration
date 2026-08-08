@@ -63,6 +63,7 @@ mutate_after_write = home / ".fake-mutate-after-write"
 mutate_namespace_after_write = home / ".fake-mutate-namespace-after-write"
 mutate_feature_after_write = home / ".fake-mutate-feature-after-write"
 mutate_state_after_write = home / ".fake-mutate-state-after-write"
+mutate_disable_restore = home / ".fake-mutate-disable-restore"
 ok_overridden = home / ".fake-ok-overridden"
 overridden_returned = home / ".fake-overridden-returned"
 fail_overridden_rollback = home / ".fake-fail-overridden-rollback"
@@ -223,6 +224,17 @@ for line in sys.stdin:
                 9,
             )
             mutate_feature_after_write.unlink()
+        if mutate_disable_restore.exists() and any(
+            edit.get("keyPath") == "features.multi_agent_v2.multi_agent_mode_hint_text"
+            and edit.get("value") is None
+            for edit in params["edits"]
+        ):
+            set_path(
+                config,
+                "features.multi_agent_v2.tool_namespace",
+                "collaboration",
+            )
+            mutate_disable_restore.unlink()
         store.write_text(json.dumps(config, sort_keys=True), encoding="utf-8")
         if mutate_state_after_write.exists():
             state_path = home / ".codex-orchestration-routing.json"
@@ -639,6 +651,37 @@ class NativeRoutingTests(unittest.TestCase):
         self.assertNotIn("agents", self.read_fake_config())
         self.assertFalse(state_path.exists())
 
+    def test_schema_six_preset_remains_disableable_without_luna_defaults(self) -> None:
+        self.run_script(
+            "--preset", NATIVE.TERRA_LUNA_SOL_ESCALATION_PRESET, "--apply"
+        )
+        state_path = self.home / NATIVE.STATE_FILENAME
+        legacy_state = json.loads(state_path.read_text(encoding="utf-8"))
+        legacy_state["schema"] = 6
+        legacy_state["policy_version"] = 6
+        legacy_state["managed"].pop("subagent")
+        legacy_state["previous"].pop("subagent")
+        state_path.write_text(json.dumps(legacy_state), encoding="utf-8")
+        historical_config = self.read_fake_config()
+        historical_config["features"].pop("multi_agent")
+        historical_config.pop("agents")
+        (self.home / ".fake-user-config.json").write_text(
+            json.dumps(historical_config), encoding="utf-8"
+        )
+
+        status = self.run_script("--status", "--require-effective", check=False)
+        self.assertEqual(status.returncode, 1)
+        self.assertIn("legacy preset requires disable and fresh setup", status.stdout)
+        self.assertIn("Luna default subagent route: unavailable", status.stdout)
+
+        disabled = self.run_script("--disable", "--apply")
+        self.assertIn("Native routing disabled", disabled.stdout)
+        self.assertEqual(
+            self.read_fake_config()["features"]["multi_agent_v2"],
+            {"max_concurrent_threads_per_session": 5},
+        )
+        self.assertFalse(state_path.exists())
+
     def test_preset_conflicts_fail_before_binary_or_config_access(self) -> None:
         missing_binary = self.root / "missing-codex"
         result = self.run_script(
@@ -689,6 +732,26 @@ class NativeRoutingTests(unittest.TestCase):
         )
         self.assertEqual(max_result.returncode, 2)
         self.assertIn("max", max_result.stderr)
+        self.assertFalse((self.home / NATIVE.STATE_FILENAME).exists())
+        self.assertFalse((self.home / ".fake-user-config.json").exists())
+
+        missing_effort_source = FAKE_CODEX.replace(
+            '"supportedReasoningEfforts"', '"omittedReasoningEfforts"'
+        )
+        _, missing_effort = _write_test_cli(
+            self.root,
+            "fake-codex-no-reasoning-catalog",
+            missing_effort_source,
+        )
+        catalog_result = self.run_script(
+            "--preset",
+            NATIVE.TERRA_LUNA_SOL_ESCALATION_PRESET,
+            "--codex-bin",
+            str(missing_effort),
+            check=False,
+        )
+        self.assertEqual(catalog_result.returncode, 2)
+        self.assertIn("did not publish a usable reasoning-effort catalog", catalog_result.stderr)
         self.assertFalse((self.home / NATIVE.STATE_FILENAME).exists())
         self.assertFalse((self.home / ".fake-user-config.json").exists())
 
@@ -835,6 +898,23 @@ if "features" in sys.argv and "list" in sys.argv:""",
         self.assertEqual(self.read_fake_config(), drifted)
         self.assertEqual((self.home / NATIVE.STATE_FILENAME).read_bytes(), profile_state)
 
+    def test_disable_retains_state_when_any_owned_restore_value_drifts(self) -> None:
+        self.run_script(
+            "--preset", NATIVE.TERRA_LUNA_SOL_ESCALATION_PRESET, "--apply"
+        )
+        state_path = self.home / NATIVE.STATE_FILENAME
+        saved_state = state_path.read_bytes()
+        (self.home / ".fake-mutate-disable-restore").touch()
+
+        disabled = self.run_script("--disable", "--apply", check=False)
+        self.assertEqual(disabled.returncode, 2)
+        self.assertIn("owned restore values could not be verified", disabled.stderr)
+        self.assertEqual(state_path.read_bytes(), saved_state)
+        self.assertEqual(
+            self.read_fake_config()["features"]["multi_agent_v2"]["tool_namespace"],
+            "collaboration",
+        )
+
     def test_preset_effective_failure_restores_config_and_removes_new_state(self) -> None:
         initial = {
             "features": {
@@ -860,6 +940,78 @@ if "features" in sys.argv and "list" in sys.argv:""",
         self.assertIn("prior config and restore state were reinstated", failed.stderr)
         self.assertEqual(self.read_fake_config(), initial)
         self.assertFalse((self.home / NATIVE.STATE_FILENAME).exists())
+
+    def test_setup_readback_failure_restores_config_and_prior_state(self) -> None:
+        def run_with_readback_failure(arguments: list[str]) -> tuple[int, str]:
+            real_request = NATIVE.AppServer.request
+            reads = 0
+
+            def request(
+                app: object, method: str, params: dict[str, object]
+            ) -> dict[str, object]:
+                nonlocal reads
+                if method == "config/read":
+                    reads += 1
+                    if reads == 2:
+                        raise NATIVE.ConfigurationError("forced readback failure")
+                return real_request(app, method, params)
+
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(sys, "argv", arguments),
+                mock.patch.object(NATIVE.AppServer, "request", new=request),
+                mock.patch.object(sys, "stderr", stderr),
+            ):
+                return NATIVE.main(), stderr.getvalue()
+
+        initial = {
+            "features": {"multi_agent_v2": {"max_concurrent_threads_per_session": 5}},
+            "unrelated": {"keep": True},
+        }
+        profile_arguments = [
+            str(SCRIPT),
+            "--codex-bin",
+            str(self.codex),
+            "--codex-home",
+            str(self.home),
+            "--preset",
+            NATIVE.TERRA_LUNA_SOL_ESCALATION_PRESET,
+            "--apply",
+        ]
+        result, stderr = run_with_readback_failure(profile_arguments)
+        self.assertEqual(result, 2)
+        self.assertIn("configuration readback failed", stderr)
+        self.assertIn("prior config and restore state were reinstated", stderr)
+        self.assertEqual(self.read_fake_config(), initial)
+        state_path = self.home / NATIVE.STATE_FILENAME
+        self.assertFalse(state_path.exists())
+
+        self.run_script(
+            "--executor-model",
+            "gpt-5.6-luna",
+            "--executor-effort",
+            "high",
+            "--apply",
+        )
+        previous_config = self.read_fake_config()
+        previous_state = state_path.read_bytes()
+        update_arguments = [
+            str(SCRIPT),
+            "--codex-bin",
+            str(self.codex),
+            "--codex-home",
+            str(self.home),
+            "--executor-model",
+            "gpt-5.6-terra",
+            "--executor-effort",
+            "high",
+            "--apply",
+        ]
+        result, stderr = run_with_readback_failure(update_arguments)
+        self.assertEqual(result, 2)
+        self.assertIn("configuration readback failed", stderr)
+        self.assertEqual(self.read_fake_config(), previous_config)
+        self.assertEqual(state_path.read_bytes(), previous_state)
 
     def test_preset_repair_and_effective_rollback_preserve_state(self) -> None:
         self.run_script(
