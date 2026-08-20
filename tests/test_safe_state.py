@@ -4,6 +4,8 @@ import sys
 import tempfile
 import threading
 import unittest
+import math
+import types
 from pathlib import Path
 from unittest import mock
 
@@ -14,6 +16,50 @@ import safe_state as state  # noqa: E402
 
 
 class SafeStateTests(unittest.TestCase):
+    def test_numeric_bounds_and_hardlinks_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for kwargs in (
+                {"max_bytes": True},
+                {"max_bytes": 0},
+                {"max_bytes": math.inf},
+                {"max_depth": state.MAX_MAX_DEPTH + 1},
+                {"max_items": 0},
+            ):
+                with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                    state.validate_json_value({}, **kwargs)
+            target = root / "state.json"
+            target.write_text("{}", encoding="utf-8")
+            hardlink = root / "state-hardlink.json"
+            try:
+                hardlink.hardlink_to(target)
+            except (OSError, NotImplementedError):
+                self.skipTest("hardlink creation unavailable")
+            with self.assertRaises(state.UnsafePathError):
+                state.read_json(root, "state-hardlink.json")
+
+    def test_quarantine_suffix_is_one_safe_component(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for suffix in ("../escape", "/absolute", "C:\\escape"):
+                target = root / "state.json"
+                target.write_text("{}", encoding="utf-8")
+                with self.subTest(suffix=suffix), self.assertRaises(state.UnsafePathError):
+                    state.quarantine_file(root, "state.json", suffix=suffix)
+
+    def test_os_lock_failure_never_yields(self) -> None:
+        fake_fcntl = types.SimpleNamespace(LOCK_EX=1, LOCK_UN=2)
+
+        def fail_lock(_descriptor: int, _operation: int) -> None:
+            raise OSError("simulated lock failure")
+
+        fake_fcntl.flock = fail_lock
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            sys.modules, {"fcntl": fake_fcntl}
+        ):
+            with self.assertRaises(OSError):
+                with state._file_lock(str(Path(tmp) / "state.json")):
+                    self.fail("unlocked critical section")
     def test_atomic_json_and_bounds(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

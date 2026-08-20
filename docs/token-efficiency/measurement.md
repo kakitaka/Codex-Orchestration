@@ -18,7 +18,7 @@ The final comparison must use the same paths and deterministic tokenizer/byte es
 
 ## Fixed benchmark tasks
 
-Use no paid model in normal CI. Static fixtures cover:
+Use no paid model in normal CI. Run every fixture from the same exact clean commit; a skipped, mixed-checkout, or unsuccessful fixture fails the benchmark gate. Static fixtures cover:
 
 1. explicit setup/status routing;
 2. one small isolated implementation packet;
@@ -29,7 +29,7 @@ Use no paid model in normal CI. Static fixtures cover:
 7. bounded noisy tool output;
 8. exact-match and mismatched session lane.
 
-Record task success and deterministic test result beside context byte/token estimates. Security/final validation bypasses result reuse.
+Record task success and deterministic test result beside context byte/token estimates. Validation-cache hits remain untrusted advisory evidence. Security, release, and final validation bypass result reuse.
 
 ## Usage fields
 
@@ -47,4 +47,4 @@ If any counter is unavailable, store/report `NOT_MEASURED`, not zero. No raw pro
 
 ## Comparison
 
-Report before and after independently for core Skill bytes/lines, selected-reference bytes, deterministic packet bytes, duplicate suppression, validation/failure-cache hits, and bounded output bytes. Claim cache-hit improvement only from actual cached/input counters; otherwise report architecture readiness plus `NOT_MEASURED`.
+Report before and after independently for core Skill bytes/lines, selected-reference bytes, deterministic packet bytes, duplicate suppression, advisory validation/failure-cache hits, and bounded output bytes. Bind baseline bytes to the declared Git object and after bytes to the clean benchmark commit. Claim provider cache-hit improvement only from actual cached/input counters; otherwise report architecture readiness plus `NOT_MEASURED`.

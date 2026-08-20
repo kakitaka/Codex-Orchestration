@@ -24,7 +24,7 @@ Use repository-local `.codex-state/` or an explicitly contained equivalent. Do n
 .codex-state/usage/usage.jsonl
 ```
 
-The exact helper API chooses names and enforces containment. Do not hand-edit state to bypass schema validation.
+The exact helper API chooses names and enforces containment. Lane data and its authentication material cannot alias the same file. Do not hand-edit state to bypass schema validation.
 
 ## Bounded commands
 
@@ -32,16 +32,16 @@ Call `bounded_run.py` with an ordered argv, byte/time bounds, and no diagnostic-
 
 ## Hooks
 
-Codex 0.147 exposes stable hooks. Hook activation remains opt-in because project hooks require trust and older/shared clients may reject current fields. Use `token_hook.py` only for:
+Codex 0.147 exposes stable hooks. Hook activation remains opt-in because project hooks require trust and older/shared clients may reject current fields. The enabled helper first probes the executing Codex binary and exact `hooks` feature readback; schema-valid event JSON alone is not a capability signal. Use `token_hook.py` only for:
 
 - `PreToolUse`: conservative non-blocking warning;
 - `UserPromptSubmit`: bounded `additionalContext` hint.
 
-Do not configure command rewriting or PostToolUse output replacement. A project may add the helper through trusted `hooks.json` or inline `[[hooks.PreToolUse]]` / `[[hooks.UserPromptSubmit]]` only after its active Codex schema accepts the event and command hook. If unsupported, run bounded helpers explicitly.
+Do not configure command rewriting or PostToolUse output replacement. A project may add the helper through trusted `hooks.json` or inline `[[hooks.PreToolUse]]` / `[[hooks.UserPromptSubmit]]` only after the capability probe and active schema accept the event and command hook. A disabled, unsupported, malformed, or timed-out probe emits no hook advice. The fallback is an explicit bounded helper command.
 
 ## Session lanes
 
-Resume is eligible only when repo, worktree, branch, model, effort, cwd, sandbox, approval, and tool profile all match and the active client exposes resume. A mismatch, missing key, corrupt state, or unsupported resume starts a new session. Session/resume identifiers remain local and never enter Git or telemetry.
+Resume is eligible only when repo, worktree, branch, model, effort, cwd, sandbox, approval, and tool profile all match, the active client exposes resume, and a caller-held capability authenticates the lane, packet, handle, and expiry. The capability is never stored with lane data. A mismatch, missing capability, expired handle, corrupt state, or unsupported resume starts a new session. Session/resume identifiers remain local and never enter Git or telemetry.
 
 ## Capability snapshot
 
@@ -51,6 +51,7 @@ Implementation was checked against local `codex-cli 0.147.0`:
 | --- | --- | --- |
 | lifecycle hooks | stable/enabled | opt-in hook helper |
 | multi-agent | stable/enabled | bounded `fork_turns="none"` packet |
+| direct spawn model overrides | independently exposed by current v2 schema | manage/read back when supported; false=`DISABLED`, absent=`UNSUPPORTED` |
 | `resume` command | exposed | exact-match lane eligibility only |
 | native token-budget feature | unavailable/disabled | plugin-side deterministic estimates |
 | usage counters | not guaranteed in every client path | absent remains `NOT_MEASURED` |

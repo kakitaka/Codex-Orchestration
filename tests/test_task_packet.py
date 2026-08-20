@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import unittest
 
 
@@ -193,6 +194,47 @@ class TaskPacketTests(unittest.TestCase):
         )
         self.assertFalse(hard_packet.accepted)
         self.assertTrue(hard_packet.hard_exceeded)
+
+    def test_shared_registry_reservation_is_atomic_across_wave_budgets(self) -> None:
+        class RacingRegistry(packets.DuplicatePacketRegistry):
+            def __init__(self) -> None:
+                super().__init__()
+                self.barrier = threading.Barrier(2)
+
+            def is_duplicate(self, packet: object) -> bool:
+                result = super().is_duplicate(packet)  # type: ignore[arg-type]
+                self.barrier.wait(timeout=2)
+                return result
+
+        packet = make_packet()
+        registry = RacingRegistry()
+        budgets = [
+            packets.WaveBudget(hard_tokens=100, duplicate_registry=registry)
+            for _ in range(2)
+        ]
+        decisions: list[packets.BudgetDecision] = []
+        failures: list[BaseException] = []
+
+        def consume(budget: packets.WaveBudget) -> None:
+            try:
+                decisions.append(budget.consume(packet, estimated_tokens=1))
+            except BaseException as exc:  # captured for the parent assertion
+                failures.append(exc)
+
+        threads = [threading.Thread(target=consume, args=(budget,)) for budget in budgets]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=3)
+        self.assertFalse(failures)
+        self.assertEqual(sum(item.accepted for item in decisions), 1)
+        self.assertEqual(sum(item.duplicate for item in decisions), 1)
+
+    def test_packet_size_caps_match_worker_context_budget(self) -> None:
+        with self.assertRaises(packets.PacketSchemaError):
+            make_packet(goal="x" * (packets.MAX_PACKET_TEXT_CHARS + 1))
+        self.assertEqual(packets.MAX_PACKET_CANONICAL_BYTES, 64 * 1024)
+        self.assertEqual(packets.MAX_PACKET_ESTIMATED_TOKENS, 16 * 1024)
 
 
 if __name__ == "__main__":

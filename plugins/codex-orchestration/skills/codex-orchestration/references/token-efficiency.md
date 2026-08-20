@@ -23,11 +23,11 @@ No timestamp, UUID, session ID, absolute path, unstable Git SHA, unordered JSON 
 
 The local knowledge index stores derived headings, symbols, imports, dependency names, relative paths, line numbers, and Git blob IDs only. It never stores source text, snippets, prompts, logs, embeddings, or LLM summaries. Revalidate containment and blob ID before reading a live range.
 
-Validation cache keys include ordered command identity digest, relative cwd, executable/environment fingerprints, relevant source/test/config/lock hashes, and format version. Reuse only a completed deterministic pass for ordinary validation. Final/security/fresh validation bypasses the cache. Known failures are hypothesis hints, never success.
+Validation cache keys keep command, executable, environment, source, test, configuration, and dependency-lock identities in separate canonical domains. Strict schema and key-digest checks reject malformed metadata but do not authenticate state writable by the same OS principal. Reuse requires an explicit untrusted-advisory lookup of a complete deterministic identity-complete pass for ordinary validation. Final, release, security, and fresh validation bypass the cache. Known failures are hypothesis hints, never success.
 
 ## Session lanes
 
-Session lanes are local resume hints keyed by exact repo/worktree/branch/model/effort/cwd/sandbox/approval/tool-profile match. Lane identity uses a local HMAC key. Resume only when the current Codex exposes resume and every field matches; otherwise start a new session. Lane/resume IDs never enter telemetry or Git.
+Session lanes are local resume hints keyed by exact repo/worktree/branch/model/effort/cwd/sandbox/approval/tool-profile match. Resume requires current-client support plus a caller-held capability that authenticates the lane, packet, resume handle, exact profile, and expiry; the capability is never stored with lane data. Any mismatch starts a new session. Lane/resume IDs never enter telemetry or Git.
 
 ## Telemetry
 

@@ -36,6 +36,18 @@ PORTABILITY_BASE_MODULES = (
     "tests.test_inspect_models",
     "tests.test_packaging",
     "tests.test_skill_contract",
+    "tests.test_bounded_run",
+    "tests.test_token_lint",
+    "tests.test_token_benchmark",
+    "tests.test_playbook_staleness",
+    "tests.test_full_test_gate",
+    "tests.test_preflight",
+    "tests.test_release_check",
+    "tests.test_token_hook",
+    "tests.test_session_telemetry",
+    "tests.test_safe_state",
+    "tests.test_context_index",
+    "tests.test_validation_cache",
 )
 ROUTING_PORTABILITY_MODULES = (
     "tests.test_native_routing",
@@ -95,6 +107,8 @@ def run_command(
     clipped = _clip(output)
     if completed.exit_category == "start_error":
         return CheckResult(name, "FAIL", "could not start command")
+    if completed.exit_category == "cleanup_error":
+        return CheckResult(name, "FAIL", "process-tree cleanup could not be verified")
     if completed.exit_category == "timeout":
         detail = f"timed out after {timeout}s"
         return CheckResult(name, "FAIL", detail + (f": {clipped}" if clipped else ""))
@@ -211,6 +225,27 @@ def playbook_staleness_check(root: Path) -> CheckResult:
     )
 
 
+def token_benchmark_check(root: Path) -> CheckResult:
+    return run_command(
+        "token-benchmark",
+        _python("scripts/token_benchmark.py", "--repo-root", str(root)),
+        root=root,
+        timeout=90,
+    )
+
+
+def tooling_security_tests(root: Path, *, timeout: int = 600) -> CheckResult:
+    modules = [
+        "tests.test_token_hook",
+        "tests.test_session_telemetry",
+        "tests.test_bounded_run",
+        "tests.test_full_test_gate",
+        "tests.test_preflight",
+        "tests.test_release_check",
+    ]
+    return unittest_check(root, "tooling-security-tests", modules, timeout=timeout)
+
+
 def quick_checks(root: Path, *, base_sha: str, head_sha: str | None) -> list[CheckResult]:
     results = [
         run_command(
@@ -269,6 +304,7 @@ def full_local_checks(
     root: Path, *, base_sha: str, head_sha: str | None
 ) -> list[CheckResult]:
     results = quick_checks(root, base_sha=base_sha, head_sha=head_sha)
+    results.append(token_benchmark_check(root))
     results.append(
         run_command(
             "full-tests",
@@ -277,6 +313,7 @@ def full_local_checks(
             timeout=1000,
         )
     )
+    results.append(tooling_security_tests(root, timeout=600))
     codex = _codex_available(root)
     if codex.status == "FAIL" and "could not start" in codex.detail:
         results.append(
@@ -333,6 +370,7 @@ def ci_checks(
             ruff_check(root, ci=True),
             token_lint_check(root),
             playbook_staleness_check(root),
+            token_benchmark_check(root),
             release_check(
                 root,
                 base_sha=base_sha,
@@ -347,7 +385,15 @@ def ci_checks(
             ),
         ]
     if target == "test":
-        return [compile_check(root), unittest_check(root, "full-tests", timeout=900)]
+        return [
+            compile_check(root),
+            run_command(
+                "full-test-differential",
+                _python("scripts/full_test_gate.py", "--repo-root", str(root)),
+                root=root,
+                timeout=1000,
+            ),
+        ]
     if target == "lifecycle":
         return [
             run_command(

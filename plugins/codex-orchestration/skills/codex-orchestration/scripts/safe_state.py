@@ -26,6 +26,9 @@ T = TypeVar("T")
 DEFAULT_MAX_BYTES = 2 * 1024 * 1024
 DEFAULT_MAX_DEPTH = 32
 DEFAULT_MAX_ITEMS = 20_000
+MAX_MAX_BYTES = 16 * 1024 * 1024
+MAX_MAX_DEPTH = 128
+MAX_MAX_ITEMS = 200_000
 _REPARSE_POINT = 0x0400
 _MISSING = object()
 _LOCK_GUARD = threading.RLock()
@@ -47,6 +50,47 @@ class StateCorruptError(SafeStateError):
 
 class ConcurrentUpdateError(SafeStateError):
     """An optimistic compare/update saw a different file."""
+
+
+def _bounded_int(
+    value: Any,
+    name: str,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int:
+    """Validate a public limit without accepting bool or lossy numbers."""
+
+    if type(value) is not int or value < minimum or value > maximum:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
+    return value
+
+
+def _regular_identity(
+    stat_result: os.stat_result,
+    *,
+    label: str,
+) -> tuple[int, int, int, int, int]:
+    """Validate one state/lock object and return its stable identity."""
+
+    if not stat.S_ISREG(stat_result.st_mode):
+        raise UnsafePathError(f"{label} must be a regular file")
+    if int(getattr(stat_result, "st_nlink", 1)) > 1:
+        raise UnsafePathError(f"{label} hardlinks are not accepted")
+    return _stat_identity(stat_result)
+
+
+def _validate_regular_path(path: str, *, label: str) -> os.stat_result:
+    """Lstat a regular, single-link, non-reparse path without following it."""
+
+    if _reparse_or_link(path):
+        raise UnsafePathError(f"{label} cannot be a link/reparse point")
+    try:
+        result = os.lstat(path)
+    except FileNotFoundError:
+        raise
+    _regular_identity(result, label=label)
+    return result
 
 
 def _reparse_or_link(path: str) -> bool:
@@ -129,8 +173,17 @@ def _checked_components(
         if os.path.lexists(candidate):
             if _reparse_or_link(candidate):
                 raise UnsafePathError(f"link/reparse component rejected: {part}")
-            if not is_final and not os.path.isdir(candidate):
-                raise UnsafePathError(f"non-directory path component: {part}")
+            try:
+                candidate_stat = os.lstat(candidate)
+            except FileNotFoundError:
+                # A concurrent unlink is handled by the operation's later
+                # ancestor/descriptor identity checks.
+                candidate_stat = None
+            if not is_final:
+                if candidate_stat is None or not stat.S_ISDIR(candidate_stat.st_mode):
+                    raise UnsafePathError(f"non-directory path component: {part}")
+            elif candidate_stat is not None:
+                _regular_identity(candidate_stat, label="state target")
         elif not is_final and create_parents:
             try:
                 os.mkdir(candidate, 0o700)
@@ -299,8 +352,24 @@ def validate_json_value(
 ) -> bytes:
     """Validate and deterministically encode a JSON value within bounds."""
 
-    if max_depth < 0 or max_items < 0 or max_bytes <= 0:
-        raise ValueError("JSON bounds must be positive where applicable")
+    max_depth = _bounded_int(
+        max_depth,
+        "max_depth",
+        minimum=1,
+        maximum=MAX_MAX_DEPTH,
+    )
+    max_items = _bounded_int(
+        max_items,
+        "max_items",
+        minimum=1,
+        maximum=MAX_MAX_ITEMS,
+    )
+    max_bytes = _bounded_int(
+        max_bytes,
+        "max_bytes",
+        minimum=1,
+        maximum=MAX_MAX_BYTES,
+    )
     _validate_json_tree(
         value,
         depth=0,
@@ -332,19 +401,21 @@ def _read_bytes_unlocked(
     ]
     | None = None,
 ) -> bytes:
-    if max_bytes <= 0:
-        raise ValueError("max_bytes must be positive")
+    max_bytes = _bounded_int(
+        max_bytes,
+        "max_bytes",
+        minimum=1,
+        maximum=MAX_MAX_BYTES,
+    )
     if ancestor_snapshot is not None:
         _revalidate_ancestors(ancestor_snapshot)
-    if _reparse_or_link(path):
-        raise UnsafePathError("link/reparse state file rejected")
     try:
-        before = os.lstat(path)
+        before = _validate_regular_path(path, label="state file")
     except FileNotFoundError:
         if ancestor_snapshot is not None:
             _revalidate_ancestors(ancestor_snapshot)
         raise
-    before_identity = _stat_identity(before)
+    before_identity = _regular_identity(before, label="state file")
     flags = os.O_RDONLY
     flags |= getattr(os, "O_BINARY", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
@@ -356,14 +427,15 @@ def _read_bytes_unlocked(
         if ancestor_snapshot is not None:
             _revalidate_ancestors(ancestor_snapshot)
         stat_result = os.fstat(descriptor)
+        descriptor_identity = _regular_identity(stat_result, label="state descriptor")
         try:
             current = os.lstat(path)
         except FileNotFoundError as exc:
             raise UnsafePathError("state file disappeared during open") from exc
         if (
             _reparse_or_link(path)
-            or _stat_identity(stat_result) != before_identity
-            or _stat_identity(current) != _stat_identity(stat_result)
+            or descriptor_identity != before_identity
+            or _regular_identity(current, label="state file") != descriptor_identity
         ):
             raise UnsafePathError("state file changed during open")
         if stat_result.st_size > max_bytes:
@@ -380,6 +452,11 @@ def _read_bytes_unlocked(
                 raise StateCorruptError("state file exceeds byte bound")
         if ancestor_snapshot is not None:
             _revalidate_ancestors(ancestor_snapshot)
+        # Re-check the pathname after the final read.  A descriptor alone is
+        # not enough: a same-name replacement must never be silently accepted.
+        final = _validate_regular_path(path, label="state file")
+        if _regular_identity(final, label="state file") != descriptor_identity:
+            raise UnsafePathError("state file changed while reading")
         return b"".join(chunks)
     finally:
         os.close(descriptor)
@@ -425,11 +502,11 @@ def _file_lock(
     ]
     | None = None,
 ) -> Iterator[None]:
-    """Use a same-directory lock file plus a process-local lock.
+    """Use a same-directory OS lock and a process-local reentrant lock.
 
-    ``fcntl`` is used when available.  Windows does not expose the same API;
-    the process-local lock still protects normal plugin concurrency and the
-    atomic replace prevents torn files across processes.
+    Atomic replacement is not a substitute for an OS lock. If the platform
+    lock cannot be acquired or released, fail closed instead of yielding an
+    apparently protected critical section.
     """
 
     lock = _thread_lock(path)
@@ -480,7 +557,7 @@ def _file_lock(
                     import fcntl  # type: ignore
 
                     fcntl.flock(descriptor, fcntl.LOCK_EX)
-                except (ImportError, OSError):
+                except ImportError:
                     try:
                         import msvcrt  # type: ignore
 
@@ -491,25 +568,125 @@ def _file_lock(
                         os.lseek(descriptor, 0, os.SEEK_SET)
                         msvcrt.locking(descriptor, msvcrt.LK_LOCK, 1)
                         windows_lock = msvcrt
-                    except (ImportError, OSError):
-                        # Atomic replace still prevents torn files on platforms
-                        # which expose neither advisory locking API.
-                        windows_lock = None
+                    except ImportError as exc:
+                        raise OSError("no supported OS lock implementation") from exc
                 yield
             finally:
                 if descriptor is not None:
-                    with contextlib.suppress(Exception):
-                        if windows_lock is not None:
-                            windows_lock.locking(descriptor, windows_lock.LK_UNLCK, 1)
-                        else:
-                            import fcntl  # type: ignore
+                    if windows_lock is not None:
+                        windows_lock.locking(descriptor, windows_lock.LK_UNLCK, 1)
+                    else:
+                        import fcntl  # type: ignore
 
-                            fcntl.flock(descriptor, fcntl.LOCK_UN)
-                    with contextlib.suppress(OSError):
-                        os.close(descriptor)
+                        fcntl.flock(descriptor, fcntl.LOCK_UN)
+                    os.close(descriptor)
         finally:
             with _LOCK_GUARD:
                 _LOCK_DEPTH.pop(depth_key, None)
+
+
+@contextlib.contextmanager
+def _strict_file_lock(
+    path: str,
+    *,
+    ancestor_snapshot: tuple[
+        tuple[str, tuple[int, int, int, int, int] | None], ...
+    ]
+    | None = None,
+) -> Iterator[None]:
+    """Acquire an OS lock and fail closed on acquisition/release errors."""
+
+    lock = _thread_lock(path)
+    with lock:
+        depth_key = (path, threading.get_ident())
+        with _LOCK_GUARD:
+            depth = _LOCK_DEPTH.get(depth_key, 0)
+            _LOCK_DEPTH[depth_key] = depth + 1
+        if depth:
+            try:
+                if ancestor_snapshot is not None:
+                    _revalidate_ancestors(ancestor_snapshot)
+                yield
+            finally:
+                with _LOCK_GUARD:
+                    if _LOCK_DEPTH.get(depth_key, 0) <= 1:
+                        _LOCK_DEPTH.pop(depth_key, None)
+                    else:
+                        _LOCK_DEPTH[depth_key] -= 1
+            return
+
+        descriptor: int | None = None
+        lock_module: Any = None
+        lock_kind: str | None = None
+        try:
+            lock_path = path + ".lock"
+            flags = os.O_CREAT | os.O_RDWR
+            flags |= getattr(os, "O_BINARY", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            if ancestor_snapshot is not None:
+                _revalidate_ancestors(ancestor_snapshot)
+            if os.path.lexists(lock_path):
+                _validate_regular_path(lock_path, label="lock file")
+            descriptor = os.open(lock_path, flags, 0o600)
+            if ancestor_snapshot is not None:
+                _revalidate_ancestors(ancestor_snapshot)
+            lock_stat = _validate_regular_path(lock_path, label="lock file")
+            descriptor_stat = os.fstat(descriptor)
+            if _regular_identity(lock_stat, label="lock file") != _regular_identity(
+                descriptor_stat, label="lock descriptor"
+            ):
+                raise UnsafePathError("lock file changed during open")
+            try:
+                os.chmod(lock_path, 0o600)
+            except OSError:
+                pass
+
+            try:
+                import fcntl  # type: ignore
+            except ImportError:
+                try:
+                    import msvcrt  # type: ignore
+                except ImportError as exc:
+                    raise OSError("no supported OS lock implementation") from exc
+                if os.fstat(descriptor).st_size == 0:
+                    os.write(descriptor, b"\0")
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                msvcrt.locking(descriptor, msvcrt.LK_LOCK, 1)
+                lock_module = msvcrt
+                lock_kind = "msvcrt"
+            else:
+                # A failed fcntl acquisition must not be silently downgraded.
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                lock_module = fcntl
+                lock_kind = "fcntl"
+            if ancestor_snapshot is not None:
+                _revalidate_ancestors(ancestor_snapshot)
+            yield
+        finally:
+            release_error: BaseException | None = None
+            if descriptor is not None and lock_kind is not None:
+                try:
+                    if lock_kind == "msvcrt":
+                        lock_module.locking(descriptor, lock_module.LK_UNLCK, 1)
+                    else:
+                        lock_module.flock(descriptor, lock_module.LOCK_UN)
+                except BaseException as exc:
+                    release_error = exc
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError as exc:
+                    if release_error is None:
+                        release_error = exc
+            with _LOCK_GUARD:
+                _LOCK_DEPTH.pop(depth_key, None)
+            if release_error is not None:
+                raise OSError("state lock release failed") from release_error
+
+
+# Keep one implementation name for callers/tests while ensuring all internal
+# writes use the strict acquire/release behavior above.
+_file_lock = _strict_file_lock
 
 
 def _fsync_directory(directory: str) -> None:
@@ -543,27 +720,36 @@ def _atomic_replace(
         raise UnsafePathError("state parent directory is missing")
     if _reparse_or_link(directory):
         raise UnsafePathError("state parent directory cannot be a link/reparse point")
-    if _reparse_or_link(path):
-        raise UnsafePathError("refusing to replace a link/reparse state file")
+    if os.path.lexists(path):
+        _validate_regular_path(path, label="state destination")
     descriptor, temporary = tempfile.mkstemp(
         prefix=f".{os.path.basename(path)}.", suffix=".tmp", dir=directory
     )
     try:
         if ancestor_snapshot is not None:
             _revalidate_ancestors(ancestor_snapshot)
-        os.fchmod(descriptor, 0o600) if hasattr(os, "fchmod") else os.chmod(temporary, 0o600)
+        _regular_identity(os.fstat(descriptor), label="temporary state file")
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, 0o600)
+        else:
+            os.chmod(temporary, 0o600)
         with os.fdopen(descriptor, "wb", closefd=True) as stream:
             descriptor = -1
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
-        if _reparse_or_link(directory) or _reparse_or_link(path):
+        if _reparse_or_link(directory):
             raise UnsafePathError("state destination changed during atomic write")
+        if os.path.lexists(path):
+            _validate_regular_path(path, label="state destination")
         if ancestor_snapshot is not None:
             _revalidate_ancestors(ancestor_snapshot)
         os.replace(temporary, path)
         if ancestor_snapshot is not None:
             _revalidate_ancestors(ancestor_snapshot)
+        final_stat = _validate_regular_path(path, label="state destination")
+        if int(getattr(final_stat, "st_nlink", 1)) != 1:
+            raise UnsafePathError("state destination became a hardlink")
         with contextlib.suppress(OSError):
             os.chmod(path, 0o600)
         _fsync_directory(directory)
@@ -585,6 +771,12 @@ def atomic_write_bytes(
 ) -> str:
     """Atomically write bounded bytes to a safe, same-directory path."""
 
+    max_bytes = _bounded_int(
+        max_bytes,
+        "max_bytes",
+        minimum=1,
+        maximum=MAX_MAX_BYTES,
+    )
     if not isinstance(data, bytes):
         raise TypeError("data must be bytes")
     if len(data) > max_bytes:
@@ -603,6 +795,12 @@ def read_bytes(
     *,
     max_bytes: int = DEFAULT_MAX_BYTES,
 ) -> bytes:
+    max_bytes = _bounded_int(
+        max_bytes,
+        "max_bytes",
+        minimum=1,
+        maximum=MAX_MAX_BYTES,
+    )
     root = _absolute_root(repo_root)
     path = resolve_state_path(root, target, create_parents=False)
     ancestors = _ancestor_snapshot(root, path)
@@ -619,14 +817,24 @@ def quarantine_file(
 ) -> str | None:
     """Move one corrupt file aside; never recursively delete anything."""
 
+    if (
+        not isinstance(suffix, str)
+        or not suffix
+        or len(suffix) > 64
+        or "\x00" in suffix
+        or suffix in {".", ".."}
+        or any(separator in suffix for separator in ("/", "\\"))
+        or ntpath.isabs(suffix)
+        or ntpath.splitdrive(suffix)[0]
+    ):
+        raise UnsafePathError("quarantine suffix must be one safe path component")
     root = _absolute_root(repo_root)
     path = resolve_state_path(root, target, create_parents=False)
     ancestors = _ancestor_snapshot(root, path)
     _revalidate_ancestors(ancestors)
     if not os.path.lexists(path):
         return None
-    if _reparse_or_link(path):
-        raise UnsafePathError("refusing to quarantine a link/reparse file")
+    _validate_regular_path(path, label="quarantine source")
     _revalidate_ancestors(ancestors)
     directory = os.path.dirname(path)
     for _ in range(8):
@@ -636,11 +844,19 @@ def quarantine_file(
         )
         if os.path.lexists(candidate):
             continue
+        # The candidate is lexical and same-directory, but still recheck its
+        # containment and object type after every race-sensitive operation.
+        candidate_ancestors = _ancestor_snapshot(root, candidate)
         _revalidate_ancestors(ancestors)
+        _revalidate_ancestors(candidate_ancestors)
         os.replace(path, candidate)
         _revalidate_ancestors(ancestors)
-        with contextlib.suppress(OSError):
+        _revalidate_ancestors(candidate_ancestors)
+        _validate_regular_path(candidate, label="quarantine destination")
+        try:
             os.chmod(candidate, 0o600)
+        except OSError:
+            pass
         _fsync_directory(directory)
         return candidate
     raise SafeStateError("could not choose a quarantine filename")
@@ -658,6 +874,26 @@ def read_json(
 ) -> Any:
     """Read bounded JSON, optionally quarantining malformed state."""
 
+    max_bytes = _bounded_int(
+        max_bytes,
+        "max_bytes",
+        minimum=1,
+        maximum=MAX_MAX_BYTES,
+    )
+    max_depth = _bounded_int(
+        max_depth,
+        "max_depth",
+        minimum=1,
+        maximum=MAX_MAX_DEPTH,
+    )
+    max_items = _bounded_int(
+        max_items,
+        "max_items",
+        minimum=1,
+        maximum=MAX_MAX_ITEMS,
+    )
+    if type(quarantine_corrupt) is not bool:
+        raise ValueError("quarantine_corrupt must be boolean")
     root = _absolute_root(repo_root)
     path = resolve_state_path(root, target, create_parents=False)
     ancestors = _ancestor_snapshot(root, path)
@@ -698,6 +934,12 @@ def write_json(
 ) -> str:
     """Validate and atomically write JSON, optionally using a digest CAS."""
 
+    if expected_digest is not None and (
+        not isinstance(expected_digest, str)
+        or len(expected_digest) != 64
+        or any(char not in "0123456789abcdefABCDEF" for char in expected_digest)
+    ):
+        raise ValueError("expected_digest must be a SHA-256 hex digest")
     encoded = validate_json_value(
         value,
         max_depth=max_depth,
@@ -739,6 +981,26 @@ def update_json(
 
     if not callable(updater):
         raise TypeError("updater must be callable")
+    max_bytes = _bounded_int(
+        max_bytes,
+        "max_bytes",
+        minimum=1,
+        maximum=MAX_MAX_BYTES,
+    )
+    max_depth = _bounded_int(
+        max_depth,
+        "max_depth",
+        minimum=1,
+        maximum=MAX_MAX_DEPTH,
+    )
+    max_items = _bounded_int(
+        max_items,
+        "max_items",
+        minimum=1,
+        maximum=MAX_MAX_ITEMS,
+    )
+    if type(quarantine_corrupt) is not bool:
+        raise ValueError("quarantine_corrupt must be boolean")
     root = _absolute_root(repo_root)
     path = resolve_state_path(root, target, create_parents=True)
     ancestors = _ancestor_snapshot(root, path)
@@ -788,6 +1050,9 @@ __all__ = [
     "DEFAULT_MAX_BYTES",
     "DEFAULT_MAX_DEPTH",
     "DEFAULT_MAX_ITEMS",
+    "MAX_MAX_BYTES",
+    "MAX_MAX_DEPTH",
+    "MAX_MAX_ITEMS",
     "SafeStateError",
     "StateCorruptError",
     "UnsafePathError",

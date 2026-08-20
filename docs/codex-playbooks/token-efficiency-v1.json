@@ -4,7 +4,7 @@
   "entries": [
     {
       "path": "plugins/codex-orchestration/skills/codex-orchestration/scripts/bounded_run.py",
-      "blob": "48452c5231b60674cd39b1f04c4b973793207c49",
+      "blob": "68332643a7b3dd8fa4be1208e2f8965d39f0c4ee",
       "symbols": ["BoundedResult", "StreamingRedactor", "run_bounded"],
       "headings": [],
       "failure_labels": ["output_limit", "start_error", "timeout"],
@@ -12,7 +12,7 @@
     },
     {
       "path": "plugins/codex-orchestration/skills/codex-orchestration/scripts/context_index.py",
-      "blob": "22428327c4f7ff6cff98ee3042ec8e620a384206",
+      "blob": "cbbc795aea0ac40a4cb4140717417b0f337e72a4",
       "symbols": ["ContextIndex", "RepeatedReadError", "git_blob_id"],
       "headings": [],
       "failure_labels": ["excluded_path", "repeated_read", "stale_blob"],
@@ -20,7 +20,7 @@
     },
     {
       "path": "plugins/codex-orchestration/skills/codex-orchestration/scripts/safe_state.py",
-      "blob": "1ddf8b87031c7d2a6094a9dcedc705686b9d7b00",
+      "blob": "be2c7c074d6cc60c37934f069cc6a2ec0ede1d28",
       "symbols": ["UnsafePathError", "read_json", "update_json", "write_json"],
       "headings": [],
       "failure_labels": ["corrupt_json", "path_escape", "symlink_or_reparse"],
@@ -28,7 +28,7 @@
     },
     {
       "path": "plugins/codex-orchestration/skills/codex-orchestration/scripts/session_telemetry.py",
-      "blob": "35c28200dfb5a2b7e51da011298f9289c90a5940",
+      "blob": "b3467f82de77e44ee737e83264ef10a4007b02fa",
       "symbols": ["SessionLaneManager", "TelemetryStore", "validate_telemetry_event"],
       "headings": [],
       "failure_labels": ["capability_mismatch", "corrupt_lane", "forbidden_telemetry_field"],
@@ -36,7 +36,7 @@
     },
     {
       "path": "plugins/codex-orchestration/skills/codex-orchestration/scripts/task_packet.py",
-      "blob": "2207a68a33d3a7a25cf3136b4a5794f056179da5",
+      "blob": "6b4518c0d196c50ca48a5114cd781cdc9ba3f1c3",
       "symbols": ["DuplicatePacketRegistry", "PacketBudget", "TaskPacket", "WaveBudget", "build_task_packet"],
       "headings": [],
       "failure_labels": ["duplicate_packet", "hard_budget", "secret_like_material", "unstable_static_prefix"],
@@ -44,7 +44,7 @@
     },
     {
       "path": "plugins/codex-orchestration/skills/codex-orchestration/scripts/token_hook.py",
-      "blob": "aa368267d7c9e4292683f3d8f9453c19ef46c98a",
+      "blob": "da3fbb5d163b19c2a4bc2eeb1d70c00d7635b2a1",
       "symbols": ["process_payload"],
       "headings": [],
       "failure_labels": ["malformed_input", "noisy_command", "unsupported_event"],
@@ -52,7 +52,7 @@
     },
     {
       "path": "plugins/codex-orchestration/skills/codex-orchestration/scripts/token_profiles.py",
-      "blob": "1d405e51828fe3e427de2fed866e1ffedb7b4702",
+      "blob": "c0380e47249f62334fef1251e5741b2d669360de",
       "symbols": ["TokenProfile", "recommend_route", "resolve_route"],
       "headings": [],
       "failure_labels": ["explicit_override", "profile_escalation"],
@@ -60,7 +60,7 @@
     },
     {
       "path": "plugins/codex-orchestration/skills/codex-orchestration/scripts/validation_cache.py",
-      "blob": "d0189f3e9bd12ac67dd1e8b30a4ed843506e9c2a",
+      "blob": "465d7e06763020fc38411feafb54f6056855fb7b",
       "symbols": ["ValidationCache", "make_validation_key"],
       "headings": [],
       "failure_labels": ["failure_hint", "final_bypass", "incomplete_result"],

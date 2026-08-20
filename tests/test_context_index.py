@@ -15,6 +15,32 @@ import context_index as index  # noqa: E402
 
 
 class ContextIndexTests(unittest.TestCase):
+    def test_git_blob_id_supports_sha1_and_sha256_repositories(self) -> None:
+        data = b"content\n"
+        self.assertEqual(len(index.git_blob_id(data, object_format="sha1")), 40)
+        self.assertEqual(len(index.git_blob_id(data, object_format="sha256")), 64)
+        with self.assertRaises(ValueError):
+            index.git_blob_id(data, object_format="future")
+
+    def test_limits_reject_bool_float_zero_and_hardlink_database(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with self.assertRaises(ValueError):
+                index.ContextIndex(root, source_max_bytes=True)
+            with self.assertRaises(ValueError):
+                index.ContextIndex(root, query_limit=0)
+            with self.assertRaises(ValueError):
+                index.ContextIndex(root, query_limit=1.5)
+            original = root / "original.sqlite"
+            original.write_bytes(b"not sqlite")
+            linked = root / "linked.sqlite"
+            try:
+                linked.hardlink_to(original)
+            except (OSError, NotImplementedError):
+                self.skipTest("hardlink creation unavailable")
+            with self.assertRaises(index.UnsafePathError):
+                index.ContextIndex(root, db_path=linked)
+
     def test_metadata_only_index_query_and_live_lines(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

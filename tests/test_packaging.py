@@ -64,14 +64,14 @@ class PackagingTests(unittest.TestCase):
         pre_commit = REPO_ROOT / ".githooks/pre-commit"
         pre_push = REPO_ROOT / ".githooks/pre-push"
 
-        self.assertEqual(
-            pre_commit.read_text(encoding="utf-8"),
-            "#!/bin/sh\nexec python3 scripts/preflight.py quick\n",
-        )
-        self.assertEqual(
-            pre_push.read_text(encoding="utf-8"),
-            "#!/bin/sh\nexec python3 scripts/preflight.py full\n",
-        )
+        pre_commit_text = pre_commit.read_text(encoding="utf-8")
+        pre_push_text = pre_push.read_text(encoding="utf-8")
+        for text, target in ((pre_commit_text, "quick"), (pre_push_text, "full")):
+            self.assertIn("command -v python3", text)
+            self.assertIn("python3 -c 'import sys'", text)
+            self.assertIn("command -v python", text)
+            self.assertIn("python -c 'import sys'", text)
+            self.assertIn(f"scripts/preflight.py {target}", text)
         for hook in (pre_commit, pre_push):
             index = subprocess.run(
                 ["git", "ls-files", "--stage", hook.relative_to(REPO_ROOT).as_posix()],
@@ -132,7 +132,9 @@ class PackagingTests(unittest.TestCase):
 
         self.assertIn('python-version: ["3.11", "3.13"]', ci)
         self.assertIn("name: portability (${{ matrix.os }})", ci)
-        self.assertIn("os: [macos-latest, windows-latest]", ci)
+        self.assertIn(
+            "os: [ubuntu-latest, macos-latest, windows-latest]", ci
+        )
         for module in (
             "tests.test_external_cli_trust",
             "tests.test_external_configurator",

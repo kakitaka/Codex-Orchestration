@@ -4,6 +4,7 @@ import json
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -31,11 +32,17 @@ class SessionTelemetryTests(unittest.TestCase):
     def test_hmac_lane_stability_and_exact_resume(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            manager = telemetry.SessionLaneManager(root)
+            manager = telemetry.SessionLaneManager(
+                root, resume_enabled=True, host_capability=True
+            )
+            packet_hash = "a" * 64
+            expiry = int(time.time()) + 60
             first = manager.get_or_create(
                 context(),
                 caller_capability="caller-capability",
                 resume_id="thread-opaque-123",
+                task_packet_hash=packet_hash,
+                resume_expires_at=expiry,
             )
             second = manager.get_or_create(context(), caller_capability="caller-capability")
             self.assertEqual(first["lane_id"], second["lane_id"])
@@ -45,6 +52,9 @@ class SessionTelemetryTests(unittest.TestCase):
                     first["lane_id"],
                     context(),
                     caller_capability="caller-capability",
+                    resume_id="thread-opaque-123",
+                    task_packet_hash=packet_hash,
+                    resume_expires_at=expiry,
                 )["resume_id"],
                 "thread-opaque-123",
             )
@@ -72,6 +82,40 @@ class SessionTelemetryTests(unittest.TestCase):
             )
             self.assertNotEqual(first["lane_id"], copied["lane_id"])
             self.assertNotIn("resume_id", copied)
+
+    def test_resume_fallback_never_retains_an_unsupported_handle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = telemetry.SessionLaneManager(root)
+            first = manager.get_or_create(
+                context(),
+                caller_capability="local",
+                resume_id="sk-123456789012345678901234-must-not-survive",
+                task_packet_hash="a" * 64,
+                resume_expires_at=int(time.time()) + 60,
+            )
+            self.assertNotIn("resume_id", first)
+            resumed = manager.resume(
+                first["lane_id"], context(), caller_capability="local"
+            )
+            self.assertEqual(resumed["lane_id"], first["lane_id"])
+            self.assertNotIn("resume_id", resumed)
+            raw = (root / ".codex-state/session-lanes.json").read_bytes()
+            self.assertNotIn(b"must-not-survive", raw)
+
+    def test_lane_context_requires_all_identity_fields_and_typed_enums(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = telemetry.SessionLaneManager(Path(tmp))
+            incomplete = context()
+            incomplete.pop("tool_profile")
+            with self.assertRaises(telemetry.LaneError):
+                manager.get_or_create(incomplete)
+            invalid = context()
+            invalid["effort"] = []  # type: ignore[assignment]
+            with self.assertRaises(telemetry.LaneError):
+                manager.get_or_create(invalid)
+            ultra = manager.get_or_create(dict(context(), effort="ultra"))
+            self.assertEqual(ultra["effort"], "ultra")
 
     def test_corrupt_lane_state_falls_back(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -157,6 +201,23 @@ class SessionTelemetryTests(unittest.TestCase):
             store.record({"cached_input_tokens": 90})
             aggregate = store.export_aggregate(opt_in=True)
             self.assertNotIn("cache_hit_ratio", aggregate)
+
+    def test_persisted_event_count_and_version_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = telemetry.TelemetryStore(root, max_events=1)
+            target = root / ".codex-state/usage/usage.jsonl"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            line = telemetry.serialize_event({"format_version": 1}) + b"\n"
+            target.write_bytes(line + line)
+            self.assertEqual(store.events(), [])
+            self.assertTrue(list(target.parent.glob("usage.jsonl.telemetry-corrupt-*")))
+
+            target.write_bytes(b'{"input_tokens":1}\n')
+            self.assertEqual(store.events(), [])
+            self.assertGreaterEqual(
+                len(list(target.parent.glob("usage.jsonl.telemetry-corrupt-*"))), 2
+            )
 
 
 if __name__ == "__main__":

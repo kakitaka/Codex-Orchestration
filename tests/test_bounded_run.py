@@ -20,6 +20,15 @@ SPEC.loader.exec_module(bounded_run)
 
 
 class BoundedRunTests(unittest.TestCase):
+    def test_windows_job_limit_flag_uses_the_struct_field(self) -> None:
+        info = bounded_run._JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        flag = bounded_run._WindowsJob._JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        info.BasicLimitInformation.LimitFlags = flag
+        self.assertEqual(info.BasicLimitInformation.LimitFlags, flag)
+        self.assertGreater(
+            bounded_run._JOBOBJECT_BASIC_LIMIT_INFORMATION.LimitFlags.offset, 0
+        )
+
     def test_redacts_secret_split_across_chunks(self) -> None:
         redactor = bounded_run.StreamingRedactor(["secret-value-123"])
         result = redactor.feed(b"prefix secret-")

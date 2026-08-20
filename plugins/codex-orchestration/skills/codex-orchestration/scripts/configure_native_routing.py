@@ -22,7 +22,7 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Any
+from typing import Any, Mapping
 
 from routing_state import (
     FABLE_EFFORTS,
@@ -66,6 +66,10 @@ FABLE_SERVERS = {
 }
 RPC_TIMEOUT_SECONDS = 20
 PROBE_TIMEOUT_SECONDS = 15
+NATIVE_MODEL_OVERRIDE_FIELD = "expose_spawn_agent_model_overrides"
+HEALTHY = "HEALTHY"
+DISABLED = "DISABLED"
+UNSUPPORTED = "UNSUPPORTED"
 MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+/@-]{0,199}$")
 AGENT_RE = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
 EFFORT_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
@@ -408,6 +412,73 @@ def supports_native_policy(binary: Path) -> tuple[bool, str]:
         return True, "supported"
     detail = " ".join(result.stdout.strip().split())
     return False, (detail[:240] or f"exit {result.returncode}")
+
+
+def supports_native_model_overrides(binary: Path) -> tuple[bool, str]:
+    """Detect the 0.147 structured spawn-agent model override capability."""
+
+    with tempfile.TemporaryDirectory(prefix="codex-orchestration-override-probe-") as home:
+        env = os.environ.copy()
+        env["CODEX_HOME"] = home
+        try:
+            result = subprocess.run(
+                [
+                    str(binary),
+                    "-c",
+                    f"features.multi_agent_v2.{NATIVE_MODEL_OVERRIDE_FIELD}=true",
+                    "features",
+                    "list",
+                ],
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=PROBE_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return False, str(exc)
+    if result.returncode != 0:
+        detail = " ".join(result.stdout.strip().split())
+        return False, (detail[:240] or f"exit {result.returncode}")
+    # `features list` reports named feature gates, not nested config fields.
+    # A successful isolated config parse is the capability signal; setup and
+    # status then read back the user and effective layers separately.
+    return True, "supported"
+
+
+def native_override_health(
+    config: Mapping[str, Any],
+    *,
+    capability: bool | None,
+) -> str:
+    """Return tri-state override health without treating hidden as healthy."""
+
+    if capability is not True:
+        return UNSUPPORTED
+    value = nested_get(
+        dict(config),
+        "features",
+        "multi_agent_v2",
+        NATIVE_MODEL_OVERRIDE_FIELD,
+    )
+    return HEALTHY if value is True else DISABLED
+
+
+def require_direct_route_capability(
+    routes: tuple[dict[str, Any] | None, ...], *, supported: bool
+) -> None:
+    """Reject direct routes when the spawn override inputs are unavailable."""
+
+    direct = any(
+        isinstance(route, dict) and route.get("kind") == "model"
+        for route in routes
+    )
+    if direct and supported is not True:
+        raise ConfigurationError(
+            "Direct model routes require exposed spawn-agent model overrides. "
+            "Use a verified custom agent or the task-local fallback on this client."
+        )
 
 
 def discover_compatibility_binaries(
@@ -1342,6 +1413,7 @@ def _compatibility_report(
     incompatible: list[str] = []
     for binary in binaries:
         supported, detail = supports_native_policy(binary)
+        overrides_supported, overrides_detail = supports_native_model_overrides(binary)
         version = binary_version(binary)
         results.append(
             {
@@ -1349,6 +1421,8 @@ def _compatibility_report(
                 "version": version,
                 "supported": supported,
                 "detail": detail,
+                "model_overrides": overrides_supported,
+                "model_overrides_detail": overrides_detail,
             }
         )
         state = "supports native policy" if supported else f"incompatible: {detail}"
@@ -1379,6 +1453,12 @@ def _current_values(config: dict[str, Any]) -> dict[str, Any]:
         ),
         "namespace": nested_get(
             config, "features", "multi_agent_v2", "tool_namespace"
+        ),
+        "model_overrides": nested_get(
+            config,
+            "features",
+            "multi_agent_v2",
+            NATIVE_MODEL_OVERRIDE_FIELD,
         ),
         "mcp": {
             server: nested_get(
@@ -1426,6 +1506,8 @@ def _managed_matches(state: dict[str, Any], current: dict[str, Any]) -> bool:
         and current["namespace"] == ROUTING_TOOL_NAMESPACE
     )
     if not base_matches:
+        return False
+    if "model_overrides" in managed and current.get("model_overrides") is not True:
         return False
     managed_mcp = managed.get("mcp")
     if managed_mcp is not None and not all(
@@ -1516,10 +1598,17 @@ def _status(
     require_effective: bool,
 ) -> int:
     clients_compatible = True
+    override_capabilities: list[bool] = []
     for binary in binaries:
         supported, detail = supports_native_policy(binary)
+        override_supported, override_detail = supports_native_model_overrides(binary)
         label = "compatible" if supported else f"incompatible ({detail})"
         print(f"Client: {binary} ({binary_version(binary)}) - {label}")
+        print(
+            f"Model overrides: {HEALTHY if override_supported else UNSUPPORTED} "
+            f"({override_detail})"
+        )
+        override_capabilities.append(override_supported)
         clients_compatible = clients_compatible and supported
     with AppServer(target, codex_home) as app:
         workspace = Path.cwd().resolve()
@@ -1533,6 +1622,15 @@ def _status(
         effective = _current_values(
             effective_config if isinstance(effective_config, dict) else {}
         )
+        overrides_capable = bool(override_capabilities) and all(
+            override_capabilities
+        )
+        override_health = native_override_health(
+            config,
+            capability=overrides_capable,
+        )
+        if override_health == HEALTHY and effective["model_overrides"] is not True:
+            override_health = DISABLED
         state_path = app.codex_home / STATE_FILENAME
         state = _read_state(state_path)
         _validate_state_config(state, app.config_path)
@@ -1549,20 +1647,31 @@ def _status(
             )
             if not controls_ready:
                 routing_state = "managed hints found but routing controls are incomplete"
-            elif (
+            else:
+                managed_overrides = (
+                    isinstance(state, dict)
+                    and isinstance(state.get("managed"), dict)
+                    and state["managed"].get("model_overrides") is True
+                )
+            if controls_ready and (
                 effective["mode"] == current["mode"]
                 and effective["usage"] == current["usage"]
                 and effective["metadata"] is False
                 and effective["namespace"] == ROUTING_TOOL_NAMESPACE
+                and (
+                    not managed_overrides
+                    or effective["model_overrides"] is True
+                )
             ):
                 routing_state = f"installed and effective in {workspace}"
-            else:
+            elif controls_ready:
                 routing_state = f"installed but overridden in {workspace}"
         elif current["mode"] is MISSING and current["usage"] is MISSING:
             routing_state = "inactive"
         else:
             routing_state = "partial or user-authored"
         print(f"Native policy: {routing_state}")
+        print(f"Native model override health: {override_health}")
         if routing_state == "managed fields conflict with local restore state":
             print(
                 "Recovery: run --repair as a dry run only when the saved plugin "
@@ -1660,6 +1769,15 @@ def _status(
             "Routing validation: not performed - config compatibility and policy "
             "effectiveness do not prove route acceptance or the effective child model"
         )
+        direct_model_route = state_matches and any(
+            isinstance(route, dict) and route.get("kind") == "model"
+            for route in (
+                state.get("executor") if state else None,
+                state.get("planner") if state else None,
+                state.get("advisor") if state else None,
+                state.get("designer") if state else None,
+            )
+        )
         healthy = (
             clients_compatible
             and routing_state.startswith("installed and effective")
@@ -1668,6 +1786,7 @@ def _status(
             and subscription_available
             and not role_issues
             and not orphaned_roles
+            and (not direct_model_route or override_health == HEALTHY)
         )
     return 1 if require_effective and not healthy else 0
 
@@ -1684,6 +1803,7 @@ def _prepare_setup_state(
     config_path: Path,
     replace_existing: bool,
     token_profile: str | TokenProfile | None = None,
+    native_overrides: bool = False,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
     current = _current_values(config)
     feature = current["feature"]
@@ -1753,6 +1873,9 @@ def _prepare_setup_state(
             ),
         }
         scalar_origin = feature if scalar_feature else None
+
+    if native_overrides and "model_overrides" not in previous:
+        previous["model_overrides"] = snapshot(current["model_overrides"])
 
     if scalar_feature and existing_state is None:
         replacement = {
@@ -1919,6 +2042,26 @@ def _prepare_setup_state(
         "metadata": False,
         "namespace": ROUTING_TOOL_NAMESPACE,
     }
+    if native_overrides:
+        if scalar_feature:
+            replacement[NATIVE_MODEL_OVERRIDE_FIELD] = True
+            edits[0]["value"] = replacement
+            managed_feature = replacement
+        else:
+            edits.append(
+                {
+                    "keyPath": f"features.multi_agent_v2.{NATIVE_MODEL_OVERRIDE_FIELD}",
+                    "value": True,
+                    "mergeStrategy": "replace",
+                }
+            )
+            rollback_edit = snapshot_edit(
+                f"features.multi_agent_v2.{NATIVE_MODEL_OVERRIDE_FIELD}",
+                snapshot(current["model_overrides"]),
+            )
+            if rollback_edit is not None:
+                rollback.append(rollback_edit)
+        managed["model_overrides"] = True
     if managed_mcp is not None:
         managed["mcp"] = managed_mcp
 
@@ -2002,6 +2145,10 @@ def _repair(
     controls_match = (
         current["metadata"] is False
         and current["namespace"] == ROUTING_TOOL_NAMESPACE
+        and (
+            "model_overrides" not in managed
+            or current["model_overrides"] is True
+        )
     )
     managed_mcp = managed.get("mcp")
     mcp_matches = managed_mcp is None or all(
@@ -2237,6 +2384,10 @@ def _disable(
                         "features.multi_agent_v2.usage_hint_text",
                         previous.get("usage", {"known": False}),
                     ),
+                    snapshot_edit(
+                        f"features.multi_agent_v2.{NATIVE_MODEL_OVERRIDE_FIELD}",
+                        previous.get("model_overrides", {"known": False}),
+                    ),
                 )
                 if edit is not None
             ]
@@ -2277,9 +2428,17 @@ def main() -> int:
             )
         # Disable must remain available when the policy itself is what makes an
         # older shared-config client incompatible.
-        _compatibility_report(
+        compatibility = _compatibility_report(
             binaries,
             args.allow_incompatible_client or args.disable,
+        )
+        native_overrides = bool(
+            compatibility
+            and all(
+                item.get("supported") is True
+                and item.get("model_overrides") is True
+                for item in compatibility
+            )
         )
 
         with AppServer(target, args.codex_home) as app:
@@ -2436,6 +2595,10 @@ def main() -> int:
                     "effort": designer_effort,
                 }
             validate_planning_routes(planner, advisor)
+            require_direct_route_capability(
+                (executor, planner, advisor, designer),
+                supported=native_overrides,
+            )
             subscription_prerequisites = {
                 (route["model"], route["effort"])
                 for route in (planner, advisor)
@@ -2471,6 +2634,7 @@ def main() -> int:
                 app.config_path,
                 args.replace_existing_policy,
                 args.token_profile,
+                native_overrides,
             )
             print(f"Config: {app.config_path}")
             print("Orchestrator: model selected when each Codex task starts")

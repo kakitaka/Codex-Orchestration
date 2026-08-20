@@ -29,8 +29,13 @@ MAX_AGENTS_BYTES = 16 * 1024
 MAX_AGENTS_LINES = 500
 MAX_FILE_BYTES = 2 * 1024 * 1024
 DEFAULT_MAX_FINDINGS = 200
+MAX_FINDINGS = 10_000
 MAX_TRACKED_PATH_BYTES = 8 * 1024 * 1024
 MAX_TOPLEVEL_PATH_BYTES = 64 * 1024
+MAX_TRACKED_PATHS = 100_000
+MAX_DOCUMENTS = 4_096
+MAX_DOCUMENT_BYTES = 16 * 1024 * 1024
+MAX_PATH_BYTES = 4_096
 _PROMPT_MAX_DEFAULT_RE = re.compile(
     r"(?i)(?:\bdefault(?:s|ed)?(?:\s+to)?\s+|"
     r"\b(?:model_)?reasoning_effort\b\s*[:=]\s*)[`\"']?(?:max|xhigh)\b"
@@ -87,6 +92,25 @@ class Finding:
         return f"{self.path}:{self.line}: {self.code}: {self.message}"
 
 
+class _FindingList(list[Finding]):
+    """List-compatible sink that never allocates past the requested cap."""
+
+    def __init__(self, limit: int) -> None:
+        super().__init__()
+        self.limit = limit
+        self.truncated = False
+
+    def append(self, item: Finding) -> None:
+        if len(self) >= self.limit:
+            self.truncated = True
+            return
+        super().append(item)
+
+    def extend(self, values: Iterable[Finding]) -> None:
+        for value in values:
+            self.append(value)
+
+
 class GitTrackingUnavailable(RuntimeError):
     """A Git worktree could not provide its authoritative tracked path set."""
 
@@ -125,7 +149,22 @@ def _git_tracked_paths(root: Path) -> set[str]:
         raw = completed.stdout
         if not isinstance(raw, bytes) or len(raw) > MAX_TRACKED_PATH_BYTES:
             raise ValueError("tracked path list exceeds bound")
-        return {item for item in raw.decode("utf-8", "strict").split("\0") if item}
+        values: set[str] = set()
+        start = 0
+        while start < len(raw):
+            end = raw.find(b"\0", start)
+            if end < 0:
+                raise ValueError("tracked path list is not NUL terminated")
+            item = raw[start:end]
+            start = end + 1
+            if not item:
+                continue
+            if len(values) >= MAX_TRACKED_PATHS:
+                raise ValueError("tracked path count exceeds bound")
+            if len(item) > MAX_PATH_BYTES:
+                raise ValueError("tracked path exceeds bound")
+            values.add(item.decode("utf-8", "strict"))
+        return values
     except (OSError, subprocess.SubprocessError, UnicodeDecodeError, ValueError):
         # A failed or non-Git root has no safe filesystem fallback: arbitrary
         # local files may hold private state unrelated to repository content.
@@ -145,12 +184,20 @@ def _tracked_regular_file(
         return False
     try:
         resolved = path.resolve(strict=True)
+        mode = path.stat(follow_symlinks=False)
     except OSError:
         return False
     expected = Path(os.path.abspath(path))
     if os.path.normcase(str(resolved)) != os.path.normcase(str(expected)):
         return False
-    return path.is_file() and not path.is_symlink()
+    attrs = getattr(mode, "st_file_attributes", 0)
+    if attrs & 0x400:
+        return False
+    return (
+        int(getattr(mode, "st_nlink", 0)) == 1
+        and path.is_file()
+        and not path.is_symlink()
+    )
 
 
 def _classify_tracked_files(
@@ -186,7 +233,8 @@ def _is_fixture(path: Path, root: Path) -> bool:
 
 def _read(path: Path) -> tuple[str, int] | None:
     try:
-        data = path.read_bytes()
+        with path.open("rb") as handle:
+            data = handle.read(MAX_FILE_BYTES + 1)
     except OSError:
         return None
     if len(data) > MAX_FILE_BYTES:
@@ -481,7 +529,11 @@ REQUIRED_HELPERS = {
 
 def _literal_assignment(path: Path, name: str) -> tuple[object, int] | None:
     try:
-        tree = ast.parse(path.read_text(encoding="utf-8"))
+        with path.open("rb") as handle:
+            raw = handle.read(MAX_FILE_BYTES + 1)
+        if len(raw) > MAX_FILE_BYTES:
+            return None
+        tree = ast.parse(raw.decode("utf-8"), filename=str(path))
     except (OSError, UnicodeError, SyntaxError):
         return None
     for node in tree.body:
@@ -503,6 +555,17 @@ def _check_repository_contracts(
     skill_root = root / "plugins/codex-orchestration/skills/codex-orchestration"
     manifest = root / "plugins/codex-orchestration/.codex-plugin/plugin.json"
     if not _tracked_regular_file(root, manifest, tracked_paths):
+        plugin_prefix = "plugins/codex-orchestration/"
+        if not any(item.startswith(plugin_prefix) for item in tracked_paths):
+            return
+        _add(
+            findings,
+            "MISSING_PLUGIN_MANIFEST",
+            root,
+            manifest,
+            1,
+            "required plugin manifest is missing from the tracked tree",
+        )
         return
     scripts = skill_root / "scripts"
     for name in sorted(REQUIRED_HELPERS):
@@ -541,10 +604,8 @@ def _check_repository_contracts(
         else None
     )
     if routing_tracked:
-        try:
-            routing_text = routing_path.read_text(encoding="utf-8")
-        except (OSError, UnicodeError):
-            routing_text = ""
+        read_routing = _read(routing_path)
+        routing_text = read_routing[0] if read_routing is not None else ""
     else:
         routing_text = ""
     if advisor_limit is None or advisor_limit[0] != 8 or "profile.advisor_loops" not in routing_text:
@@ -560,12 +621,12 @@ def _check_repository_contracts(
 
 def scan(root: str | Path, *, max_findings: int = DEFAULT_MAX_FINDINGS) -> list[Finding]:
     """Scan root and return deterministic findings, capped at max_findings."""
-    if max_findings <= 0:
-        raise ValueError("max_findings must be positive")
+    if type(max_findings) is not int or not 1 <= max_findings <= MAX_FINDINGS:
+        raise ValueError(f"max_findings must be positive and at most {MAX_FINDINGS}")
     base = Path(root).resolve()
     if not base.exists() or not base.is_dir():
         raise ValueError(f"root is not a directory: {root}")
-    findings: list[Finding] = []
+    findings: _FindingList = _FindingList(max_findings)
     documents: list[tuple[Path, str]] = []
     try:
         tracked_paths = _git_tracked_paths(base)
@@ -581,6 +642,7 @@ def scan(root: str | Path, *, max_findings: int = DEFAULT_MAX_FINDINGS) -> list[
             )
         ]
     regular_files, unsafe_paths = _classify_tracked_files(base, tracked_paths)
+    document_bytes = 0
     for relative_name in unsafe_paths:
         findings.append(
             Finding(
@@ -598,13 +660,35 @@ def scan(root: str | Path, *, max_findings: int = DEFAULT_MAX_FINDINGS) -> list[
         read = _read(path)
         if read is None:
             try:
-                _check_byte_budgets(findings, base, path, path.stat().st_size)
+                size = path.stat().st_size
+                _check_byte_budgets(findings, base, path, size)
+                if size > MAX_FILE_BYTES:
+                    _add(
+                        findings,
+                        "FILE_BYTES",
+                        base,
+                        path,
+                        1,
+                        f"tracked file is {size} bytes; limit is {MAX_FILE_BYTES}",
+                    )
             except OSError:
-                pass
+                _add(
+                    findings,
+                    "FILE_READ_ERROR",
+                    base,
+                    path,
+                    1,
+                    "tracked file could not be inspected safely",
+                )
         else:
             text, size = read
             if path.suffix.lower() in _TEXT_SUFFIXES:
-                documents.append((path, text))
+                if (
+                    len(documents) < MAX_DOCUMENTS
+                    and document_bytes + size <= MAX_DOCUMENT_BYTES
+                ):
+                    documents.append((path, text))
+                    document_bytes += size
                 _check_budgets(findings, base, path, text, size)
                 if path.suffix.lower() in {".md", ".markdown"}:
                     _check_links(findings, base, path, text, tracked_paths)
@@ -618,7 +702,7 @@ def scan(root: str | Path, *, max_findings: int = DEFAULT_MAX_FINDINGS) -> list[
     # Path/line order matches ordinary linter output and is independent of
     # filesystem traversal order.
     findings.sort(key=lambda finding: (finding.path, finding.line, finding.code, finding.message))
-    return findings[:max_findings]
+    return findings
 
 
 def lint(root: str | Path, *, max_findings: int = DEFAULT_MAX_FINDINGS) -> list[Finding]:
@@ -636,12 +720,11 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
-    if args.max_findings <= 0:
-        parser.error("--max-findings must be positive")
-    # Ask for one extra item so JSON output can accurately state truncation.
-    collected = scan(args.root, max_findings=args.max_findings + 1)
-    truncated = len(collected) > args.max_findings
-    findings = collected[:args.max_findings]
+    if type(args.max_findings) is not int or not 1 <= args.max_findings <= MAX_FINDINGS:
+        parser.error(f"--max-findings must be positive and at most {MAX_FINDINGS}")
+    collected = scan(args.root, max_findings=args.max_findings)
+    truncated = bool(getattr(collected, "truncated", False))
+    findings = collected
     if args.as_json:
         payload = {
             "findings": [finding.as_dict() for finding in findings],

@@ -17,7 +17,8 @@ import re
 import shutil
 import stat
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
 try:
@@ -40,12 +41,27 @@ except ImportError:  # type: ignore
     )
 
 
-CACHE_FORMAT_VERSION = 1
+CACHE_FORMAT_VERSION = 2
 DEFAULT_TTL_SECONDS = 24 * 60 * 60
 MAX_ENTRIES = 512
 MAX_CACHE_BYTES = 2 * 1024 * 1024
+MAX_EXECUTABLE_BYTES = 64 * 1024 * 1024
+MAX_TTL_SECONDS = 365 * 24 * 60 * 60
+MAX_FUTURE_SKEW_SECONDS = 5 * 60
+MAX_KEY_FIELDS = 2_048
+UNTRUSTED_ADVISORY = "UNTRUSTED_ADVISORY"
 _DIGEST_RE = r"^[0-9a-fA-F]{16,128}$"
-_ALLOWED_PURPOSES = frozenset({"ordinary", "final", "security", "fresh"})
+_ALLOWED_PURPOSES = frozenset(
+    {
+        "ordinary",
+        "advisory",
+        "authoritative",
+        "final",
+        "release",
+        "security",
+        "fresh",
+    }
+)
 _NON_REUSABLE = frozenset({"partial", "timeout", "timed_out", "cancel", "cancelled", "corrupt", "incomplete"})
 _PASS = frozenset({"pass", "passed", "success", "ok", "complete", "completed"})
 _FAIL = frozenset({"fail", "failed", "failure", "error"})
@@ -71,6 +87,20 @@ def _digest(value: Any) -> str:
     return hashlib.sha256(_canonical_bytes(value)).hexdigest()
 
 
+def _exact_bounded_int(
+    value: Any,
+    field: str,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int:
+    if type(value) is not int or value < minimum or value > maximum:
+        raise ValidationCacheInputError(
+            f"{field} must be an integer in [{minimum}, {maximum}]"
+        )
+    return value
+
+
 def _validate_digest(value: Any, field: str) -> str:
     if not isinstance(value, str) or len(value) < 16 or len(value) > 128:
         raise ValidationCacheInputError(f"invalid {field}")
@@ -91,7 +121,12 @@ def _normal_relative(value: Any, field: str, *, allow_root: bool = False) -> str
         raise ValidationCacheInputError(f"invalid {field}") from exc
 
 
-def _normalize_hash_map(value: Mapping[str, str] | None, field: str) -> dict[str, str]:
+def _normalize_hash_map(
+    value: Mapping[str, str] | None,
+    field: str,
+    *,
+    namespace: str,
+) -> dict[str, str]:
     if value is None:
         return {}
     if not isinstance(value, Mapping):
@@ -101,7 +136,14 @@ def _normalize_hash_map(value: Mapping[str, str] | None, field: str) -> dict[str
     result: dict[str, str] = {}
     for raw_name, raw_digest in value.items():
         name = _normal_relative(raw_name, f"{field} name")
-        result[name] = _validate_digest(raw_digest, f"{field} value")
+        if name in result:
+            raise ValidationCacheInputError(f"duplicate {field} name")
+        digest = _validate_digest(raw_digest, f"{field} value")
+        # Category and path are part of the digest domain.  This prevents a
+        # digest copied between source/config/test namespaces from colliding.
+        result[name] = _digest(
+            {"namespace": namespace, "path": name, "digest": digest}
+        )
     return dict(sorted(result.items()))
 
 
@@ -129,7 +171,15 @@ def _normalize_env(value: Mapping[str, Any] | Sequence[str] | None) -> dict[str,
             continue
         if not isinstance(raw_value, str) or len(raw_value) > 4096:
             raise ValidationCacheInputError("invalid environment value")
-        result[raw_name] = _digest([raw_name, raw_value])
+        if raw_name in result:
+            raise ValidationCacheInputError("duplicate environment name")
+        result[raw_name] = _digest(
+            {
+                "namespace": "environment",
+                "name": raw_name,
+                "value_digest": _digest([raw_name, raw_value]),
+            }
+        )
     return dict(sorted(result.items()))
 
 
@@ -141,23 +191,82 @@ def executable_identity_digest(executable: str | os.PathLike[str], version: str 
     raw = os.fspath(executable)
     if not isinstance(raw, str) or not raw or "\x00" in raw:
         raise ValidationCacheInputError("invalid executable")
+    version_text = "" if version is None else version
+    if not isinstance(version_text, str) or len(version_text) > 128 or "\x00" in version_text:
+        raise ValidationCacheInputError("invalid executable version")
     resolved = shutil.which(raw) if not os.path.isabs(raw) else raw
     if resolved is None:
         raise ValidationCacheInputError("executable cannot be resolved")
-    if os.path.islink(resolved):
-        raise ValidationCacheInputError("executable symlink is not accepted")
+    resolved = os.path.abspath(resolved)
     try:
-        details = os.stat(resolved, follow_symlinks=False)
+        path_before = os.lstat(resolved)
     except OSError as exc:
         raise ValidationCacheInputError("executable cannot be inspected") from exc
-    version_text = "" if version is None else version
-    if not isinstance(version_text, str) or len(version_text) > 512 or "\x00" in version_text:
-        raise ValidationCacheInputError("invalid executable version")
+    if os.path.islink(resolved) or bool(int(getattr(path_before, "st_file_attributes", 0)) & 0x0400):
+        raise ValidationCacheInputError("executable symlink/reparse is not accepted")
+    if not stat.S_ISREG(path_before.st_mode) or int(getattr(path_before, "st_nlink", 1)) > 1:
+        raise ValidationCacheInputError("executable must be a single-link regular file")
+    def object_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+        return (
+            int(value.st_dev),
+            int(value.st_ino),
+            stat.S_IFMT(value.st_mode),
+            int(value.st_size),
+            int(getattr(value, "st_mtime_ns", 0)),
+        )
+
+    path_before_identity = object_identity(path_before)
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(resolved, flags)
+    except OSError as exc:
+        raise ValidationCacheInputError("executable cannot be inspected") from exc
+    content = hashlib.sha256()
+    try:
+        with os.fdopen(descriptor, "rb", closefd=True) as handle:
+            before = os.fstat(handle.fileno())
+            if not stat.S_ISREG(before.st_mode):
+                raise ValidationCacheInputError("executable must be a regular file")
+            if int(getattr(before, "st_nlink", 1)) > 1:
+                raise ValidationCacheInputError("executable hardlinks are not accepted")
+            if object_identity(before) != path_before_identity:
+                raise ValidationCacheInputError("executable changed before hashing")
+            if before.st_size < 0 or before.st_size > MAX_EXECUTABLE_BYTES:
+                raise ValidationCacheInputError("executable exceeds hashing bound")
+            bytes_read = 0
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                bytes_read += len(chunk)
+                if bytes_read > MAX_EXECUTABLE_BYTES:
+                    raise ValidationCacheInputError("executable exceeds hashing bound")
+                content.update(chunk)
+            after = os.fstat(handle.fileno())
+    except OSError as exc:
+        raise ValidationCacheInputError("executable cannot be hashed") from exc
+    try:
+        path_after = os.lstat(resolved)
+    except OSError as exc:
+        raise ValidationCacheInputError("executable disappeared while hashing") from exc
+    if os.path.islink(resolved) or bool(int(getattr(path_after, "st_file_attributes", 0)) & 0x0400):
+        raise ValidationCacheInputError("executable changed to a link/reparse point")
+    if not stat.S_ISREG(path_after.st_mode) or int(getattr(path_after, "st_nlink", 1)) > 1:
+        raise ValidationCacheInputError("executable changed to an unsafe file")
+    if object_identity(before) != object_identity(after):
+        raise ValidationCacheInputError("executable changed while hashing")
+    if object_identity(path_after) != object_identity(before):
+        raise ValidationCacheInputError("executable path changed while hashing")
     identity = {
+        "namespace": "executable",
         "basename": os.path.basename(resolved).lower(),
-        "mode": stat.S_IMODE(details.st_mode),
-        "size": int(details.st_size),
-        "mtime_ns": int(details.st_mtime_ns),
+        "resolved_path_digest": _digest(
+            [os.path.normcase(os.path.realpath(resolved))]
+        ),
+        "content_sha256": content.hexdigest(),
+        "mode": stat.S_IMODE(before.st_mode),
+        "size": int(before.st_size),
+        "mtime_ns": int(before.st_mtime_ns),
         "version": version_text,
     }
     return _digest(identity)
@@ -169,26 +278,111 @@ class ValidationCacheKey:
     argv_digest: str
     cwd_relative: str
     executable_digest: str
-    source_blob_ids: dict[str, str]
-    lock_hashes: dict[str, str]
-    config_hashes: dict[str, str]
-    env_fingerprints: dict[str, str]
+    source_blob_ids: Mapping[str, str]
+    lock_hashes: Mapping[str, str]
+    config_hashes: Mapping[str, str]
+    env_fingerprints: Mapping[str, str]
+    dependency_hashes: Mapping[str, str] = field(default_factory=dict)
+    test_hashes: Mapping[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if type(self.format_version) is not int or self.format_version != CACHE_FORMAT_VERSION:
+            raise ValidationCacheInputError("unsupported cache key format")
+        object.__setattr__(
+            self, "argv_digest", _validate_digest(self.argv_digest, "argv_digest")
+        )
+        object.__setattr__(
+            self,
+            "executable_digest",
+            _validate_digest(self.executable_digest, "executable_digest"),
+        )
+        object.__setattr__(
+            self,
+            "cwd_relative",
+            _normal_relative(self.cwd_relative, "cwd_relative", allow_root=True),
+        )
+        for name in (
+            "source_blob_ids",
+            "lock_hashes",
+            "dependency_hashes",
+            "test_hashes",
+            "config_hashes",
+            "env_fingerprints",
+        ):
+            value = getattr(self, name)
+            if not isinstance(value, Mapping) or len(value) > MAX_KEY_FIELDS:
+                raise ValidationCacheInputError(f"{name} must be a bounded mapping")
+            normalized: dict[str, str] = {}
+            for raw_path, raw_digest in value.items():
+                path = _normal_relative(raw_path, f"{name} path")
+                if path in normalized:
+                    raise ValidationCacheInputError(f"duplicate {name} path")
+                digest = _validate_digest(raw_digest, f"{name} digest")
+                # make_validation_key emits 64-character namespaced digests.
+                # Requiring that representation here prevents direct dataclass
+                # construction from bypassing category canonicalization.
+                if len(digest) != 64:
+                    raise ValidationCacheInputError(f"{name} digest is not canonical")
+                normalized[path] = digest
+            object.__setattr__(self, name, MappingProxyType(dict(sorted(normalized.items()))))
 
     def as_record(self) -> dict[str, Any]:
-        return {
+        # Return fresh mutable copies so callers cannot mutate the key held by
+        # a cache entry or change a later digest calculation.
+        record = {
             "format_version": self.format_version,
             "argv_digest": self.argv_digest,
             "cwd_relative": self.cwd_relative,
             "executable_digest": self.executable_digest,
-            "source_blob_ids": self.source_blob_ids,
-            "lock_hashes": self.lock_hashes,
-            "config_hashes": self.config_hashes,
-            "env_fingerprints": self.env_fingerprints,
+            "source_blob_ids": dict(self.source_blob_ids),
+            "lock_hashes": dict(self.lock_hashes),
+            "dependency_hashes": dict(self.dependency_hashes),
+            "test_hashes": dict(self.test_hashes),
+            "config_hashes": dict(self.config_hashes),
+            "env_fingerprints": dict(self.env_fingerprints),
         }
+        # Re-run validation on every public serialization path.
+        type(self)(**record)
+        return record
 
     @property
     def digest(self) -> str:
         return _digest(self.as_record())
+
+    @property
+    def identity_complete(self) -> bool:
+        return all(
+            bool(getattr(self, name))
+            for name in (
+                "source_blob_ids",
+                "test_hashes",
+                "config_hashes",
+                "env_fingerprints",
+            )
+        ) and bool(self.lock_hashes or self.dependency_hashes) and bool(
+            self.executable_digest
+        )
+
+    @classmethod
+    def from_record(cls, value: Mapping[str, Any]) -> "ValidationCacheKey":
+        required = {
+            "format_version",
+            "argv_digest",
+            "cwd_relative",
+            "executable_digest",
+            "source_blob_ids",
+            "lock_hashes",
+            "dependency_hashes",
+            "test_hashes",
+            "config_hashes",
+            "env_fingerprints",
+        }
+        if not isinstance(value, Mapping) or set(value) != required:
+            raise ValidationCacheError("cache key schema is malformed")
+        try:
+            return cls(**dict(value))
+        except (TypeError, ValueError, ValidationCacheError) as exc:
+            raise ValidationCacheError("cache key identity is malformed") from exc
 
 
 def make_validation_key(
@@ -202,6 +396,7 @@ def make_validation_key(
     lock_hashes: Mapping[str, str] | None = None,
     config_hashes: Mapping[str, str] | None = None,
     dependency_hashes: Mapping[str, str] | None = None,
+    test_hashes: Mapping[str, str] | None = None,
     env_allowlist: Mapping[str, Any] | Sequence[str] | None = None,
     format_version: int = CACHE_FORMAT_VERSION,
 ) -> ValidationCacheKey:
@@ -218,20 +413,39 @@ def make_validation_key(
         if not isinstance(item, str) or not item or len(item) > 4096 or "\x00" in item:
             raise ValidationCacheInputError("argv contains an invalid argument")
         normalized_argv.append(item)
-    argv_digest = _digest({"ordered_argv": normalized_argv})
+    argv_digest = _digest(
+        {"namespace": "command_argv", "ordered_argv": normalized_argv}
+    )
     cwd = _normal_relative(cwd_relative, "cwd_relative", allow_root=True)
+    if executable_digest is not None and (
+        executable is not None or executable_version is not None
+    ):
+        raise ValidationCacheInputError(
+            "executable identity inputs and executable_digest are mutually exclusive"
+        )
     if executable_digest is None:
         if executable is None:
             raise ValidationCacheInputError("executable or executable_digest is required")
         executable_digest = executable_identity_digest(executable, executable_version)
     else:
         executable_digest = _validate_digest(executable_digest, "executable_digest")
-    source_ids = _normalize_hash_map(source_blob_ids, "source_blob_ids")
-    locks = _normalize_hash_map(lock_hashes, "lock_hashes")
-    if dependency_hashes:
-        locks.update(_normalize_hash_map(dependency_hashes, "dependency_hashes"))
-        locks = dict(sorted(locks.items()))
-    configs = _normalize_hash_map(config_hashes, "config_hashes")
+    source_ids = _normalize_hash_map(
+        source_blob_ids, "source_blob_ids", namespace="relevant_sources"
+    )
+    locks = _normalize_hash_map(
+        lock_hashes, "lock_hashes", namespace="dependency_lockfiles"
+    )
+    dependencies = _normalize_hash_map(
+        dependency_hashes,
+        "dependency_hashes",
+        namespace="dependency_sources",
+    )
+    tests = _normalize_hash_map(
+        test_hashes, "test_hashes", namespace="test_files"
+    )
+    configs = _normalize_hash_map(
+        config_hashes, "config_hashes", namespace="configuration"
+    )
     env = _normalize_env(env_allowlist)
     return ValidationCacheKey(
         format_version=format_version,
@@ -242,6 +456,8 @@ def make_validation_key(
         lock_hashes=locks,
         config_hashes=configs,
         env_fingerprints=env,
+        dependency_hashes=dependencies,
+        test_hashes=tests,
     )
 
 
@@ -257,6 +473,66 @@ class ValidationCacheEntry:
     complete: bool
     created_at: int
     expires_at: int
+    identity_complete: bool = False
+    trust: str = UNTRUSTED_ADVISORY
+
+    def __post_init__(self) -> None:
+        key = ValidationCacheKey.from_record(self.key)
+        if not isinstance(self.key_digest, str) or _validate_digest(
+            self.key_digest, "cache key"
+        ) != key.digest:
+            raise ValidationCacheError("cache entry key digest mismatch")
+        if self.status not in {
+            "passed",
+            "failed",
+            "partial",
+            "timeout",
+            "timed_out",
+            "cancel",
+            "cancelled",
+            "corrupt",
+            "incomplete",
+        }:
+            raise ValidationCacheError("cache entry status is malformed")
+        if not isinstance(self.exit_category, str) or _CATEGORY_RE.fullmatch(
+            self.exit_category
+        ) is None:
+            raise ValidationCacheError("cache entry category is malformed")
+        if self.exit_code is not None and (
+            type(self.exit_code) is not int or abs(self.exit_code) > 2**31 - 1
+        ):
+            raise ValidationCacheError("cache entry exit code is malformed")
+        if self.duration_ms is not None and (
+            type(self.duration_ms) is not int
+            or self.duration_ms < 0
+            or self.duration_ms > 2**31 - 1
+        ):
+            raise ValidationCacheError("cache entry duration is malformed")
+        if type(self.deterministic) is not bool or type(self.complete) is not bool:
+            raise ValidationCacheError("cache entry completion flags are malformed")
+        if type(self.created_at) is not int or type(self.expires_at) is not int:
+            raise ValidationCacheError("cache entry timestamps are malformed")
+        if (
+            self.created_at < 0
+            or self.expires_at < self.created_at
+            or self.expires_at - self.created_at > MAX_TTL_SECONDS
+        ):
+            raise ValidationCacheError("cache entry timestamps are malformed")
+        if type(self.identity_complete) is not bool:
+            raise ValidationCacheError("cache entry identity flag is malformed")
+        if self.trust != UNTRUSTED_ADVISORY:
+            raise ValidationCacheError("cache entry trust semantics are malformed")
+        record = key.as_record()
+        for name in (
+            "source_blob_ids",
+            "lock_hashes",
+            "dependency_hashes",
+            "test_hashes",
+            "config_hashes",
+            "env_fingerprints",
+        ):
+            record[name] = MappingProxyType(dict(record[name]))
+        object.__setattr__(self, "key", MappingProxyType(record))
 
     @property
     def reusable(self) -> bool:
@@ -264,23 +540,37 @@ class ValidationCacheEntry:
             self.status == "passed"
             and self.complete
             and self.deterministic
+            and self.identity_complete
             and self.exit_category == "success"
-            and (self.exit_code in {None, 0})
-            and bool(self.key.get("source_blob_ids"))
+            and type(self.exit_code) is int
+            and self.exit_code == 0
+            and ValidationCacheKey.from_record(self.key).identity_complete
         )
 
     @property
     def is_failure_hint(self) -> bool:
-        return bool(self.key.get("source_blob_ids")) and not self.reusable and self.status in {
-            "failed",
-            "partial",
-            "timeout",
-            "cancelled",
-            "corrupt",
-        }
+        return (
+            self.identity_complete
+            and ValidationCacheKey.from_record(self.key).identity_complete
+            and not self.reusable
+            and self.status
+            in {
+                "failed",
+                "partial",
+                "timeout",
+                "cancelled",
+                "corrupt",
+            }
+        )
+
+    @property
+    def advisory(self) -> bool:
+        return True
 
 
 def _entry_from_record(key_digest: str, value: Mapping[str, Any]) -> ValidationCacheEntry:
+    if not isinstance(value, Mapping):
+        raise ValidationCacheError("cache entry is malformed")
     required = {
         "key",
         "status",
@@ -291,6 +581,8 @@ def _entry_from_record(key_digest: str, value: Mapping[str, Any]) -> ValidationC
         "complete",
         "created_at",
         "expires_at",
+        "identity_complete",
+        "trust",
     }
     if set(value) != required:
         raise ValidationCacheError("cache entry has unexpected fields")
@@ -298,9 +590,18 @@ def _entry_from_record(key_digest: str, value: Mapping[str, Any]) -> ValidationC
     if not isinstance(key, Mapping):
         raise ValidationCacheError("cache entry key is malformed")
     status = value["status"]
-    if not isinstance(status, str) or status not in _PASS | _FAIL | _NON_REUSABLE:
+    if not isinstance(status, str) or status not in {
+        "passed",
+        "failed",
+        "partial",
+        "timeout",
+        "timed_out",
+        "cancel",
+        "cancelled",
+        "corrupt",
+        "incomplete",
+    }:
         raise ValidationCacheError("cache entry status is malformed")
-    status = "passed" if status in _PASS else "failed" if status in _FAIL else status
     category = value["exit_category"]
     if not isinstance(category, str) or _CATEGORY_RE.fullmatch(category) is None:
         raise ValidationCacheError("cache entry category is malformed")
@@ -314,11 +615,21 @@ def _entry_from_record(key_digest: str, value: Mapping[str, Any]) -> ValidationC
         raise ValidationCacheError("cache entry completion flags are malformed")
     created = value["created_at"]
     expires = value["expires_at"]
-    if type(created) is not int or type(expires) is not int or created < 0 or expires < created:
+    if (
+        type(created) is not int
+        or type(expires) is not int
+        or created < 0
+        or expires < created
+        or expires - created > MAX_TTL_SECONDS
+    ):
         raise ValidationCacheError("cache entry timestamps are malformed")
+    identity_complete = value["identity_complete"]
+    trust = value["trust"]
+    if type(identity_complete) is not bool or trust != UNTRUSTED_ADVISORY:
+        raise ValidationCacheError("cache entry trust/identity metadata is malformed")
     return ValidationCacheEntry(
-        key_digest=key_digest,
-        key=dict(key),
+        key_digest=_validate_digest(key_digest, "cache key"),
+        key=key,
         status=status,
         exit_category=category,
         exit_code=exit_code,
@@ -327,6 +638,8 @@ def _entry_from_record(key_digest: str, value: Mapping[str, Any]) -> ValidationC
         complete=value["complete"],
         created_at=created,
         expires_at=expires,
+        identity_complete=identity_complete,
+        trust=trust,
     )
 
 
@@ -343,11 +656,19 @@ class ValidationCache:
     ) -> None:
         self.repo_root = os.path.abspath(os.fspath(repo_root))
         self.target = path if path is not None else os.path.join(".codex-state", "validation-cache.json")
+        self.ttl_seconds = _exact_bounded_int(
+            ttl_seconds,
+            "ttl_seconds",
+            minimum=1,
+            maximum=MAX_TTL_SECONDS,
+        )
+        self.max_entries = _exact_bounded_int(
+            max_entries,
+            "max_entries",
+            minimum=1,
+            maximum=4096,
+        )
         self.cache_path = resolve_state_path(self.repo_root, self.target, create_parents=True)
-        self.ttl_seconds = int(ttl_seconds)
-        self.max_entries = int(max_entries)
-        if self.ttl_seconds <= 0 or self.max_entries <= 0 or self.max_entries > 4096:
-            raise ValueError("invalid cache bounds")
 
     def _empty(self) -> dict[str, Any]:
         return {"format_version": CACHE_FORMAT_VERSION, "entries": {}}
@@ -367,37 +688,60 @@ class ValidationCache:
             with contextlib.suppress(Exception):
                 quarantine_file(self.repo_root, self.target, suffix="cache-schema")
             return self._empty()
-        if value["format_version"] != CACHE_FORMAT_VERSION or not isinstance(value["entries"], Mapping):
+        if (
+            type(value["format_version"]) is not int
+            or value["format_version"] != CACHE_FORMAT_VERSION
+            or not isinstance(value["entries"], Mapping)
+        ):
             with contextlib.suppress(Exception):
                 quarantine_file(self.repo_root, self.target, suffix="cache-schema")
             return self._empty()
         entries: dict[str, Any] = {}
+        invalid_seen = False
+        now_value = self._now(None)
         for raw_digest, raw_entry in value["entries"].items():
             try:
                 key_digest = _validate_digest(raw_digest, "cache key")
                 if not isinstance(raw_entry, Mapping):
-                    continue
+                    raise ValidationCacheError("cache entry is malformed")
                 parsed = _entry_from_record(key_digest, raw_entry)
             except ValidationCacheError:
+                invalid_seen = True
                 continue
             if parsed.key_digest != key_digest:
+                invalid_seen = True
+                continue
+            if parsed.created_at > now_value + MAX_FUTURE_SKEW_SECONDS:
+                invalid_seen = True
                 continue
             entries[key_digest] = dict(raw_entry)
             if len(entries) >= self.max_entries:
                 break
+        if invalid_seen:
+            with contextlib.suppress(Exception):
+                quarantine_file(self.repo_root, self.target, suffix="cache-entry")
+            return self._empty()
         return {"format_version": CACHE_FORMAT_VERSION, "entries": entries}
 
     @staticmethod
     def _now(now: int | float | None) -> int:
-        value = int(time.time() if now is None else now)
+        if now is None:
+            value = int(time.time())
+        else:
+            if type(now) is not int:
+                raise ValidationCacheInputError("time must be an integer")
+            value = now
         if value < 0:
-            raise ValueError("time cannot be negative")
+            raise ValidationCacheInputError("time cannot be negative")
         return value
 
     def _key_record(self, key: ValidationCacheKey) -> dict[str, Any]:
         if not isinstance(key, ValidationCacheKey):
             raise ValidationCacheInputError("key must be ValidationCacheKey")
-        return key.as_record()
+        try:
+            return key.as_record()
+        except (TypeError, ValueError, ValidationCacheError) as exc:
+            raise ValidationCacheInputError("key identity is malformed") from exc
 
     def record_result(
         self,
@@ -407,8 +751,8 @@ class ValidationCache:
         exit_category: str,
         exit_code: int | None = None,
         duration_seconds: float | int | None = None,
-        deterministic: bool = True,
-        complete: bool = True,
+        deterministic: bool = False,
+        complete: bool = False,
         ttl_seconds: int | None = None,
         now: int | float | None = None,
         output: Any = None,
@@ -433,6 +777,10 @@ class ValidationCache:
             normalized = "failed"
         elif normalized not in _NON_REUSABLE:
             raise ValidationCacheInputError("unsupported validation status")
+        elif normalized == "timed_out":
+            normalized = "timeout"
+        elif normalized == "cancel":
+            normalized = "cancelled"
         if not isinstance(exit_category, str) or _CATEGORY_RE.fullmatch(exit_category) is None:
             raise ValidationCacheInputError("invalid exit category")
         if exit_code is not None and (type(exit_code) is not int or abs(exit_code) > 2**31 - 1):
@@ -447,9 +795,16 @@ class ValidationCache:
             duration_ms = int(round(float(duration_seconds) * 1000))
         if type(deterministic) is not bool or type(complete) is not bool:
             raise ValidationCacheInputError("completion flags must be boolean")
-        ttl = self.ttl_seconds if ttl_seconds is None else int(ttl_seconds)
-        if ttl <= 0 or ttl > 365 * 24 * 60 * 60:
-            raise ValidationCacheInputError("invalid TTL")
+        ttl = (
+            self.ttl_seconds
+            if ttl_seconds is None
+            else _exact_bounded_int(
+                ttl_seconds,
+                "ttl_seconds",
+                minimum=1,
+                maximum=MAX_TTL_SECONDS,
+            )
+        )
         created = self._now(now)
         key_digest = key.digest
         raw_entry = {
@@ -462,6 +817,8 @@ class ValidationCache:
             "complete": complete,
             "created_at": created,
             "expires_at": created + ttl,
+            "identity_complete": key.identity_complete,
+            "trust": UNTRUSTED_ADVISORY,
         }
         # Parse the constructed entry before touching disk.
         entry = _entry_from_record(key_digest, raw_entry)
@@ -503,6 +860,10 @@ class ValidationCache:
     record = record_result
 
     def _entry_for(self, key: ValidationCacheKey, *, now: int | float | None = None) -> ValidationCacheEntry | None:
+        if not isinstance(key, ValidationCacheKey):
+            raise ValidationCacheInputError("key must be ValidationCacheKey")
+        self._key_record(key)
+        now_value = self._now(now)
         key_digest = key.digest
         state = self._load()
         raw = state["entries"].get(key_digest)
@@ -512,10 +873,13 @@ class ValidationCache:
             entry = _entry_from_record(key_digest, raw)
         except ValidationCacheError:
             return None
-        if entry.expires_at < self._now(now):
+        if entry.expires_at < now_value:
+            return None
+        if entry.created_at > now_value + MAX_FUTURE_SKEW_SECONDS:
             return None
         # Recompute key digest from the persisted key; a forged map must not hit.
-        if _digest(entry.key) != key_digest or entry.key != key.as_record():
+        entry_key_record = ValidationCacheKey.from_record(entry.key).as_record()
+        if _digest(entry_key_record) != key_digest or entry_key_record != key.as_record():
             return None
         return entry
 
@@ -525,10 +889,17 @@ class ValidationCache:
         *,
         purpose: str = "ordinary",
         now: int | float | None = None,
+        advisory: bool = False,
     ) -> ValidationCacheEntry | None:
+        self._key_record(key)
+        self._now(now)
         if purpose not in _ALLOWED_PURPOSES:
             raise ValidationCacheInputError("invalid validation purpose")
-        if purpose != "ordinary":
+        if type(advisory) is not bool:
+            raise ValidationCacheInputError("advisory mode must be boolean")
+        if purpose == "advisory":
+            advisory = True
+        if purpose not in {"ordinary", "advisory"} or not advisory:
             return None
         entry = self._entry_for(key, now=now)
         return entry if entry is not None and entry.reusable else None
@@ -536,16 +907,31 @@ class ValidationCache:
     get = lookup
     reusable = lookup
 
+    def lookup_advisory(
+        self,
+        key: ValidationCacheKey,
+        *,
+        now: int | None = None,
+    ) -> ValidationCacheEntry | None:
+        return self.lookup(key, purpose="ordinary", now=now, advisory=True)
+
     def failure_hint(
         self,
         key: ValidationCacheKey,
         *,
         purpose: str = "ordinary",
         now: int | float | None = None,
+        advisory: bool = False,
     ) -> ValidationCacheEntry | None:
+        self._key_record(key)
+        self._now(now)
         if purpose not in _ALLOWED_PURPOSES:
             raise ValidationCacheInputError("invalid validation purpose")
-        if purpose != "ordinary":
+        if type(advisory) is not bool:
+            raise ValidationCacheInputError("advisory mode must be boolean")
+        if purpose == "advisory":
+            advisory = True
+        if purpose not in {"ordinary", "advisory"} or not advisory:
             return None
         entry = self._entry_for(key, now=now)
         return entry if entry is not None and entry.is_failure_hint else None
@@ -594,6 +980,12 @@ ValidationResultCache = ValidationCache
 
 __all__ = [
     "CACHE_FORMAT_VERSION",
+    "DEFAULT_TTL_SECONDS",
+    "MAX_CACHE_BYTES",
+    "MAX_EXECUTABLE_BYTES",
+    "MAX_FUTURE_SKEW_SECONDS",
+    "MAX_TTL_SECONDS",
+    "UNTRUSTED_ADVISORY",
     "ValidationCache",
     "ValidationCacheEntry",
     "ValidationCacheError",

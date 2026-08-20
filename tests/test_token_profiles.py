@@ -71,9 +71,20 @@ class TokenProfileTests(unittest.TestCase):
             {"model": "gpt-5.6-sol", "effort": "max"},
         )
         self.assertEqual(
-            profiles.recommend_route("quality", worker_requirement="Luna Max"),
+            profiles.recommend_route(
+                "quality",
+                worker_requirement={"model": "gpt-5.6-luna", "effort": "max"},
+            ),
             {"model": "gpt-5.6-luna", "effort": "max"},
         )
+        self.assertEqual(
+            profiles.recommend_route("quality", worker_requirement="Luna Max"),
+            {"model": "gpt-5.6-sol", "effort": "high"},
+        )
+        with self.assertRaises(profiles.TokenProfileError):
+            profiles.recommend_route(
+                "lean", worker_requirement={"model": "not-luna", "effort": "max"}
+            )
 
     def test_review_roles_have_sol_high_floor(self) -> None:
         for seat in ("auditor", "advisor", "reviewer", "Reviewer"):
@@ -90,7 +101,7 @@ class TokenProfileTests(unittest.TestCase):
     def test_worker_requirement_is_agents_precedence_but_explicit_values_win(self) -> None:
         result = profiles.resolve_route(
             profile="lean",
-            worker_requirement="Luna Max",
+            worker_requirement={"model": "gpt-5.6-luna", "effort": "max"},
             configured={"model": "configured", "effort": "medium"},
         )
         self.assertEqual(result, {"model": "gpt-5.6-luna", "effort": "max"})
@@ -98,7 +109,7 @@ class TokenProfileTests(unittest.TestCase):
         explicit_model = profiles.resolve_route(
             profile="lean",
             explicit={"model": "user-model"},
-            worker_requirement="Luna Max",
+            worker_requirement={"model": "gpt-5.6-luna", "effort": "max"},
             configured={"model": "configured", "effort": "medium"},
         )
         self.assertEqual(
@@ -108,7 +119,7 @@ class TokenProfileTests(unittest.TestCase):
         explicit_effort = profiles.resolve_route(
             profile="lean",
             explicit={"effort": "low"},
-            worker_requirement="Luna Max",
+            worker_requirement={"model": "gpt-5.6-luna", "effort": "max"},
             configured={"model": "configured", "effort": "medium"},
         )
         self.assertEqual(
@@ -117,12 +128,17 @@ class TokenProfileTests(unittest.TestCase):
         )
         sourced = profiles.resolve_route_with_source(
             profile="lean",
-            worker_requirement="Luna Max",
+            worker_requirement={"model": "gpt-5.6-luna", "effort": "max"},
             configured={"model": "configured", "effort": "medium"},
         )
         self.assertEqual(sourced["source"], "agents")
         self.assertEqual(sourced["model_source"], "agents")
         self.assertEqual(sourced["effort_source"], "agents")
+
+        with self.assertRaisesRegex(profiles.TokenProfileError, "conflicting explicit"):
+            profiles.resolve_route(
+                explicit={"model": "first"}, explicit_model="second"
+            )
 
     def test_precedence_does_not_mutate_routes(self) -> None:
         configured = {"model": "configured", "effort": "high"}

@@ -13,11 +13,13 @@ import contextlib
 import hashlib
 import hmac
 import json
+import math
 import ntpath
 import os
 import re
 import secrets
 import threading
+import time
 from typing import Any, Mapping, Sequence
 
 try:
@@ -55,13 +57,18 @@ MAX_TELEMETRY_EVENTS = 512
 MAX_TELEMETRY_BYTES = 2 * 1024 * 1024
 MAX_LANES = 128
 MAX_LANE_BYTES = 256 * 1024
+MAX_RESUME_EXPIRY = 2**63 - 1
 _DIGEST_RE = re.compile(r"^[0-9a-fA-F]{16,128}$")
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+/@-]{0,127}$")
 _SENSITIVE_VALUE_RE = re.compile(
     r"(?i)(?:\b(?:sk|rk)-[A-Za-z0-9_-]{16,}\b|\bgh[pousr]_[A-Za-z0-9_]{20,}\b|"
     r"\bBearer\s+[A-Za-z0-9._~+/=-]{12,})"
 )
-_EFFORTS = frozenset({"minimal", "low", "medium", "high", "xhigh", "max"})
+_EXTRA_SENSITIVE_VALUE_RE = re.compile(
+    r"(?i)(?:\bgithub_pat_[A-Za-z0-9_-]{12,}\b|\bAKIA[0-9A-Z]{16}\b|"
+    r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----)"
+)
+_EFFORTS = frozenset({"minimal", "low", "medium", "high", "xhigh", "max", "ultra"})
 _SANDBOXES = frozenset({"read-only", "workspace-write", "danger-full-access", "none", "default"})
 _TELEMETRY_FIELDS = frozenset(
     {
@@ -113,7 +120,12 @@ _LANE_IDENTITY_FIELDS = frozenset(
         "tool_profile",
     }
 )
-_LANE_FIELDS = _LANE_IDENTITY_FIELDS | {"lane_id", "resume_id"}
+_LANE_FIELDS = _LANE_IDENTITY_FIELDS | {
+    "lane_id",
+    "resume_tag",
+    "resume_expires_at",
+    "resume_task_packet_hash",
+}
 _LANE_FORBIDDEN_NAMES = frozenset(
     {
         "prompt",
@@ -163,6 +175,22 @@ def _require_digest(value: Any, field: str) -> str:
     return value.lower()
 
 
+def _is_sensitive(value: str) -> bool:
+    return bool(
+        _SENSITIVE_VALUE_RE.search(value)
+        or _EXTRA_SENSITIVE_VALUE_RE.search(value)
+    )
+
+
+def _bounded_mapping_keys(value: Mapping[Any, Any], *, limit: int, error: str) -> list[Any]:
+    keys: list[Any] = []
+    for index, key in enumerate(value):
+        if index >= limit:
+            raise TelemetryError(error)
+        keys.append(key)
+    return keys
+
+
 def _count(value: Any, field: str) -> int | None:
     if value is None:
         return None
@@ -180,7 +208,12 @@ def validate_telemetry_event(event: Mapping[str, Any]) -> dict[str, Any]:
 
     if not isinstance(event, Mapping):
         raise TelemetryError("telemetry event must be an object")
-    unknown = set(event) - _TELEMETRY_FIELDS
+    keys = _bounded_mapping_keys(
+        event,
+        limit=len(_TELEMETRY_FIELDS) + 1,
+        error="telemetry event has too many fields",
+    )
+    unknown = set(keys) - _TELEMETRY_FIELDS
     if unknown:
         raise TelemetryError("unknown/forbidden telemetry fields")
     result: dict[str, Any] = {}
@@ -209,6 +242,7 @@ def validate_telemetry_event(event: Mapping[str, Any]) -> dict[str, Any]:
         if (
             isinstance(supplied_ratio, bool)
             or not isinstance(supplied_ratio, (int, float))
+            or not math.isfinite(float(supplied_ratio))
             or supplied_ratio < 0
             or supplied_ratio > 1
         ):
@@ -231,7 +265,7 @@ def validate_telemetry_event(event: Mapping[str, Any]) -> dict[str, Any]:
                 continue
             if not isinstance(value, str) or _IDENTIFIER_RE.fullmatch(value) is None:
                 raise TelemetryError("invalid approved model identifier")
-            if _SENSITIVE_VALUE_RE.search(value):
+            if _is_sensitive(value):
                 raise TelemetryError("sensitive model identifier is forbidden")
             if os.path.isabs(value) or ntpath.isabs(value) or ntpath.splitdrive(value)[0]:
                 raise TelemetryError("absolute model path is forbidden")
@@ -286,7 +320,7 @@ def _normalize_rel(value: Any, field: str, *, root_allowed: bool = False) -> str
 def _lane_string(value: Any, field: str, *, max_length: int = 256) -> str:
     if not isinstance(value, str) or not value or len(value) > max_length or "\x00" in value or "\r" in value or "\n" in value:
         raise LaneError(f"invalid {field}")
-    if _SENSITIVE_VALUE_RE.search(value):
+    if _is_sensitive(value):
         raise LaneError(f"sensitive {field} is forbidden")
     if field in _LANE_FORBIDDEN_NAMES:
         raise LaneError(f"forbidden lane field: {field}")
@@ -305,24 +339,30 @@ def _lane_string(value: Any, field: str, *, max_length: int = 256) -> str:
 def _normalize_lane_context(context: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(context, Mapping):
         raise LaneError("lane context must be an object")
-    unknown = set(context) - _LANE_IDENTITY_FIELDS
-    if unknown:
-        raise LaneError("unknown lane context field")
-    result: dict[str, Any] = {
-        "repo_relative": _normalize_rel(context.get("repo_relative", "."), "repo_relative", root_allowed=True),
-        "worktree_relative": _normalize_rel(context.get("worktree_relative", "."), "worktree_relative", root_allowed=True),
-        "branch": _lane_string(context.get("branch", "detached"), "branch"),
-        "model": _lane_string(context.get("model", "unknown"), "model"),
-        "effort": context.get("effort", "medium"),
-        "cwd_relative": _normalize_rel(context.get("cwd_relative", "."), "cwd_relative", root_allowed=True),
-        "sandbox": context.get("sandbox", "default"),
-        "approval": _lane_string(context.get("approval", "default"), "approval"),
-        "tool_profile": _lane_string(context.get("tool_profile", "default"), "tool_profile"),
-    }
-    if result["effort"] not in _EFFORTS:
+    keys: list[Any] = []
+    for index, key in enumerate(context):
+        if index >= len(_LANE_IDENTITY_FIELDS) + 1:
+            raise LaneError("lane context has too many fields")
+        keys.append(key)
+    if set(keys) != _LANE_IDENTITY_FIELDS:
+        raise LaneError("lane context must contain the exact identity fields")
+    effort = context["effort"]
+    sandbox = context["sandbox"]
+    if not isinstance(effort, str) or effort not in _EFFORTS:
         raise LaneError("invalid reasoning effort")
-    if result["sandbox"] not in _SANDBOXES:
+    if not isinstance(sandbox, str) or sandbox not in _SANDBOXES:
         raise LaneError("invalid sandbox")
+    result: dict[str, Any] = {
+        "repo_relative": _normalize_rel(context["repo_relative"], "repo_relative", root_allowed=True),
+        "worktree_relative": _normalize_rel(context["worktree_relative"], "worktree_relative", root_allowed=True),
+        "branch": _lane_string(context["branch"], "branch"),
+        "model": _lane_string(context["model"], "model"),
+        "effort": effort,
+        "cwd_relative": _normalize_rel(context["cwd_relative"], "cwd_relative", root_allowed=True),
+        "sandbox": sandbox,
+        "approval": _lane_string(context["approval"], "approval"),
+        "tool_profile": _lane_string(context["tool_profile"], "tool_profile"),
+    }
     return result
 
 
@@ -351,6 +391,65 @@ def _lane_id(
     ).hexdigest()
 
 
+def _task_packet_hash(value: Any) -> str:
+    if not isinstance(value, str) or re.fullmatch(r"[0-9a-fA-F]{64}", value) is None:
+        raise LaneCapabilityError("invalid task packet hash")
+    return value.lower()
+
+
+def _resume_tag(
+    key: bytes,
+    capability: str,
+    lane_id: str,
+    resume_id: str,
+    task_packet_hash: str,
+    context: Mapping[str, Any],
+    expires_at: int,
+) -> str:
+    if (
+        not isinstance(capability, str)
+        or not capability
+        or len(capability) > 4096
+        or "\x00" in capability
+        or type(expires_at) is not int
+        or expires_at <= 0
+        or expires_at > MAX_RESUME_EXPIRY
+    ):
+        raise LaneCapabilityError("invalid caller capability")
+    exact_context = {
+        field: context[field]
+        for field in (
+            "model",
+            "effort",
+            "cwd_relative",
+            "sandbox",
+            "tool_profile",
+        )
+    }
+    canonical = json.dumps(
+        {
+            "lane_id": lane_id,
+            "resume_id": resume_id,
+            "task_packet_hash": task_packet_hash,
+            "context": exact_context,
+            "expires_at": expires_at,
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    capability_key = hmac.new(
+        key,
+        b"resume-capability\0" + capability.encode("utf-8", "strict"),
+        hashlib.sha256,
+    ).digest()
+    return "resume-v1-" + hmac.new(
+        capability_key,
+        b"resume\0" + canonical,
+        hashlib.sha256,
+    ).hexdigest()
+
+
 def _validate_lane_record(record: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(record, Mapping) or set(record) - _LANE_FIELDS:
         raise LaneError("malformed lane record")
@@ -373,8 +472,35 @@ def _validate_lane_record(record: Mapping[str, Any]) -> dict[str, Any]:
         raise LaneError("invalid lane ID")
     context = _normalize_lane_context({key: record[key] for key in _LANE_IDENTITY_FIELDS})
     result = {"lane_id": lane_id, **context}
-    if "resume_id" in record:
-        result["resume_id"] = _lane_string(record["resume_id"], "resume_id")
+    resume_fields = {
+        "resume_tag",
+        "resume_expires_at",
+        "resume_task_packet_hash",
+    }
+    present_resume = resume_fields & set(record)
+    if present_resume and present_resume != resume_fields:
+        raise LaneError("resume tag record is incomplete")
+    if present_resume:
+        tag = record["resume_tag"]
+        expiry = record["resume_expires_at"]
+        task_hash = record["resume_task_packet_hash"]
+        if (
+            not isinstance(tag, str)
+            or re.fullmatch(r"resume-v1-[0-9a-f]{64}", tag) is None
+            or type(expiry) is not int
+            or expiry <= 0
+            or expiry > MAX_RESUME_EXPIRY
+            or not isinstance(task_hash, str)
+            or re.fullmatch(r"[0-9a-f]{64}", task_hash) is None
+        ):
+            raise LaneError("invalid resume tag record")
+        result.update(
+            {
+                "resume_tag": tag,
+                "resume_expires_at": expiry,
+                "resume_task_packet_hash": task_hash,
+            }
+        )
     return result
 
 
@@ -388,17 +514,26 @@ class SessionLaneManager:
         lanes_path: os.PathLike[str] | str = DEFAULT_LANES_PATH,
         key_path: os.PathLike[str] | str = DEFAULT_LANE_KEY_PATH,
         max_lanes: int = MAX_LANES,
+        resume_enabled: bool = False,
+        host_capability: bool = False,
     ) -> None:
         self.repo_root = os.path.abspath(os.fspath(repo_root))
         self.lanes_target = lanes_path
         self.key_target = key_path
-        self.max_lanes = int(max_lanes)
+        if type(max_lanes) is not int:
+            raise ValueError("max_lanes must be an integer")
+        if type(resume_enabled) is not bool or type(host_capability) is not bool:
+            raise ValueError("resume feature flags must be literal bools")
+        self.max_lanes = max_lanes
+        self.resume_enabled = resume_enabled
+        self.host_capability = host_capability
         if self.max_lanes <= 0 or self.max_lanes > 1024:
             raise ValueError("invalid lane bound")
         # Resolving creates only the local state directories; no source paths
         # are written into lane state.
         self.lanes_path = resolve_state_path(self.repo_root, self.lanes_target, create_parents=True)
         self.key_path = resolve_state_path(self.repo_root, self.key_target, create_parents=True)
+        self._reject_aliasing_state_paths()
         self._key = self._load_or_create_key()
         scope_path = os.path.normcase(os.path.realpath(self.repo_root)).replace("\\", "/")
         self._repo_scope = hmac.new(
@@ -406,6 +541,22 @@ class SessionLaneManager:
             b"repo-scope\0" + scope_path.encode("utf-8", "strict"),
             hashlib.sha256,
         ).digest()
+
+    def _reject_aliasing_state_paths(self) -> None:
+        lexical_lanes = os.path.normcase(os.path.abspath(self.lanes_path))
+        lexical_key = os.path.normcase(os.path.abspath(self.key_path))
+        if lexical_lanes == lexical_key:
+            raise LaneError("lane data and key paths must differ")
+        resolved_lanes = os.path.normcase(os.path.realpath(self.lanes_path))
+        resolved_key = os.path.normcase(os.path.realpath(self.key_path))
+        if resolved_lanes == resolved_key:
+            raise LaneError("lane data and key paths resolve to the same object")
+        try:
+            if os.path.exists(self.lanes_path) and os.path.exists(self.key_path):
+                if os.path.samefile(self.lanes_path, self.key_path):
+                    raise LaneError("lane data and key paths alias")
+        except OSError as exc:
+            raise LaneError("could not inspect lane data/key identity") from exc
 
     def _load_or_create_key(self) -> bytes:
         with _local_lock(self.key_path), _state_file_lock(
@@ -457,14 +608,52 @@ class SessionLaneManager:
         *,
         caller_capability: str | None = None,
         resume_id: str | None = None,
+        task_packet_hash: str | None = None,
+        resume_expires_at: int | None = None,
     ) -> dict[str, Any]:
         normalized = _normalize_lane_context(context)
-        normalized_resume = (
-            None if resume_id is None else _lane_string(resume_id, "resume_id")
-        )
+        normalized_resume: str | None = None
+        if self.resume_enabled and self.host_capability and resume_id is not None:
+            try:
+                normalized_resume = _lane_string(resume_id, "resume_id")
+            except LaneError:
+                # Invalid or unsupported handles degrade to a fresh local lane;
+                # they are never persisted or returned.
+                normalized_resume = None
+        resume_data: dict[str, Any] = {}
+        if (
+            self.resume_enabled
+            and self.host_capability
+            and normalized_resume is not None
+            and caller_capability is not None
+            and task_packet_hash is not None
+            and type(resume_expires_at) is int
+            and resume_expires_at > int(time.time())
+        ):
+            if resume_expires_at <= MAX_RESUME_EXPIRY:
+                try:
+                    normalized_task_hash = _task_packet_hash(task_packet_hash)
+                except LaneCapabilityError:
+                    normalized_task_hash = None
+                if normalized_task_hash is not None:
+                    resume_data = {
+                        "resume_task_packet_hash": normalized_task_hash,
+                        "resume_expires_at": resume_expires_at,
+                    }
+        resume_handle_allowed = normalized_resume is not None and bool(resume_data)
         lane_id = _lane_id(
             self._key, normalized, caller_capability, self._repo_scope
         )
+        if resume_data:
+            resume_data["resume_tag"] = _resume_tag(
+                self._key,
+                caller_capability,
+                lane_id,
+                normalized_resume,
+                resume_data["resume_task_packet_hash"],
+                normalized,
+                resume_data["resume_expires_at"],
+            )
         with _state_file_lock(
             self.lanes_path,
             ancestor_snapshot=_ancestor_snapshot(self.repo_root, self.lanes_path),
@@ -475,22 +664,35 @@ class SessionLaneManager:
                     continue
                 lane_context = {key: lane[key] for key in _LANE_IDENTITY_FIELDS}
                 if lane_context == normalized:
-                    stored_resume = lane.get("resume_id")
-                    if normalized_resume is not None:
-                        if stored_resume is not None and stored_resume != normalized_resume:
-                            raise LaneError("conflicting resume ID")
-                        if stored_resume is None:
-                            lane = {**lane, "resume_id": normalized_resume}
-                            lanes[index] = lane
+                    result = dict(lane)
+                    if resume_handle_allowed:
+                        if all(
+                            lane.get(field) == value
+                            for field, value in resume_data.items()
+                        ):
+                            result["resume_id"] = normalized_resume
+                        elif any(field in lane for field in resume_data):
+                            raise LaneError("conflicting resume tag")
+                        else:
+                            lanes[index] = {**lane, **resume_data}
                             self._write(lanes)
-                    # The ID proves exact context and caller capability.  The
-                    # opaque handle is record data, never part of identity.
-                    return dict(lane)
+                            result = {**lanes[index], "resume_id": normalized_resume}
+                    elif normalized_resume is not None:
+                        for field in (
+                            "resume_tag",
+                            "resume_expires_at",
+                            "resume_task_packet_hash",
+                        ):
+                            result.pop(field, None)
+                    return result
             new_lane = {"lane_id": lane_id, **normalized}
-            if normalized_resume is not None:
-                new_lane["resume_id"] = normalized_resume
+            if resume_data:
+                new_lane.update(resume_data)
             self._write([*lanes, new_lane])
-            return dict(new_lane)
+            result = dict(new_lane)
+            if resume_handle_allowed:
+                result["resume_id"] = normalized_resume
+            return result
 
     create_or_resume = get_or_create
     resume_or_create = get_or_create
@@ -501,8 +703,35 @@ class SessionLaneManager:
         context: Mapping[str, Any],
         *,
         caller_capability: str | None = None,
+        resume_id: str | None = None,
+        task_packet_hash: str | None = None,
+        resume_expires_at: int | None = None,
     ) -> dict[str, Any]:
         normalized = _normalize_lane_context(context)
+        if (
+            not self.resume_enabled
+            or not self.host_capability
+            or caller_capability is None
+            or resume_id is None
+            or task_packet_hash is None
+            or type(resume_expires_at) is not int
+            or resume_expires_at <= int(time.time())
+            or resume_expires_at > MAX_RESUME_EXPIRY
+        ):
+            fresh = self.get_or_create(normalized, caller_capability=caller_capability)
+            fresh.pop("resume_id", None)
+            for field in ("resume_tag", "resume_expires_at", "resume_task_packet_hash"):
+                fresh.pop(field, None)
+            return fresh
+        try:
+            normalized_resume = _lane_string(resume_id, "resume_id")
+            normalized_hash = _task_packet_hash(task_packet_hash)
+        except LaneError:
+            fresh = self.get_or_create(normalized, caller_capability=caller_capability)
+            fresh.pop("resume_id", None)
+            for field in ("resume_tag", "resume_expires_at", "resume_task_packet_hash"):
+                fresh.pop(field, None)
+            return fresh
         expected = _lane_id(
             self._key, normalized, caller_capability, self._repo_scope
         )
@@ -516,7 +745,24 @@ class SessionLaneManager:
                         key: lane[key] for key in _LANE_IDENTITY_FIELDS
                     }
                     if lane.get("lane_id") == lane_id and lane_context == normalized:
-                        return dict(lane)
+                        expected_tag = _resume_tag(
+                            self._key,
+                            caller_capability,
+                            lane_id,
+                            normalized_resume,
+                            normalized_hash,
+                            normalized,
+                            resume_expires_at,
+                        )
+                        if (
+                            lane.get("resume_tag") == expected_tag
+                            and lane.get("resume_task_packet_hash") == normalized_hash
+                            and lane.get("resume_expires_at") == resume_expires_at
+                            and lane.get("resume_expires_at", 0) > int(time.time())
+                        ):
+                            result = dict(lane)
+                            result["resume_id"] = normalized_resume
+                            return result
         # A missing/mismatched lane becomes a context-derived local lane but
         # never carries a handle from either the requested or an existing lane.
         fresh = self.get_or_create(
@@ -524,6 +770,8 @@ class SessionLaneManager:
             caller_capability=caller_capability,
         )
         fresh.pop("resume_id", None)
+        for field in ("resume_tag", "resume_expires_at", "resume_task_packet_hash"):
+            fresh.pop(field, None)
         return fresh
 
     def list_lanes(self) -> list[dict[str, Any]]:
@@ -549,14 +797,22 @@ class TelemetryStore:
         self.repo_root = os.path.abspath(os.fspath(repo_root))
         self.target = path
         self.path = resolve_state_path(self.repo_root, self.target, create_parents=True)
-        self.max_events = int(max_events)
-        self.max_bytes = int(max_bytes)
-        self.export_opt_in = bool(export_opt_in)
+        if type(max_events) is not int or type(max_bytes) is not int:
+            raise ValueError("telemetry bounds must be integers")
+        self.max_events = max_events
+        self.max_bytes = max_bytes
+        if type(export_opt_in) is not bool:
+            raise ValueError("export_opt_in must be a literal bool")
+        self.export_opt_in = export_opt_in
         if self.max_events <= 0 or self.max_events > 4096 or self.max_bytes <= 0 or self.max_bytes > 16 * 1024 * 1024:
             raise ValueError("invalid telemetry bounds")
 
     @staticmethod
-    def _parse(raw: bytes) -> list[dict[str, Any]]:
+    def _parse(
+        raw: bytes,
+        *,
+        max_events: int = MAX_TELEMETRY_EVENTS,
+    ) -> list[dict[str, Any]]:
         if not raw:
             return []
         events: list[dict[str, Any]] = []
@@ -565,10 +821,14 @@ class TelemetryStore:
                 continue
             try:
                 value = json.loads(line.decode("utf-8", "strict"))
+                if not isinstance(value, Mapping) or "format_version" not in value:
+                    raise TelemetryError("persisted telemetry event lacks format_version")
                 normalized = validate_telemetry_event(value)
             except (UnicodeDecodeError, json.JSONDecodeError, TelemetryError, TypeError, ValueError) as exc:
                 raise TelemetryError("telemetry file is corrupt") from exc
             events.append(normalized)
+            if len(events) > max_events:
+                raise TelemetryError("telemetry file exceeds event bound")
         return events
 
     def _load(self) -> list[dict[str, Any]]:
@@ -581,7 +841,7 @@ class TelemetryStore:
                 quarantine_file(self.repo_root, self.target, suffix="telemetry-corrupt")
             return []
         try:
-            return self._parse(raw)
+            return self._parse(raw, max_events=self.max_events)
         except TelemetryError:
             with contextlib.suppress(Exception):
                 quarantine_file(self.repo_root, self.target, suffix="telemetry-corrupt")
@@ -600,7 +860,7 @@ class TelemetryStore:
         ):
             try:
                 raw = read_bytes(self.repo_root, self.target, max_bytes=self.max_bytes)
-                events = self._parse(raw)
+                events = self._parse(raw, max_events=self.max_events)
             except FileNotFoundError:
                 events = []
             except (StateCorruptError, TelemetryError):
@@ -629,8 +889,10 @@ class TelemetryStore:
             return [dict(event) for event in self._load()]
 
     def export_aggregate(self, *, opt_in: bool | None = None) -> dict[str, Any]:
-        enabled = self.export_opt_in if opt_in is None else bool(opt_in)
-        if not enabled:
+        if opt_in is not None and type(opt_in) is not bool:
+            raise TelemetryError("aggregate export opt-in must be a literal bool")
+        enabled = self.export_opt_in if opt_in is None else opt_in
+        if enabled is not True:
             raise TelemetryError("aggregate export requires explicit opt-in")
         events = self.events()
         aggregate: dict[str, Any] = {

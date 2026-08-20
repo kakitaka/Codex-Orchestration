@@ -145,6 +145,11 @@ class PreflightTests(unittest.TestCase):
                 "playbook_staleness_check",
                 return_value=PREFLIGHT.CheckResult("playbook", "PASS"),
             ),
+            mock.patch.object(
+                PREFLIGHT,
+                "token_benchmark_check",
+                return_value=PREFLIGHT.CheckResult("token-benchmark", "PASS"),
+            ),
         ):
             results = PREFLIGHT.ci_checks(
                 "quality",
@@ -238,6 +243,78 @@ class PreflightTests(unittest.TestCase):
         hosted = [result for result in results if result.name == "hosted-required-checks"]
         self.assertEqual(len(hosted), 1)
         self.assertEqual(hosted[0].status, "SKIP")
+
+    def test_clean_head_benchmark_runs_in_full_but_not_precommit_quick(self) -> None:
+        with mock.patch.object(
+            PREFLIGHT,
+            "token_benchmark_check",
+            return_value=PREFLIGHT.CheckResult("token-benchmark", "PASS"),
+        ) as benchmark:
+            with (
+                mock.patch.object(
+                    PREFLIGHT,
+                    "run_command",
+                    return_value=PREFLIGHT.CheckResult("command", "PASS"),
+                ),
+                mock.patch.object(
+                    PREFLIGHT,
+                    "token_lint_check",
+                    return_value=PREFLIGHT.CheckResult("token-lint", "PASS"),
+                ),
+                mock.patch.object(
+                    PREFLIGHT,
+                    "playbook_staleness_check",
+                    return_value=PREFLIGHT.CheckResult("playbook", "PASS"),
+                ),
+                mock.patch.object(
+                    PREFLIGHT,
+                    "compile_check",
+                    return_value=PREFLIGHT.CheckResult("compile", "PASS"),
+                ),
+                mock.patch.object(
+                    PREFLIGHT,
+                    "ruff_check",
+                    return_value=PREFLIGHT.CheckResult("ruff", "PASS"),
+                ),
+                mock.patch.object(
+                    PREFLIGHT,
+                    "unittest_check",
+                    return_value=PREFLIGHT.CheckResult("tests", "PASS"),
+                ),
+                mock.patch.object(
+                    PREFLIGHT,
+                    "release_check",
+                    return_value=PREFLIGHT.CheckResult("release", "PASS"),
+                ),
+            ):
+                PREFLIGHT.quick_checks(REPO_ROOT, base_sha="base", head_sha=None)
+            benchmark.assert_not_called()
+
+            with (
+                mock.patch.object(PREFLIGHT, "quick_checks", return_value=[]),
+                mock.patch.object(
+                    PREFLIGHT,
+                    "run_command",
+                    return_value=PREFLIGHT.CheckResult("full-tests", "PASS"),
+                ),
+                mock.patch.object(
+                    PREFLIGHT,
+                    "tooling_security_tests",
+                    return_value=PREFLIGHT.CheckResult("security", "PASS"),
+                ),
+                mock.patch.object(
+                    PREFLIGHT,
+                    "_codex_available",
+                    return_value=PREFLIGHT.CheckResult(
+                        "codex", "FAIL", "could not start"
+                    ),
+                ),
+            ):
+                results = PREFLIGHT.full_local_checks(
+                    REPO_ROOT, base_sha="base", head_sha=None
+                )
+            benchmark.assert_called_once_with(REPO_ROOT)
+            self.assertIn("token-benchmark", [result.name for result in results])
 
     def test_ci_skip_fails_closed(self) -> None:
         stdout = io.StringIO()

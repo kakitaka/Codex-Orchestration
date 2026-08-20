@@ -114,6 +114,44 @@ class RoutingStateTests(unittest.TestCase):
         }
         self.assertIs(STATE.validate_routing_state(state), state)
 
+    def test_model_override_state_is_paired_typed_and_scalar_complete(self) -> None:
+        state = genuine_state(5)
+        state["managed"]["model_overrides"] = True
+        state["previous"]["model_overrides"] = snapshot(False, present=True)
+        self.assertIs(STATE.validate_routing_state(state), state)
+
+        for label, mutate in (
+            ("missing restore", lambda value: value["previous"].pop("model_overrides")),
+            ("false managed", lambda value: value["managed"].update(model_overrides=False)),
+            ("wrong restore", lambda value: value["previous"].update(model_overrides=snapshot(0, present=True))),
+        ):
+            with self.subTest(label=label):
+                invalid = deepcopy(state)
+                mutate(invalid)
+                with self.assertRaises(STATE.RoutingStateError):
+                    STATE.validate_routing_state(invalid)
+
+        scalar = deepcopy(state)
+        scalar["scalar_origin"] = True
+        scalar["managed_feature"] = {
+            "enabled": True,
+            "hide_spawn_agent_metadata": False,
+            "tool_namespace": STATE.ROUTING_TOOL_NAMESPACE,
+            "multi_agent_mode_hint_text": scalar["managed"]["mode"],
+            "usage_hint_text": scalar["managed"]["usage"],
+            STATE.NATIVE_MODEL_OVERRIDE_FIELD: True,
+        }
+        self.assertIs(STATE.validate_routing_state(scalar), scalar)
+        scalar["managed_feature"][STATE.NATIVE_MODEL_OVERRIDE_FIELD] = False
+        with self.assertRaises(STATE.RoutingStateError):
+            STATE.validate_routing_state(scalar)
+
+        legacy = genuine_state(4)
+        legacy["managed"]["model_overrides"] = True
+        legacy["previous"]["model_overrides"] = snapshot()
+        with self.assertRaises(STATE.RoutingStateError):
+            STATE.validate_routing_state(legacy)
+
     def test_full_negative_invariant_matrix_fails_closed(self) -> None:
         baseline = genuine_state(4)
 

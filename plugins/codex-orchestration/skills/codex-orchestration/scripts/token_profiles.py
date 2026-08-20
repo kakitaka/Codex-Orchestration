@@ -9,6 +9,8 @@ and is therefore the default when no profile was requested.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import MappingProxyType
+import re
 from typing import Any, Mapping
 
 
@@ -35,6 +37,29 @@ class TokenProfile:
     packet_hard_tokens: int | None
     wave_soft_tokens: int | None
     wave_hard_tokens: int | None
+
+    def __post_init__(self) -> None:
+        if type(self.name) is not str or self.name not in PROFILE_NAMES:
+            raise TokenProfileError("invalid token profile name")
+        if type(self.advisor_loops) is not int or not 1 <= self.advisor_loops <= 128:
+            raise TokenProfileError("invalid advisor loop limit")
+        values = (
+            ("packet_soft_tokens", self.packet_soft_tokens),
+            ("packet_hard_tokens", self.packet_hard_tokens),
+            ("wave_soft_tokens", self.wave_soft_tokens),
+            ("wave_hard_tokens", self.wave_hard_tokens),
+        )
+        for label, value in values:
+            if value is not None and (
+                type(value) is not int or value < 0 or value > 10**12
+            ):
+                raise TokenProfileError(f"invalid {label}")
+        for soft, hard in (
+            (self.packet_soft_tokens, self.packet_hard_tokens),
+            (self.wave_soft_tokens, self.wave_hard_tokens),
+        ):
+            if soft is not None and hard is not None and soft > hard:
+                raise TokenProfileError("soft token budget cannot exceed hard budget")
 
     @property
     def advisor_review_limit(self) -> int:
@@ -134,12 +159,12 @@ class TokenProfile:
             return default
 
 
-_PROFILE_VALUES: dict[str, TokenProfile] = {
+_PROFILE_VALUES = MappingProxyType({
     "legacy": TokenProfile("legacy", 8, None, None, None, None),
     "lean": TokenProfile("lean", 1, 3_000, 6_000, 12_000, 20_000),
     "balanced": TokenProfile("balanced", 2, 5_000, 9_000, 24_000, 36_000),
     "quality": TokenProfile("quality", 4, 8_000, 14_000, 48_000, 72_000),
-}
+})
 
 # Public aliases make the schema easy to consume from small scripts without
 # requiring callers to know the private implementation name.
@@ -206,51 +231,61 @@ def profile_budgets(profile: str | TokenProfile | None = None) -> dict[str, int 
 
 # The ladder is deliberately monotonic.  ``max`` is only an escalation step;
 # ordinary recommendations stop at the effort appropriate to the profile.
-RECOMMENDATION_LADDER: tuple[dict[str, str], ...] = (
-    {"model": "gpt-5.6-luna", "effort": "medium"},
-    {"model": "gpt-5.6-terra", "effort": "medium"},
-    {"model": "gpt-5.6-terra", "effort": "high"},
-    {"model": "gpt-5.6-sol", "effort": "high"},
-    {"model": "gpt-5.6-sol", "effort": "max"},
+RECOMMENDATION_LADDER: tuple[Mapping[str, str], ...] = (
+    MappingProxyType({"model": "gpt-5.6-luna", "effort": "medium"}),
+    MappingProxyType({"model": "gpt-5.6-terra", "effort": "medium"}),
+    MappingProxyType({"model": "gpt-5.6-terra", "effort": "high"}),
+    MappingProxyType({"model": "gpt-5.6-sol", "effort": "high"}),
+    MappingProxyType({"model": "gpt-5.6-sol", "effort": "max"}),
 )
 
 # Review-facing roles need a stronger default than a normal Executor.  This is
 # still only a recommendation: an explicit user route and an applicable
 # repository requirement are resolved before it.
 REVIEW_ROLE_NAMES = frozenset({"auditor", "advisor", "reviewer"})
-REVIEW_ROLE_FLOOR = {"model": "gpt-5.6-sol", "effort": "high"}
+REVIEW_ROLE_FLOOR = MappingProxyType({"model": "gpt-5.6-sol", "effort": "high"})
+_SUPPORTED_EFFORTS = frozenset(
+    {"low", "medium", "high", "xhigh", "max", "ultra"}
+)
+_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+/@-]{0,199}$")
 
 
 def _worker_requires_luna_max(worker_requirement: Any) -> bool:
-    if worker_requirement is None:
-        return False
-    if isinstance(worker_requirement, Mapping):
-        model = worker_requirement.get("model") or worker_requirement.get("route")
-        effort = worker_requirement.get("effort")
-        if isinstance(model, str) and "luna" in model.lower():
-            return isinstance(effort, str) and effort.lower() == "max"
-        text = " ".join(str(value) for value in worker_requirement.values())
-    else:
-        text = str(worker_requirement)
-    normalized = " ".join(text.replace("_", " ").replace("-", " ").split()).lower()
-    return ("luna" in normalized and "max" in normalized) or normalized in {
-        "luna max",
-        "gpt 5.6 luna max",
-    }
+    return _worker_requirement_route(worker_requirement) is not None
 
 
 def _worker_requirement_route(worker_requirement: Any) -> dict[str, str] | None:
     """Return the concrete route carried by the supported Luna requirement.
 
     ``worker_requirement`` is an AGENTS-level requirement, not a profile
-    recommendation.  Keep the accepted interpretation deliberately narrow so
-    arbitrary text cannot silently become a route.  The public compatibility
-    path historically accepts both ``"Luna Max"`` and a mapping containing
-    ``model``/``effort``.
+    recommendation. Only an exact structured mapping can elevate a route;
+    prose and compatibility strings are informational input.
     """
 
-    if not _worker_requires_luna_max(worker_requirement):
+    if isinstance(worker_requirement, str):
         return None
+    if not isinstance(worker_requirement, Mapping):
+        return None
+    keys = set(worker_requirement)
+    if keys not in (
+        {"model", "effort"},
+        {"model", "reasoning_effort"},
+        {"model", "model_reasoning_effort"},
+    ):
+        raise TokenProfileError("worker requirement has unsupported fields")
+    effort_key = (
+        "effort"
+        if "effort" in worker_requirement
+        else (
+            "reasoning_effort"
+            if "reasoning_effort" in worker_requirement
+            else "model_reasoning_effort"
+        )
+    )
+    model = worker_requirement.get("model")
+    effort = worker_requirement.get(effort_key)
+    if model != "gpt-5.6-luna" or effort != "max":
+        raise TokenProfileError("worker requirement must be gpt-5.6-luna@max")
     return {"model": "gpt-5.6-luna", "effort": "max"}
 
 
@@ -260,6 +295,32 @@ def _route_value(route: Any, key: str) -> str | None:
     else:
         value = getattr(route, key, None)
     return value if isinstance(value, str) and value else None
+
+
+def _validate_route_value(value: Any, key: str, source: str) -> str:
+    if type(value) is not str or not value.strip():
+        raise TokenProfileError(f"{source} {key} must be a non-empty string")
+    value = value.strip()
+    if key == "effort" and value not in _SUPPORTED_EFFORTS:
+        raise TokenProfileError(f"{source} effort is unsupported")
+    if key == "model" and _MODEL_RE.fullmatch(value) is None:
+        raise TokenProfileError(f"{source} model is malformed")
+    return value
+
+
+def _extract_route(route: Any, source: str) -> dict[str, str]:
+    if route is None:
+        return {}
+    if not isinstance(route, Mapping):
+        raise TokenProfileError(f"{source} route must be an object")
+    result: dict[str, str] = {}
+    for key in ("model", "effort"):
+        if key in route:
+            result[key] = _validate_route_value(route[key], key, source)
+    unknown = set(route) - {"model", "effort"}
+    if unknown:
+        raise TokenProfileError(f"{source} route contains unsupported fields")
+    return result
 
 
 def _recommendation_index(
@@ -374,15 +435,42 @@ def resolve_route(
     any input route.
     """
 
-    if explicit is not None:
-        explicit_model = _route_value(explicit, "model") or explicit_model
-        explicit_effort = _route_value(explicit, "effort") or explicit_effort
-    if agents is not None:
-        agents_model = _route_value(agents, "model") or agents_model
-        agents_effort = _route_value(agents, "effort") or agents_effort
-    if configured is not None:
-        configured_model = _route_value(configured, "model") or configured_model
-        configured_effort = _route_value(configured, "effort") or configured_effort
+    explicit_values = _extract_route(explicit, "explicit")
+    agents_values = _extract_route(agents, "agents")
+    configured_values = _extract_route(configured, "configured")
+    if explicit_model is not None:
+        explicit_model = _validate_route_value(explicit_model, "model", "explicit")
+    if explicit_effort is not None:
+        explicit_effort = _validate_route_value(explicit_effort, "effort", "explicit")
+    if agents_model is not None:
+        agents_model = _validate_route_value(agents_model, "model", "agents")
+    if agents_effort is not None:
+        agents_effort = _validate_route_value(agents_effort, "effort", "agents")
+    if configured_model is not None:
+        configured_model = _validate_route_value(configured_model, "model", "configured")
+    if configured_effort is not None:
+        configured_effort = _validate_route_value(configured_effort, "effort", "configured")
+    for source, values, model_value, effort_value in (
+        ("explicit", explicit_values, explicit_model, explicit_effort),
+        ("agents", agents_values, agents_model, agents_effort),
+        ("configured", configured_values, configured_model, configured_effort),
+    ):
+        if (
+            model_value is not None
+            and "model" in values
+            and values["model"] != model_value
+        ) or (
+            effort_value is not None
+            and "effort" in values
+            and values["effort"] != effort_value
+        ):
+            raise TokenProfileError(f"conflicting {source} route forms")
+    explicit_model = explicit_values.get("model", explicit_model)
+    explicit_effort = explicit_values.get("effort", explicit_effort)
+    agents_model = agents_values.get("model", agents_model)
+    agents_effort = agents_values.get("effort", agents_effort)
+    configured_model = configured_values.get("model", configured_model)
+    configured_effort = configured_values.get("effort", configured_effort)
     effective_agents = _effective_agents_route(agents, worker_requirement)
     recommendation = recommend_route(
         profile,
@@ -413,13 +501,20 @@ def resolve_route_with_source(**kwargs: Any) -> dict[str, str]:
     explicit = kwargs.get("explicit")
     agents = kwargs.get("agents")
     configured = kwargs.get("configured")
-    explicit_model = _route_value(explicit, "model") or kwargs.get("explicit_model")
-    explicit_effort = _route_value(explicit, "effort") or kwargs.get("explicit_effort")
+    explicit_values = _extract_route(explicit, "explicit")
+    agents_values = _extract_route(agents, "agents")
+    configured_values = _extract_route(configured, "configured")
+    explicit_model = explicit_values.get("model", kwargs.get("explicit_model"))
+    explicit_effort = explicit_values.get("effort", kwargs.get("explicit_effort"))
     effective_agents = _effective_agents_route(agents, worker_requirement)
-    agents_model = _route_value(effective_agents, "model") or kwargs.get("agents_model")
-    agents_effort = _route_value(effective_agents, "effort") or kwargs.get("agents_effort")
-    configured_model = _route_value(configured, "model") or kwargs.get("configured_model")
-    configured_effort = _route_value(configured, "effort") or kwargs.get("configured_effort")
+    agents_model = _route_value(effective_agents, "model") or agents_values.get(
+        "model", kwargs.get("agents_model")
+    )
+    agents_effort = _route_value(effective_agents, "effort") or agents_values.get(
+        "effort", kwargs.get("agents_effort")
+    )
+    configured_model = configured_values.get("model", kwargs.get("configured_model"))
+    configured_effort = configured_values.get("effort", kwargs.get("configured_effort"))
     resolved = resolve_route(**kwargs)
     _, model_source = _first_route_value(
         "model", explicit_model, agents_model, configured_model

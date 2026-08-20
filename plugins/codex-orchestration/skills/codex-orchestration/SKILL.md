@@ -92,3 +92,4 @@ Natural-language availability questions trigger read-only discovery only. Exampl
 ## Resources
 
 Helper scripts live in `scripts/`; provider manifests in `providers/`. Run helpers only after reading the routed lifecycle/security reference. Use current-host capability detection rather than assuming a version supports a field.
+Native setup capability-tests the complete four-field preset in an isolated `CODEX_HOME`; direct model overrides receive their own feature probe.

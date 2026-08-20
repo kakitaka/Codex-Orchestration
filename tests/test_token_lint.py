@@ -4,6 +4,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -272,6 +273,21 @@ class TokenLintTests(unittest.TestCase):
         unsafe = [item for item in findings if item.code == "UNSAFE_TRACKED_PATH"]
         self.assertEqual(len(unsafe), 1)
         self.assertEqual(unsafe[0].path, ".venv/link.py")
+
+    def test_hardlinked_tracked_file_is_not_read(self) -> None:
+        root = self._clean_root()
+        source = root / "src/hardlink-source.py"
+        alias = root / "src/hardlink-alias.py"
+        source.write_text("PRIVATE_SENTINEL", encoding="utf-8")
+        try:
+            os.link(source, alias)
+        except OSError:
+            self.skipTest("hardlinks unavailable")
+        self.assertFalse(
+            token_lint._tracked_regular_file(
+                root, alias, {"src/hardlink-alias.py"}
+            )
+        )
 
     def test_secret_literal_is_rejected_without_echo(self) -> None:
         root = self._clean_root()

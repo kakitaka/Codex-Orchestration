@@ -13,15 +13,18 @@ import ast
 import contextlib
 import functools
 import hashlib
+import itertools
 import json
 import ntpath
 import os
 import re
 import sqlite3
+import stat
 import subprocess
 import threading
 import time
 import warnings
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -33,6 +36,7 @@ try:  # package import
         quarantine_file,
         read_bytes,
         resolve_state_path,
+        _file_lock,
     )
 except ImportError:  # direct script/module import
     from safe_state import (  # type: ignore
@@ -42,6 +46,7 @@ except ImportError:  # direct script/module import
         quarantine_file,
         read_bytes,
         resolve_state_path,
+        _file_lock,
     )
 
 
@@ -90,6 +95,13 @@ CREATE INDEX IF NOT EXISTS dependencies_name ON dependencies(name);
 """
 DEFAULT_SOURCE_MAX_BYTES = 4 * 1024 * 1024
 DEFAULT_QUERY_LIMIT = 50
+MAX_SOURCE_MAX_BYTES = 16 * 1024 * 1024
+MAX_QUERY_LIMIT = 1000
+MAX_DB_BYTES = 64 * 1024 * 1024
+MAX_INDEX_PATHS = 20_000
+MAX_TOTAL_INDEXED_FILES = 20_000
+MAX_LIVE_READ_KEYS = 1_024
+MAX_QUERY_TEXT_LENGTH = 512
 MAX_REPOSITORY_PATH_BYTES = 8 * 1024 * 1024
 MAX_REPOSITORY_FILES = 20_000
 MAX_REPOSITORY_WARNING_LENGTH = 192
@@ -181,13 +193,39 @@ class RepeatedReadError(ContextIndexError):
     """The same live blob/range was already returned in this index session."""
 
 
-def git_blob_id(data: bytes) -> str:
-    """Return the Git SHA-1 blob ID for bytes without invoking Git."""
+def git_blob_id(data: bytes, *, object_format: str = "sha1") -> str:
+    """Return the Git SHA-1 or SHA-256 blob ID without invoking Git."""
 
     if not isinstance(data, bytes):
         raise TypeError("data must be bytes")
+    if object_format not in {"sha1", "sha256"}:
+        raise ValueError("unsupported Git object format")
     header = f"blob {len(data)}\0".encode("ascii")
-    return hashlib.sha1(header + data).hexdigest()
+    return hashlib.new(object_format, header + data).hexdigest()
+
+
+def _git_object_format(repo_root: str) -> str:
+    """Detect the repository format; non-Git fixtures retain SHA-1 fallback."""
+
+    try:
+        completed = subprocess.run(
+            ["git", "-C", repo_root, "rev-parse", "--show-object-format"],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "sha1"
+    raw = completed.stdout
+    if completed.returncode != 0 or not isinstance(raw, bytes) or len(raw) > 32:
+        return "sha1"
+    try:
+        value = raw.decode("ascii", "strict").strip()
+    except UnicodeDecodeError:
+        return "sha1"
+    return value if value in {"sha1", "sha256"} else "sha1"
 
 
 def _db_lock(path: str) -> threading.RLock:
@@ -196,11 +234,10 @@ def _db_lock(path: str) -> threading.RLock:
 
 
 def _schema_signature(connection: sqlite3.Connection) -> tuple[tuple[str, ...], ...]:
-    """Return the exact user table/index definition without row content."""
+    """Return the exact SQLite object/DDL inventory, including autoindexes."""
 
     rows = connection.execute(
         "SELECT type, name, tbl_name, sql FROM sqlite_master "
-        "WHERE name NOT LIKE 'sqlite_%' "
         "ORDER BY type, name"
     )
     return tuple(
@@ -208,7 +245,7 @@ def _schema_signature(connection: sqlite3.Connection) -> tuple[tuple[str, ...], 
             str(row[0]),
             str(row[1]),
             str(row[2]),
-            re.sub(r"\s+", " ", str(row[3]).strip()).casefold(),
+            None if row[3] is None else re.sub(r"\s+", " ", str(row[3]).strip()),
         )
         for row in rows
     )
@@ -442,9 +479,56 @@ def _escape_like(value: str) -> str:
 def _query_terms(query: str) -> list[str]:
     if not isinstance(query, str) or "\x00" in query:
         raise ContextIndexError("query must be valid text")
-    if len(query) > 512:
+    if len(query) > MAX_QUERY_TEXT_LENGTH or len(query.encode("utf-8")) > MAX_QUERY_TEXT_LENGTH * 4:
         raise ContextIndexError("query exceeds bound")
     return [term for term in _QUERY_TOKEN_RE.split(query.strip()) if term][:16]
+
+
+def _exact_bounded_int(
+    value: Any,
+    field: str,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int:
+    if type(value) is not int or value < minimum or value > maximum:
+        raise ValueError(f"{field} must be an integer in [{minimum}, {maximum}]")
+    return value
+
+
+def _check_db_path(path: str) -> None:
+    """Reject unsafe/oversized database files before sqlite follows them."""
+
+    try:
+        result = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if os.path.islink(path) or bool(int(getattr(result, "st_file_attributes", 0)) & 0x0400):
+        raise UnsafePathError("context database cannot be a link/reparse point")
+    if not stat.S_ISREG(result.st_mode):
+        raise UnsafePathError("context database must be a regular file")
+    if int(getattr(result, "st_nlink", 1)) > 1:
+        raise UnsafePathError("context database hardlinks are not accepted")
+    if result.st_size < 0 or result.st_size > MAX_DB_BYTES:
+        raise ContextIndexError("context database exceeds byte bound")
+
+
+def _check_connection_size(connection: sqlite3.Connection) -> None:
+    """Bound page growth before a query can materialize untrusted rows."""
+
+    page_size = int(connection.execute("PRAGMA page_size").fetchone()[0])
+    page_count = int(connection.execute("PRAGMA page_count").fetchone()[0])
+    if page_size <= 0 or page_count < 0 or page_size * page_count > MAX_DB_BYTES:
+        raise CorruptIndexError("context database exceeds page bound")
+
+
+def _validate_path_value(value: Any, *, field: str) -> str:
+    if not isinstance(value, str) or len(value) > 4096:
+        raise CorruptIndexError(f"invalid {field}")
+    try:
+        return normalize_relative_path(value)
+    except UnsafePathError as exc:
+        raise CorruptIndexError(f"invalid {field}") from exc
 
 
 class ContextIndex:
@@ -459,21 +543,37 @@ class ContextIndex:
         query_limit: int = DEFAULT_QUERY_LIMIT,
     ) -> None:
         self.repo_root = os.path.abspath(os.fspath(repo_root))
-        self.source_max_bytes = int(source_max_bytes)
-        self.query_limit = int(query_limit)
-        if self.source_max_bytes <= 0 or self.query_limit <= 0 or self.query_limit > 1000:
-            raise ValueError("invalid index bounds")
+        if not os.path.isdir(self.repo_root) or os.path.islink(self.repo_root):
+            raise UnsafePathError("repository root must be a real directory")
+        self.source_max_bytes = _exact_bounded_int(
+            source_max_bytes,
+            "source_max_bytes",
+            minimum=1,
+            maximum=MAX_SOURCE_MAX_BYTES,
+        )
+        self.query_limit = _exact_bounded_int(
+            query_limit,
+            "query_limit",
+            minimum=1,
+            maximum=MAX_QUERY_LIMIT,
+        )
+        self.object_format = _git_object_format(self.repo_root)
         self.db_target = db_path if db_path is not None else os.path.join(".codex-state", "context", "index.sqlite")
         self.db_path = resolve_state_path(self.repo_root, self.db_target, create_parents=True)
+        _check_db_path(self.db_path)
         self._lock = _db_lock(self.db_path)
-        self._connection = self._open_connection_with_recovery()
-        self._live_reads: set[tuple[str, str, int, int]] = set()
+        self._live_reads: OrderedDict[tuple[str, str, int, int], None] = OrderedDict()
         self._repository_status: dict[str, Any] = {
             "status": "not_started",
             "tracked_files": 0,
             "warning": None,
         }
-        self._initialize_schema_with_recovery()
+        # Thread and process locks cover both first creation and recovery. A
+        # second process must observe the recovered database, not quarantine
+        # the first process's replacement.
+        with self._lock, _file_lock(self.db_path):
+            self._connection = self._open_connection_with_recovery()
+            self._initialize_schema_with_recovery()
 
     @property
     def repository_status(self) -> dict[str, Any]:
@@ -496,12 +596,25 @@ class ContextIndex:
         self.db_path = resolve_state_path(
             self.repo_root, self.db_target, create_parents=True
         )
+        _check_db_path(self.db_path)
         connection = sqlite3.connect(self.db_path, timeout=10, isolation_level=None)
         try:
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA busy_timeout=10000")
             connection.execute("PRAGMA journal_mode=DELETE")
             connection.execute("PRAGMA foreign_keys=ON")
+            page_size = int(connection.execute("PRAGMA page_size").fetchone()[0])
+            if page_size <= 0:
+                raise CorruptIndexError("context database page size is invalid")
+            maximum_pages = max(1, MAX_DB_BYTES // page_size)
+            configured_pages = int(
+                connection.execute(
+                    f"PRAGMA max_page_count={maximum_pages}"
+                ).fetchone()[0]
+            )
+            if configured_pages > maximum_pages:
+                raise CorruptIndexError("context database page cap is ineffective")
+            _check_connection_size(connection)
             with contextlib.suppress(OSError):
                 os.chmod(self.db_path, 0o600)
             return connection
@@ -513,13 +626,16 @@ class ContextIndex:
             raise
 
     def _open_connection_with_recovery(self) -> sqlite3.Connection:
+        connection: sqlite3.Connection | None = None
         try:
             connection = self._connect()
             connection.execute("PRAGMA schema_version")
+            _check_connection_size(connection)
             return connection
         except (sqlite3.DatabaseError, OSError):
             with contextlib.suppress(Exception):
-                connection.close()  # type: ignore[name-defined]
+                if connection is not None:
+                    connection.close()
             with contextlib.suppress(Exception):
                 quarantine_file(self.repo_root, self.db_target, suffix="sqlite-corrupt")
             return self._connect()
@@ -547,11 +663,84 @@ class ContextIndex:
                     "INSERT INTO index_meta(key, value) VALUES (?, ?)",
                     ("format_version", str(INDEX_FORMAT_VERSION)),
                 )
+            self._validate_database()
+
+    def _validate_database(self) -> None:
+        """Run full SQLite integrity and bounded data/schema validation."""
+
+        _check_connection_size(self._connection)
+        integrity = self._connection.execute("PRAGMA integrity_check").fetchall()
+        if not integrity or any(str(row[0]).casefold() != "ok" for row in integrity):
+            raise CorruptIndexError("context database integrity check failed")
+        foreign_keys = self._connection.execute("PRAGMA foreign_key_check").fetchall()
+        if foreign_keys:
+            raise CorruptIndexError("context database foreign-key check failed")
+        if _schema_signature(self._connection) != _expected_schema_signature():
+            raise CorruptIndexError("context database schema inventory mismatch")
+
+        meta_rows = [
+            (str(row[0]), str(row[1]))
+            for row in self._connection.execute(
+                "SELECT key, value FROM index_meta ORDER BY key"
+            )
+        ]
+        if meta_rows != [("format_version", str(INDEX_FORMAT_VERSION))]:
+            raise CorruptIndexError("context index metadata mismatch")
+
+        file_count = int(self._connection.execute("SELECT COUNT(*) FROM files").fetchone()[0])
+        if file_count > MAX_TOTAL_INDEXED_FILES:
+            raise CorruptIndexError("context index file count exceeds bound")
+        for row in self._connection.execute("SELECT path, blob_id, language FROM files"):
+            _validate_path_value(row[0], field="file path")
+            _clean_hash(row[1], field="blob_id")
+            _clean_text(row[2], field="language", max_length=32)
+
+        table_bounds = {
+            "headings": MAX_TOTAL_INDEXED_FILES * MAX_METADATA_ITEMS_PER_KIND,
+            "symbols": MAX_TOTAL_INDEXED_FILES * MAX_METADATA_ITEMS_PER_KIND,
+            "dependencies": MAX_TOTAL_INDEXED_FILES * MAX_METADATA_ITEMS_PER_KIND,
+            "adr_playbooks": MAX_TOTAL_INDEXED_FILES,
+        }
+        for table, bound in table_bounds.items():
+            count = int(self._connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+            if count > bound:
+                raise CorruptIndexError(f"context index {table} count exceeds bound")
+        for row in self._connection.execute("SELECT path, level, name, line FROM headings"):
+            _validate_path_value(row[0], field="heading path")
+            if type(row[1]) is not int or not 1 <= row[1] <= 6:
+                raise CorruptIndexError("invalid heading level")
+            _clean_text(row[2], field="heading name")
+            if type(row[3]) is not int or row[3] < 1:
+                raise CorruptIndexError("invalid heading line")
+        for row in self._connection.execute("SELECT path, name, kind, line FROM symbols"):
+            _validate_path_value(row[0], field="symbol path")
+            _clean_text(row[1], field="symbol name")
+            _clean_text(row[2], field="symbol kind", max_length=64)
+            if type(row[3]) is not int or row[3] < 1:
+                raise CorruptIndexError("invalid symbol line")
+        for row in self._connection.execute("SELECT path, name FROM dependencies"):
+            _validate_path_value(row[0], field="dependency path")
+            _clean_text(row[1], field="dependency name", max_length=256)
+        for row in self._connection.execute(
+            "SELECT path, kind, title, status, validated_at, source_files FROM adr_playbooks"
+        ):
+            _validate_path_value(row[0], field="artifact path")
+            _clean_text(row[1], field="artifact kind", max_length=32)
+            _clean_text(row[2], field="artifact title")
+            if row[3] != "":
+                _clean_text(row[3], field="artifact status", max_length=64)
+            if row[4] != "":
+                _clean_text(row[4], field="artifact validated_at", max_length=128)
+            source_files = json.loads(str(row[5]))
+            if not isinstance(source_files, list) or len(source_files) > MAX_RESULT_ITEMS_PER_KIND:
+                raise CorruptIndexError("invalid artifact source_files")
+            for source in source_files:
+                _validate_path_value(source, field="artifact source path")
 
     def _initialize_schema_with_recovery(self) -> None:
         try:
             self._create_schema()
-        except (CorruptIndexError, sqlite3.DatabaseError, OSError) as exc:
+        except (CorruptIndexError, ContextIndexError, sqlite3.DatabaseError, OSError) as exc:
             try:
                 self._connection.close()
             except Exception as close_error:
@@ -605,6 +794,19 @@ class ContextIndex:
                 with self._lock:
                     self._connection.execute("BEGIN IMMEDIATE")
                     try:
+                        existing = self._connection.execute(
+                            "SELECT 1 FROM files WHERE path = ?", (relative_path,)
+                        ).fetchone()
+                        if existing is None:
+                            total = int(
+                                self._connection.execute(
+                                    "SELECT COUNT(*) FROM files"
+                                ).fetchone()[0]
+                            )
+                            if total >= MAX_TOTAL_INDEXED_FILES:
+                                raise ContextIndexError(
+                                    "context index file count exceeds bound"
+                                )
                         self._connection.execute("DELETE FROM files WHERE path = ?", (relative_path,))
                         self._connection.execute(
                             "INSERT INTO files(path, blob_id, language) VALUES (?, ?, ?)",
@@ -645,7 +847,7 @@ class ContextIndex:
         if not _indexable_path(relative_path):
             raise ContextIndexError("source path is excluded from the metadata index")
         data = self._read_source(relative_path)
-        blob_id = git_blob_id(data)
+        blob_id = git_blob_id(data, object_format=self.object_format)
         language, headings, symbols, imports, text = _line_metadata(data, relative_path)
         artifact = _parse_artifact_frontmatter(text, relative_path, headings)
         self._replace_metadata(relative_path, blob_id, language, headings, symbols, imports, artifact)
@@ -672,8 +874,11 @@ class ContextIndex:
             ).fetchone()
             if row is None or row[0] == blob_id:
                 return False
-            self._connection.execute("DELETE FROM files WHERE path = ?", (relative_path,))
-            return True
+            deleted = self._connection.execute(
+                "DELETE FROM files WHERE path = ? AND blob_id = ?",
+                (relative_path, str(row[0])),
+            ).rowcount
+            return bool(deleted)
 
     def invalidate_stale(self, paths: Iterable[os.PathLike[str] | str] | None = None) -> list[str]:
         """Drop rows whose live blob no longer matches the recorded blob."""
@@ -695,12 +900,20 @@ class ContextIndex:
         stale: list[str] = []
         for relative_path, expected in candidates:
             try:
-                actual = git_blob_id(self._read_source(relative_path))
+                actual = git_blob_id(
+                    self._read_source(relative_path),
+                    object_format=self.object_format,
+                )
             except (OSError, StateCorruptError, UnsafePathError, InvalidSourceEncoding):
                 actual = ""
             if actual != expected:
-                self.remove(relative_path)
-                stale.append(relative_path)
+                with self._lock:
+                    deleted = self._connection.execute(
+                        "DELETE FROM files WHERE path = ? AND blob_id = ?",
+                        (relative_path, expected),
+                    ).rowcount
+                if deleted:
+                    stale.append(relative_path)
         return stale
 
     def query(self, query: str, *, limit: int | None = None) -> list[dict[str, Any]]:
@@ -709,9 +922,12 @@ class ContextIndex:
         terms = _query_terms(query)
         if not terms:
             return []
-        effective_limit = self.query_limit if limit is None else int(limit)
-        if effective_limit <= 0 or effective_limit > 1000:
-            raise ValueError("invalid query limit")
+        effective_limit = self.query_limit if limit is None else _exact_bounded_int(
+            limit,
+            "query limit",
+            minimum=1,
+            maximum=MAX_QUERY_LIMIT,
+        )
         clauses: list[str] = []
         parameters: list[str] = []
         for term in terms:
@@ -808,7 +1024,7 @@ class ContextIndex:
         if start_line < 1 or end_line < start_line or end_line - start_line > 1000:
             raise ValueError("invalid line range")
         data = self._read_source(relative_path)
-        actual_blob = git_blob_id(data)
+        actual_blob = git_blob_id(data, object_format=self.object_format)
         with self._lock:
             row = self._connection.execute(
                 "SELECT blob_id FROM files WHERE path = ?", (relative_path,)
@@ -826,7 +1042,10 @@ class ContextIndex:
             raise InvalidSourceEncoding(relative_path) from exc
         result = text.splitlines(keepends=True)[start_line - 1 : end_line]
         if deduplicate:
-            self._live_reads.add(read_key)
+            self._live_reads[read_key] = None
+            self._live_reads.move_to_end(read_key)
+            while len(self._live_reads) > MAX_LIVE_READ_KEYS:
+                self._live_reads.popitem(last=False)
         return result
 
     def fetch_line_range(self, path: os.PathLike[str] | str, start_line: int, end_line: int) -> list[str]:
@@ -846,7 +1065,13 @@ class ContextIndex:
         return None if row is None else str(row[0])
 
     def index_paths(self, paths: Iterable[os.PathLike[str] | str]) -> list[dict[str, Any]]:
-        return [self.index_file(path) for path in paths]
+        if isinstance(paths, (str, bytes, bytearray)):
+            raise ContextIndexError("paths must be a bounded iterable")
+        limited = itertools.islice(paths, MAX_INDEX_PATHS + 1)
+        materialized = list(limited)
+        if len(materialized) > MAX_INDEX_PATHS:
+            raise ContextIndexError("index path count exceeds bound")
+        return [self.index_file(path) for path in materialized]
 
     def index_repository(self) -> list[dict[str, Any]]:
         """Index Git-tracked regular files, excluding local state and binaries."""
@@ -874,13 +1099,56 @@ class ContextIndex:
             "warning": None,
         }
         indexed: list[dict[str, Any]] = []
+        eligible_paths: set[str] = set()
         for path in sorted(set(paths)):
             if path.startswith(".codex-state/") or path.startswith(".git/"):
                 continue
             try:
-                indexed.append(self.index_file(path))
-            except (OSError, StateCorruptError, UnsafePathError, InvalidSourceEncoding, ContextIndexError):
+                relative_path = self._safe_relative(path)
+            except (ContextIndexError, UnsafePathError):
                 continue
+            if not _indexable_path(relative_path):
+                continue
+            eligible_paths.add(relative_path)
+            with self._lock:
+                previous = self._connection.execute(
+                    "SELECT blob_id FROM files WHERE path = ?", (relative_path,)
+                ).fetchone()
+            try:
+                indexed.append(self.index_file(relative_path))
+            except (OSError, StateCorruptError, UnsafePathError, InvalidSourceEncoding, ContextIndexError):
+                # A failed reindex must not leave an old, stale row.  Keep
+                # deletion compare-and-swap based so a concurrent successful
+                # index cannot be removed.
+                if previous is not None:
+                    with self._lock:
+                        self._connection.execute(
+                            "DELETE FROM files WHERE path = ? AND blob_id = ?",
+                            (relative_path, str(previous[0])),
+                        )
+
+        # Git is the repository authority. Prune paths deleted from Git and
+        # any rows that failed indexing above.
+        with self._lock:
+            existing = [
+                str(row[0])
+                for row in self._connection.execute("SELECT path FROM files")
+            ]
+            for stale_path in existing:
+                if stale_path not in eligible_paths:
+                    self._connection.execute(
+                        "DELETE FROM files WHERE path = ?", (stale_path,)
+                    )
+            remaining = [
+                str(row[0])
+                for row in self._connection.execute(
+                    "SELECT path FROM files ORDER BY path"
+                )
+            ]
+            for stale_path in remaining[MAX_TOTAL_INDEXED_FILES:]:
+                self._connection.execute(
+                    "DELETE FROM files WHERE path = ?", (stale_path,)
+                )
         return indexed
 
 
@@ -914,8 +1182,16 @@ __all__ = [
     "ContextIndex",
     "ContextIndexError",
     "CorruptIndexError",
+    "DEFAULT_QUERY_LIMIT",
+    "DEFAULT_SOURCE_MAX_BYTES",
     "InvalidSourceEncoding",
     "KnowledgeIndex",
+    "MAX_DB_BYTES",
+    "MAX_INDEX_PATHS",
+    "MAX_LIVE_READ_KEYS",
+    "MAX_QUERY_LIMIT",
+    "MAX_SOURCE_MAX_BYTES",
+    "MAX_TOTAL_INDEXED_FILES",
     "MetadataIndex",
     "RepeatedReadError",
     "StaleIndexError",

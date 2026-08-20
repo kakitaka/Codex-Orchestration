@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -54,17 +55,35 @@ class TokenEfficiencyIntegrationTests(unittest.TestCase):
                 executable_version=sys.version.split()[0],
                 source_blob_ids={"src/worker.py": metadata["blob_id"]},
                 lock_hashes={"requirements.txt": "b" * 40},
+                dependency_hashes={"runtime": "d" * 40},
+                test_hashes={"tests/test_worker.py": "e" * 40},
                 config_hashes={"pyproject.toml": "c" * 40},
                 env_allowlist={"CI": "true"},
             )
             validation = validation_cache.ValidationCache(root)
-            validation.record_result(key, status="passed", exit_category="success", exit_code=0)
-            self.assertIsNotNone(validation.lookup(key))
+            validation.record_result(
+                key,
+                status="passed",
+                exit_category="success",
+                exit_code=0,
+                deterministic=True,
+                complete=True,
+            )
+            self.assertIsNotNone(validation.lookup(key, advisory=True))
+            self.assertIsNone(validation.lookup(key))
             self.assertIsNone(validation.lookup(key, purpose="final"))
             self.assertIsNone(validation.lookup(key, purpose="security"))
-            validation.record_result(key, status="failed", exit_category="assertion", exit_code=1)
-            self.assertIsNone(validation.lookup(key))
-            self.assertIsNotNone(validation.failure_hint(key))
+            validation.record_result(
+                key,
+                status="failed",
+                exit_category="assertion",
+                exit_code=1,
+                deterministic=True,
+                complete=True,
+            )
+            self.assertIsNone(validation.lookup(key, advisory=True))
+            self.assertIsNotNone(validation.failure_hint(key, advisory=True))
+            self.assertIsNone(validation.failure_hint(key))
 
             lane_context = {
                 "repo_relative": ".",
@@ -77,9 +96,28 @@ class TokenEfficiencyIntegrationTests(unittest.TestCase):
                 "approval": "never",
                 "tool_profile": "lean",
             }
-            lanes = session_telemetry.SessionLaneManager(root)
-            first = lanes.get_or_create(lane_context, caller_capability="local")
-            self.assertEqual(lanes.resume(first["lane_id"], lane_context, caller_capability="local"), first)
+            lanes = session_telemetry.SessionLaneManager(
+                root, resume_enabled=True, host_capability=True
+            )
+            expires = int(time.time()) + 60
+            first = lanes.get_or_create(
+                lane_context,
+                caller_capability="local",
+                resume_id="opaque-session",
+                task_packet_hash=packet.sha256,
+                resume_expires_at=expires,
+            )
+            self.assertEqual(
+                lanes.resume(
+                    first["lane_id"],
+                    lane_context,
+                    caller_capability="local",
+                    resume_id="opaque-session",
+                    task_packet_hash=packet.sha256,
+                    resume_expires_at=expires,
+                ),
+                first,
+            )
             changed = lanes.resume(
                 first["lane_id"],
                 dict(lane_context, model="gpt-5.6-terra"),
@@ -91,6 +129,7 @@ class TokenEfficiencyIntegrationTests(unittest.TestCase):
             event = usage.record(
                 {
                     "input_tokens": 100,
+                    "format_version": 1,
                     "cached_input_tokens": 60,
                     "output_tokens": 10,
                     "reasoning_output_tokens": 5,

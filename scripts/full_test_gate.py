@@ -26,7 +26,17 @@ DEFAULT_BASELINE = ROOT / "tests" / "baselines" / "windows-ee43f3a.json"
 MAX_CAPTURE_BYTES = 4_000_000
 MAX_REPORT_FAILURES = 100
 BASELINE_TEST_COUNT = 384
+MAX_TEST_IDS = 10_000
+MAX_INVENTORY_BYTES = 256 * 1024
+TEST_INVENTORY_PATH = ROOT / "tests" / "test_inventory.json"
 WINDOWS_BASELINE_SHA256 = "b585913e579a681ed8d9b696231787f32be976a23bdb7198dec14a33e349308a"
+# These pre-existing native-routing failures are part of the immutable specification
+# baseline.  Keep the general protected-test rule intact while allowing only
+# this exact, content-bound legacy set to remain in that baseline.
+LEGACY_BASELINE_NODE_PREFIXES = ("test_native_routing.NativeRoutingTests.",)
+LEGACY_BASELINE_NODES = {
+    "test_configure_orchestration.ConfigureOrchestrationTests.test_atomic_update_preserves_security_metadata",
+}
 TOP_KEYS = {"schema", "commit", "platform", "rationale", "owner", "expires", "entries"}
 ENTRY_KEYS = {"kind", "node", "signature", "occurrences"}
 BLOCK_RE = re.compile(
@@ -37,6 +47,9 @@ BLOCK_RE = re.compile(
 NODE_RE = re.compile(r"\(((?:tests?\.)?[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+){2,})\)")
 EXCEPTION_RE = re.compile(r"^(?:[A-Za-z_][\w.]*?(?:Error|Exception)):\s*.*$")
 TEST_COUNT_RE = re.compile(r"\bRan\s+(\d+)\s+tests?\b")
+TEST_ID_RE = re.compile(
+    r"^(?P<id>test_[A-Za-z0-9_]+\s+\([^\r\n]+\))\s+\.\.\."
+)
 WINDOWS_TEMP_RE = re.compile(
     r"(?i)(?:[A-Z]:)?/[^\s:'\"]*?/AppData/Local/Temp/(?:tmp|codex-)[^\s:'\"]*"
 )
@@ -58,8 +71,12 @@ def _normalize(value: str, repo_root: Path) -> str:
 
 
 def parse_failures(output: str, repo_root: Path) -> list[Failure]:
+    if not isinstance(output, str) or len(output.encode("utf-8", "replace")) > MAX_CAPTURE_BYTES:
+        raise ValueError("test output exceeds parse bound")
     failures: list[Failure] = []
-    for match in BLOCK_RE.finditer(output):
+    for index, match in enumerate(BLOCK_RE.finditer(output)):
+        if index >= MAX_TEST_IDS:
+            raise ValueError("failure block count exceeds bound")
         header = match.group("header")
         node_match = NODE_RE.search(header)
         node = node_match.group(1) if node_match else header
@@ -80,8 +97,91 @@ def parse_failures(output: str, repo_root: Path) -> list[Failure]:
 
 
 def parse_test_count(output: str) -> int | None:
+    if not isinstance(output, str) or len(output.encode("utf-8", "replace")) > MAX_CAPTURE_BYTES:
+        return None
     matches = TEST_COUNT_RE.findall(output)
     return int(matches[-1]) if matches else None
+
+
+def discover_test_ids(output: str) -> tuple[str, ...]:
+    """Extract the exact unittest IDs from verbose output, with hard bounds."""
+    if not isinstance(output, str) or len(output.encode("utf-8", "replace")) > MAX_CAPTURE_BYTES:
+        raise ValueError("test output exceeds inventory parse bound")
+    found: list[str] = []
+    seen: set[str] = set()
+    for line in output.splitlines():
+        match = TEST_ID_RE.match(line)
+        if match is None:
+            continue
+        test_id = match.group("id")
+        if test_id in seen:
+            raise ValueError(f"duplicate discovered test ID: {test_id}")
+        if len(found) >= MAX_TEST_IDS:
+            raise ValueError("discovered test ID count exceeds bound")
+        seen.add(test_id)
+        found.append(test_id)
+    return tuple(sorted(found))
+
+
+def classify_test_id(test_id: str) -> str:
+    lowered = test_id.lower()
+    if any(token in lowered for token in (
+        "token", "bounded_run", "playbook", "full_test_gate", "preflight",
+        "release_check", "packaging", "plugin_lifecycle", "task_packet",
+        "validation_cache", "safe_state", "context_index", "session_telemetry",
+        "token_hook", "token_profiles", "token_budget", "efficiency",
+        "external_credentials", "native_routing", "routing_state",
+    )):
+        return "protected-tooling-security"
+    if "security" in lowered or "credential" in lowered or "secret" in lowered:
+        return "protected-tooling-security"
+    return "ordinary"
+
+
+def _read_bounded(path: Path, limit: int, label: str) -> bytes:
+    with path.open("rb") as handle:
+        raw = handle.read(limit + 1)
+    if len(raw) > limit:
+        raise ValueError(f"{label} exceeds byte limit")
+    return raw
+
+
+def load_test_inventory(path: Path) -> tuple[tuple[str, ...], dict[str, str]]:
+    raw = _read_bounded(path, MAX_INVENTORY_BYTES, "test inventory")
+    payload = json.loads(raw.decode("utf-8"))
+    if not isinstance(payload, dict) or set(payload) != {"schema", "test_ids", "protected"}:
+        raise ValueError("test inventory schema mismatch")
+    if payload["schema"] != 1:
+        raise ValueError("unsupported test inventory schema")
+    ids = payload["test_ids"]
+    if not isinstance(ids, list) or len(ids) > MAX_TEST_IDS or any(
+        not isinstance(item, str) or not item or len(item) > 512 for item in ids
+    ) or ids != sorted(set(ids)):
+        raise ValueError("test inventory IDs must be sorted and unique")
+    protected = payload["protected"]
+    if not isinstance(protected, dict) or len(protected) > MAX_TEST_IDS:
+        raise ValueError("test inventory protected classification is malformed")
+    if any(
+        not isinstance(key, str) or key not in ids or value != "protected-tooling-security"
+        for key, value in protected.items()
+    ):
+        raise ValueError("test inventory protected classification is malformed")
+    return tuple(ids), dict(protected)
+
+
+def compare_test_inventory(
+    actual_ids: tuple[str, ...], expected_ids: tuple[str, ...], expected_protected: dict[str, str]
+) -> tuple[list[str], list[str], list[str]]:
+    actual = set(actual_ids)
+    expected = set(expected_ids)
+    unexpected = sorted(actual - expected)
+    missing = sorted(expected - actual)
+    classification = sorted(
+        test_id
+        for test_id in expected & actual
+        if classify_test_id(test_id) != expected_protected.get(test_id, "ordinary")
+    )
+    return unexpected, missing, classification
 
 
 def load_baseline(
@@ -90,12 +190,11 @@ def load_baseline(
     today: date,
     expected_sha256: str | None = None,
 ) -> Counter[Failure]:
-    raw = path.read_bytes()
-    if len(raw) > 256 * 1024:
-        raise ValueError("baseline exceeds byte limit")
+    raw = _read_bounded(path, 256 * 1024, "baseline")
+    content_digest = hashlib.sha256(raw).hexdigest()
     if (
         expected_sha256 is not None
-        and hashlib.sha256(raw).hexdigest() != expected_sha256
+        and content_digest != expected_sha256
     ):
         raise ValueError("baseline content differs from the bound base-commit allowlist")
     payload = json.loads(raw.decode("utf-8"))
@@ -136,7 +235,15 @@ def load_baseline(
         if not 1 <= occurrences <= 100:
             raise ValueError(f"baseline entry {index} occurrences invalid")
         node = entry["node"]
-        if "token_" in node or "playbook" in node or "full_test_gate" in node:
+        legacy_node = (
+            expected_sha256 == WINDOWS_BASELINE_SHA256
+            and content_digest == WINDOWS_BASELINE_SHA256
+            and (
+                node in LEGACY_BASELINE_NODES
+                or any(node.startswith(prefix) for prefix in LEGACY_BASELINE_NODE_PREFIXES)
+            )
+        )
+        if classify_test_id(node) != "ordinary" and not legacy_node:
             raise ValueError("baseline cannot exempt token-efficiency tests")
         failure = Failure(entry["kind"], node, entry["signature"])
         if failure in failures:
@@ -155,13 +262,19 @@ def _format(failure: Failure) -> str:
     return f"{failure.kind} {failure.node}: {failure.signature}"
 
 
-def run_gate(repo_root: Path, baseline_path: Path, *, platform: str) -> int:
+def run_gate(
+    repo_root: Path,
+    baseline_path: Path,
+    *,
+    platform: str,
+    inventory_path: Path = TEST_INVENTORY_PATH,
+) -> int:
     environment = os.environ.copy()
     environment.setdefault("PYTHONUTF8", "1")
     environment.setdefault("PYTHONIOENCODING", "utf-8")
     try:
         completed = run_bounded(
-            [sys.executable, "-m", "unittest", "discover", "-s", "tests"],
+            [sys.executable, "-m", "unittest", "discover", "-v", "-s", "tests"],
             cwd=repo_root,
             env=environment,
             timeout=900,
@@ -175,13 +288,30 @@ def run_gate(repo_root: Path, baseline_path: Path, *, platform: str) -> int:
             file=sys.stderr,
         )
         return 1
-    if completed.exit_category in {"start_error", "timeout", "output_limit"}:
+    if completed.exit_category in {"start_error", "timeout", "output_limit", "cleanup_error"}:
         print(
             f"FAIL: full tests ended with {completed.exit_category}", file=sys.stderr
         )
         return 1
     output = completed.stdout_first + "\n" + completed.stderr_first
-    actual = Counter(parse_failures(output, repo_root))
+    try:
+        actual = Counter(parse_failures(output, repo_root))
+        actual_ids = discover_test_ids(output)
+        expected_ids, protected = load_test_inventory(inventory_path.resolve())
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        print(f"FAIL: exact test inventory unavailable: {exc}", file=sys.stderr)
+        return 1
+    unexpected_ids, missing_ids, classification = compare_test_inventory(
+        actual_ids, expected_ids, protected
+    )
+    if unexpected_ids or missing_ids or classification:
+        if unexpected_ids:
+            print(f"FAIL: unexpected test IDs: {unexpected_ids[:MAX_REPORT_FAILURES]}", file=sys.stderr)
+        if missing_ids:
+            print(f"FAIL: missing test IDs: {missing_ids[:MAX_REPORT_FAILURES]}", file=sys.stderr)
+        if classification:
+            print(f"FAIL: protected test classification drift: {classification[:MAX_REPORT_FAILURES]}", file=sys.stderr)
+        return 1
     test_count = parse_test_count(output)
     if test_count is None:
         print("FAIL: unittest output omitted the test count", file=sys.stderr)
@@ -235,12 +365,18 @@ def parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo-root", type=Path, default=ROOT)
     parser.add_argument("--baseline", type=Path, default=DEFAULT_BASELINE)
+    parser.add_argument("--inventory", type=Path, default=TEST_INVENTORY_PATH)
     return parser.parse_args(arguments)
 
 
 def main(arguments: list[str] | None = None) -> int:
     args = parse_args(arguments)
-    return run_gate(args.repo_root.resolve(), args.baseline.resolve(), platform=sys.platform)
+    return run_gate(
+        args.repo_root.resolve(),
+        args.baseline.resolve(),
+        platform=sys.platform,
+        inventory_path=args.inventory.resolve(),
+    )
 
 
 if __name__ == "__main__":

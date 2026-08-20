@@ -16,6 +16,7 @@ from pathlib import Path
 import posixpath
 import re
 import stat
+import threading
 from types import MappingProxyType
 import unicodedata
 from typing import Any, Iterable, Mapping
@@ -48,6 +49,17 @@ PACKET_KEYS = (
     "OUTPUT_CONTRACT",
 )
 CANONICAL_PACKET_KEYS = PACKET_KEYS
+
+# Packet input is untrusted. These finite bounds are enforced while
+# iterating (one item past the limit), rather than after materializing a
+# generator with list or set.
+MAX_PACKET_ITEMS = 256
+MAX_PACKET_TEXT_CHARS = 8 * 1024
+MAX_PACKET_TEXT_UTF8_BYTES = 64 * 1024
+MAX_PACKET_CANONICAL_BYTES = 64 * 1024
+MAX_PACKET_ESTIMATED_TOKENS = 16 * 1024
+MAX_BUDGET_TOKENS = 10**12
+MAX_BUDGET_COST = 10**12
 
 
 class TaskPacketError(ValueError):
@@ -107,6 +119,27 @@ _FIELD_ALIASES = {
     "expected_output": "OUTPUT_CONTRACT",
 }
 
+_PACKET_METADATA_KEYS = frozenset(
+    {
+        "SHA256",
+        "sha256",
+        "PACKET_HASH",
+        "packet_hash",
+        "CANONICAL_BYTES",
+        "canonical_bytes",
+        "CANONICAL",
+        "canonical",
+    }
+)
+_ALIASES_BY_FIELD: dict[str, tuple[str, ...]] = {
+    field: tuple(
+        key
+        for key, target in _FIELD_ALIASES.items()
+        if target == field
+    )
+    for field in PACKET_KEYS
+}
+
 _STATIC_UUID_RE = re.compile(
     r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-"
     r"[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}\b"
@@ -116,12 +149,16 @@ _STATIC_TIME_RE = re.compile(
 )
 _STATIC_ABSOLUTE_RE = re.compile(
     r"(?:"
-    r"\b[A-Za-z]:[\\/]"
+  r"\b[A-Za-z]:[\\/]"
+    r"|\b[A-Za-z]:[^\s/'\"`]+"
     r"|(?<![A-Za-z0-9:])[/\\]{2,}[^\s'\"`]*"
     r"|(?<![A-Za-z0-9:])\\\\[^\\/\s]+[\\/][^\\/\s]+"
     r"|(?<![A-Za-z0-9:])//[^/\s]+/[^/\s]+"
-    r"|(?<![A-Za-z0-9/.])/(?!/)(?:[^\s/'\"`][^\s'\"`]*)?"
-    r"|(?<![A-Za-z0-9\\/.])\\(?!\\)(?:[^\s\\/'\"`][^\s'\"`]*)?"
+    # A single slash-prefixed word is common prose (for example /skills).
+    # Require a second path component for POSIX prose paths.
+    r"|(?<![A-Za-z0-9/.])/(?:\s|$)"
+    r"|(?<![A-Za-z0-9/.])/(?!/)(?:[^\s/'\"`]+/){1,}[^\s/'\"`]+"
+    r"|(?<![A-Za-z0-9\\/.])\\(?!\\)(?:[^\s\\/'\"`]+\\){1,}[^\s'\"`]+"
     r"|(?<![A-Za-z0-9_])-[A-Za-z0-9][/\\]{2,}[^\s'\"`]*"
     r"|(?<![A-Za-z0-9_])-[A-Za-z0-9]/(?!/)"
     r"(?:[^\s/'\"`][^\s'\"`]*)?"
@@ -137,7 +174,40 @@ def _nfc_lf(value: str) -> str:
         raise PacketSchemaError("packet text fields must be strings")
     # Normalize line endings before NFC so a combining character spanning a
     # source boundary receives the same canonical treatment on every platform.
-    return unicodedata.normalize("NFC", value.replace("\r\n", "\n").replace("\r", "\n"))
+    if any(0xD800 <= ord(char) <= 0xDFFF for char in value):
+        raise PacketSchemaError("packet text contains a lone surrogate")
+    normalized = unicodedata.normalize(
+        "NFC", value.replace("\r\n", "\n").replace("\r", "\n")
+    )
+    if any(0xD800 <= ord(char) <= 0xDFFF for char in normalized):
+        raise PacketSchemaError("packet text contains a lone surrogate")
+    try:
+        normalized.encode("utf-8", "strict")
+    except UnicodeEncodeError as exc:
+        raise PacketSchemaError("packet text is not valid UTF-8") from exc
+    return normalized
+
+
+def _bounded_text(value: Any, field: str) -> str:
+    if type(value) is not str:
+        raise PacketSchemaError("packet text fields must be strings")
+    # Check the caller-provided representation before normalization.  NFC and
+    # line-ending conversion must never be allowed to materialize an
+    # unbounded hostile field first.
+    if len(value) > MAX_PACKET_TEXT_CHARS:
+        raise PacketSchemaError(f"{field} exceeds text bound")
+    try:
+        raw_bytes = len(value.encode("utf-8", "strict"))
+    except UnicodeEncodeError as exc:
+        raise PacketSchemaError(f"{field} is not valid UTF-8") from exc
+    if raw_bytes > MAX_PACKET_TEXT_UTF8_BYTES:
+        raise PacketSchemaError(f"{field} exceeds UTF-8 byte bound")
+    text = _nfc_lf(value)
+    if len(text) > MAX_PACKET_TEXT_CHARS:
+        raise PacketSchemaError(f"{field} exceeds text bound")
+    if len(text.encode("utf-8", "strict")) > MAX_PACKET_TEXT_UTF8_BYTES:
+        raise PacketSchemaError(f"{field} exceeds UTF-8 byte bound")
+    return text
 
 
 def _is_reparse_point(path: Path) -> bool:
@@ -205,12 +275,17 @@ def normalize_repo_path(
         value = os.fspath(value)
     if type(value) is not str:
         raise PacketPathError("packet paths must be strings")
-    text = _nfc_lf(value).replace("\\", "/")
+    text = _bounded_text(value, "packet path").replace("\\", "/")
     if not text or "\n" in text or "\x00" in text:
         raise PacketPathError("packet path is empty or contains a control character")
     # PurePosixPath does not recognize a Windows drive on POSIX, so check both
     # spellings explicitly before any normalization.
-    if text.startswith("/") or text.startswith("//") or re.match(r"^[A-Za-z]:($|/)", text):
+    if (
+        text.startswith("/")
+        or text.startswith("//")
+        or re.match(r"^[A-Za-z]:", text)
+        or text.startswith("\\\\")
+    ):
         raise PacketPathError("packet paths must be repository-relative")
     pieces = text.split("/")
     if any(piece in {"", ".", ".."} for piece in pieces):
@@ -218,8 +293,10 @@ def normalize_repo_path(
     normalized = posixpath.normpath("/".join(pieces))
     if normalized in {"", ".", ".."} or normalized.startswith("../"):
         raise PathContainmentError("packet path escapes the repository")
-    if repo_root is not None:
-        root = _root_path(repo_root)
+    # Use the current repository as the safe default when no explicit root
+    # was supplied. This checks symlink/reparse components on every route.
+    root = _root_path(Path.cwd() if repo_root is None else repo_root)
+    if root is not None:
         candidate = root.joinpath(*normalized.split("/"))
         try:
             resolved = candidate.resolve(strict=False)
@@ -233,7 +310,7 @@ def normalize_repo_path(
 
 
 def _iter_values(value: Any, field: str) -> Iterable[Any]:
-    if isinstance(value, (str, bytes, bytearray)) or value is None:
+    if isinstance(value, (str, bytes, bytearray, ABCMapping)) or value is None:
         raise PacketSchemaError(f"{field} must be a list")
     if not isinstance(value, Iterable):
         raise PacketSchemaError(f"{field} must be a list")
@@ -249,7 +326,24 @@ _SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("openai_key", re.compile(r"\bsk-[A-Za-z0-9][A-Za-z0-9_-]{19,}\b")),
     ("bearer_token", re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{16,}\b", re.I)),
     ("jwt", re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b")),
-    ("credential_assignment", re.compile(r"\b(?:api[_-]?key|secret|password|token|credential)\s*[:=]\s*[^\s,;]+", re.I)),
+    # Do not classify benign prose such as token: budget as a secret.
+    (
+        "credential_assignment",
+        re.compile(
+            r"\b(?:api[_-]?key|secret|password|credential)\s*[:=]\s*[^\s,;]{4,}"
+            r"|\btoken\s*[:=]\s*(?:gh[pousr]|github_pat_|AKIA|sk-)[^\s,;]+",
+            re.I,
+        ),
+    ),
+    (
+        "credential_url",
+        re.compile(
+            r"\bhttps?://[^\s/@:]+:[^\s/@]+@"
+            r"|\bhttps?://[^\s?#]+[?&](?:api[_-]?key|token|secret|password|credential)="
+            r"[^\s&#]+",
+            re.I,
+        ),
+    ),
 )
 
 
@@ -279,7 +373,7 @@ def _reject_unstable_static(value: Any, field: str) -> None:
 
     values = [value] if isinstance(value, str) else value
     for item in values:
-        if not isinstance(item, str):
+        if type(item) is not str:
             raise PacketSchemaError(f"{field} must contain text")
         if _STATIC_UUID_RE.search(item):
             raise PacketSchemaError(f"{field} contains an unstable UUID")
@@ -302,8 +396,10 @@ def _reject_user_absolute_paths(value: Any, field: str) -> None:
 
 def _normalize_text_list(value: Any, field: str) -> list[str]:
     normalized: set[str] = set()
-    for item in _iter_values(value, field):
-        normalized.add(_nfc_lf(item))
+    for index, item in enumerate(_iter_values(value, field)):
+        if index >= MAX_PACKET_ITEMS:
+            raise PacketSchemaError(f"{field} exceeds item bound")
+        normalized.add(_bounded_text(item, field))
     return sorted(normalized)
 
 
@@ -314,19 +410,18 @@ def _normalize_path_list(
     repo_root: str | os.PathLike[str] | None,
 ) -> list[str]:
     normalized: set[str] = set()
-    for item in _iter_values(value, field):
+    for index, item in enumerate(_iter_values(value, field)):
+        if index >= MAX_PACKET_ITEMS:
+            raise PacketSchemaError(f"{field} exceeds item bound")
         normalized.add(normalize_repo_path(item, repo_root=repo_root))
     return sorted(normalized)
 
 
 def _mapping_value(source: Mapping[str, Any], field: str, default: Any) -> Any:
-    if field in source:
-        return source[field]
-    alias = field.lower()
-    if alias in source:
-        return source[alias]
-    # Permit the natural snake_case alias for fixed uppercase keys.
-    return source.get(_FIELD_ALIASES.get(alias, alias), default)
+    keys = [key for key in (field, *_ALIASES_BY_FIELD.get(field, ())) if key in source]
+    if len(keys) > 1:
+        raise PacketSchemaError(f"canonical/alias duplicate field: {field}")
+    return source[keys[0]] if keys else default
 
 
 def _coerce_source(
@@ -347,7 +442,12 @@ def _coerce_source(
     if packet is not None:
         if not isinstance(packet, Mapping):
             raise PacketSchemaError("packet source must be an object")
-        unknown = set(packet) - set(PACKET_KEYS) - set(_FIELD_ALIASES)
+        keys: list[Any] = []
+        for index, key in enumerate(packet):
+            if index >= MAX_PACKET_ITEMS:
+                raise PacketSchemaError("packet contains too many fields")
+            keys.append(key)
+        unknown = set(keys) - set(PACKET_KEYS) - set(_FIELD_ALIASES)
         if unknown:
             raise PacketSchemaError("packet contains unsupported fields")
         return {
@@ -380,24 +480,48 @@ def _coerce_source(
     }
 
 
+def _check_payload_bounds(payload: Mapping[str, Any]) -> None:
+    total_bytes = 0
+    for value in payload.values():
+        values = value if isinstance(value, (list, tuple)) else (value,)
+        for item in values:
+            if type(item) is not str:
+                raise PacketSchemaError("packet payload contains a non-text value")
+            total_bytes += len(item.encode("utf-8", "strict"))
+            if total_bytes > MAX_PACKET_TEXT_UTF8_BYTES:
+                raise PacketSchemaError("packet text exceeds UTF-8 byte bound")
+
+
 def _build_payload(
     source: Mapping[str, Any],
     *,
     repo_root: str | os.PathLike[str] | None,
 ) -> dict[str, Any]:
-    version = _nfc_lf(source["VERSION"])
+    version = _bounded_text(source["VERSION"], "VERSION")
     if version != PACKET_VERSION:
         raise PacketSchemaError("packet VERSION is unsupported")
     if source["ROLE"] is None or source["GOAL"] is None:
         raise PacketSchemaError("packet ROLE and GOAL are required")
-    role = _nfc_lf(source["ROLE"])
-    goal = _nfc_lf(source["GOAL"])
+    role = _bounded_text(source["ROLE"], "ROLE")
+    goal = _bounded_text(source["GOAL"], "GOAL")
     if not role.strip() or not goal.strip():
         raise PacketSchemaError("packet ROLE and GOAL must be non-empty")
-    base_revision = _nfc_lf(source["BASE_REVISION"] or "")
-    validation = _nfc_lf(source["VALIDATION"] or "")
-    output_contract = _nfc_lf(source["OUTPUT_CONTRACT"] or "")
-    static_rules = _normalize_text_list(source["STATIC_RULES"] or (), "STATIC_RULES")
+    base_revision = _bounded_text(
+        "" if source["BASE_REVISION"] is None else source["BASE_REVISION"],
+        "BASE_REVISION",
+    )
+    validation = _bounded_text(
+        "" if source["VALIDATION"] is None else source["VALIDATION"],
+        "VALIDATION",
+    )
+    output_contract = _bounded_text(
+        "" if source["OUTPUT_CONTRACT"] is None else source["OUTPUT_CONTRACT"],
+        "OUTPUT_CONTRACT",
+    )
+    static_rules = _normalize_text_list(
+        () if source["STATIC_RULES"] is None else source["STATIC_RULES"],
+        "STATIC_RULES",
+    )
     _reject_unstable_static(role, "ROLE")
     _reject_unstable_static(static_rules, "STATIC_RULES")
     payload = {
@@ -436,12 +560,44 @@ def _build_payload(
     for field, value in payload.items():
         _reject_secrets(value, field)
         _reject_user_absolute_paths(value, field)
+    _check_payload_bounds(payload)
     return payload
 
 
-def canonical_json_bytes(payload: Mapping[str, Any]) -> bytes:
-    """Serialize a validated fixed-order payload exactly once."""
+def _normalize_public_payload(
+    payload: Mapping[str, Any],
+    *,
+    repo_root: str | os.PathLike[str] | None = None,
+) -> dict[str, Any]:
+    if not isinstance(payload, Mapping):
+        raise PacketSchemaError("packet payload must be an object")
+    allowed = set(PACKET_KEYS) | set(_FIELD_ALIASES)
+    keys: list[Any] = []
+    for index, key in enumerate(payload):
+        if index >= MAX_PACKET_ITEMS:
+            raise PacketSchemaError("packet contains too many fields")
+        keys.append(key)
+    unknown = set(keys) - allowed
+    if unknown:
+        raise PacketSchemaError("packet contains unsupported fields")
+    source = _coerce_source(
+        payload,
+        role=None,
+        static_rules=None,
+        goal=None,
+        base_revision=None,
+        files_allowed=None,
+        files_forbidden=None,
+        known_facts=None,
+        constraints=None,
+        acceptance_criteria=None,
+        validation=None,
+        output_contract=None,
+    )
+    return _build_payload(source, repo_root=repo_root)
 
+
+def _serialize_normalized_payload(payload: Mapping[str, Any]) -> bytes:
     if tuple(payload) != PACKET_KEYS:
         raise PacketSchemaError("packet keys are not in TASK_PACKET_V1 order")
     data = json.dumps(
@@ -450,9 +606,22 @@ def canonical_json_bytes(payload: Mapping[str, Any]) -> bytes:
         separators=(",", ":"),
         sort_keys=False,
     ).encode("utf-8")
-    if data.startswith(b"\xef\xbb\xbf") or data.endswith(b"\n"):
+    if (
+        data.startswith(b"\xef\xbb\xbf")
+        or data.endswith(b"\n")
+        or len(data) > MAX_PACKET_CANONICAL_BYTES
+    ):
         raise PacketSchemaError("canonical packet bytes have an invalid BOM or LF")
     return data
+
+
+def canonical_json_bytes(payload: Mapping[str, Any]) -> bytes:
+    """Validate and serialize one packet in deterministic UTF-8 order."""
+
+    if isinstance(payload, TaskPacket):
+        return payload.canonical_bytes
+    normalized = _normalize_public_payload(payload)
+    return _serialize_normalized_payload(normalized)
 
 
 @dataclass(frozen=True)
@@ -462,11 +631,22 @@ class TaskPacket(ABCMapping[str, Any]):
     sha256: str
 
     def __post_init__(self) -> None:
+        normalized = _normalize_public_payload(self.payload)
+        data = _serialize_normalized_payload(normalized)
+        digest = hashlib.sha256(data).hexdigest()
+        if type(self.canonical_bytes) is not bytes or self.canonical_bytes != data:
+            raise PacketSchemaError("supplied canonical bytes do not match packet")
+        if type(self.sha256) is not str or not re.fullmatch(r"[0-9a-f]{64}", self.sha256):
+            raise PacketSchemaError("supplied packet hash is malformed")
+        if self.sha256 != digest:
+            raise PacketSchemaError("supplied packet hash does not match packet")
         immutable = {
             key: tuple(value) if isinstance(value, list) else value
-            for key, value in self.payload.items()
+            for key, value in normalized.items()
         }
         object.__setattr__(self, "payload", MappingProxyType(immutable))
+        object.__setattr__(self, "canonical_bytes", data)
+        object.__setattr__(self, "sha256", digest)
 
     @property
     def packet_hash(self) -> str:
@@ -557,8 +737,35 @@ def build_task_packet(
     """
 
     source_mapping: Mapping[str, Any] | None
+    supplied_hash: str | None = None
+    supplied_canonical: bytes | None = None
     if isinstance(packet, Mapping):
-        source_mapping = packet
+        metadata: dict[str, Any] = {}
+        source_data: dict[str, Any] = {}
+        for index, key in enumerate(packet):
+            if index > len(PACKET_KEYS) + len(_PACKET_METADATA_KEYS):
+                raise PacketSchemaError("packet contains too many fields")
+            if key in _PACKET_METADATA_KEYS:
+                metadata[key] = packet[key]
+            else:
+                source_data[key] = packet[key]
+        hash_keys = [
+            key
+            for key in ("SHA256", "sha256", "PACKET_HASH", "packet_hash")
+            if key in metadata
+        ]
+        canonical_keys = [
+            key
+            for key in ("CANONICAL_BYTES", "canonical_bytes", "CANONICAL", "canonical")
+            if key in metadata
+        ]
+        if len(hash_keys) > 1 or len(canonical_keys) > 1:
+            raise PacketSchemaError("duplicate packet integrity field")
+        if hash_keys:
+            supplied_hash = metadata[hash_keys[0]]
+        if canonical_keys:
+            supplied_canonical = metadata[canonical_keys[0]]
+        source_mapping = source_data
     elif packet is None:
         source_mapping = None
     else:
@@ -581,8 +788,16 @@ def build_task_packet(
         output_contract=expected_output if output_contract is None else output_contract,
     )
     payload = _build_payload(source, repo_root=repo_root)
-    data = canonical_json_bytes(payload)
+    data = _serialize_normalized_payload(payload)
     digest = hashlib.sha256(data).hexdigest()
+    if supplied_hash is not None:
+        if type(supplied_hash) is not str or not re.fullmatch(r"[0-9a-f]{64}", supplied_hash):
+            raise PacketSchemaError("supplied packet hash is malformed")
+        if supplied_hash != digest:
+            raise PacketSchemaError("supplied packet hash does not match packet")
+    if supplied_canonical is not None:
+        if type(supplied_canonical) is not bytes or supplied_canonical != data:
+            raise PacketSchemaError("supplied canonical bytes do not match packet")
     return TaskPacket(payload=payload, canonical_bytes=data, sha256=digest)
 
 
@@ -626,7 +841,12 @@ def estimate_tokens(packet: TaskPacket | bytes | str, *, chars_per_token: int = 
         size = len(packet.encode("utf-8"))
     else:
         raise TaskPacketError("token estimation requires a packet, bytes, or text")
-    return max(1, (size + chars_per_token - 1) // chars_per_token)
+    if size > MAX_PACKET_CANONICAL_BYTES:
+        raise TaskPacketError("packet exceeds canonical byte bound")
+    estimated = max(1, (size + chars_per_token - 1) // chars_per_token)
+    if estimated > MAX_PACKET_ESTIMATED_TOKENS:
+        raise TaskPacketError("packet exceeds estimated-token bound")
+    return estimated
 
 
 @dataclass(frozen=True)
@@ -646,62 +866,92 @@ class DuplicatePacketRegistry:
     """Content-addressed packet registry; it never limits worker concurrency."""
 
     def __init__(self, hashes: Iterable[str] = ()) -> None:
+        self._lock = threading.RLock()
         self._hashes: set[str] = set()
-        for value in hashes:
-            self._hashes.add(self._coerce_hash(value))
+        for index, value in enumerate(hashes):
+            if index >= MAX_PACKET_ITEMS:
+                raise TaskPacketError("packet registry is too large")
+            # Seed hashes are trusted state loaded by the owner.  Public
+            # reserve/check routes below never accept a caller-supplied hash
+            # in place of packet content.
+            self._hashes.add(self._coerce_hash(value, allow_hash=True))
 
     @staticmethod
-    def _coerce_hash(packet: TaskPacket | str | bytes) -> str:
+    def _coerce_hash(
+        packet: TaskPacket | Mapping[str, Any] | str | bytes,
+        *,
+        allow_hash: bool = False,
+    ) -> str:
         if isinstance(packet, TaskPacket):
             return packet.sha256
+        if isinstance(packet, Mapping):
+            return build_task_packet(packet).sha256
         if isinstance(packet, bytes):
-            return hashlib.sha256(packet).hexdigest()
-        if isinstance(packet, str) and re.fullmatch(r"[0-9a-fA-F]{64}", packet):
+            if len(packet) > MAX_PACKET_CANONICAL_BYTES:
+                raise TaskPacketError("packet exceeds canonical byte bound")
+            try:
+                decoded = json.loads(packet.decode("utf-8", "strict"))
+            except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+                raise PacketSchemaError("packet bytes are not canonical JSON") from exc
+            rebuilt = build_task_packet(decoded)
+            if rebuilt.canonical_bytes != packet:
+                raise PacketSchemaError("packet bytes are not canonical")
+            return rebuilt.sha256
+        if allow_hash and isinstance(packet, str) and re.fullmatch(r"[0-9a-fA-F]{64}", packet):
             return packet.lower()
-        raise TaskPacketError("packet registry requires a TaskPacket or SHA256 hash")
+        raise TaskPacketError("packet registry requires packet content")
 
     @property
     def hashes(self) -> frozenset[str]:
-        return frozenset(self._hashes)
+        with self._lock:
+            return frozenset(self._hashes)
 
-    def is_duplicate(self, packet: TaskPacket | str | bytes) -> bool:
-        return self._coerce_hash(packet) in self._hashes
+    def is_duplicate(self, packet: TaskPacket | Mapping[str, Any] | bytes) -> bool:
+        digest = self._coerce_hash(packet)
+        with self._lock:
+            return digest in self._hashes
 
-    def seen(self, packet: TaskPacket | str | bytes) -> bool:
+    def seen(self, packet: TaskPacket | Mapping[str, Any] | bytes) -> bool:
         return self.is_duplicate(packet)
 
-    def check(self, packet: TaskPacket | str | bytes) -> DuplicateDecision:
+    def check(self, packet: TaskPacket | Mapping[str, Any] | bytes) -> DuplicateDecision:
         digest = self._coerce_hash(packet)
-        duplicate = digest in self._hashes
+        with self._lock:
+            duplicate = digest in self._hashes
         return DuplicateDecision(digest, duplicate, not duplicate)
 
     def register(
         self,
-        packet: TaskPacket | str | bytes,
+        packet: TaskPacket | Mapping[str, Any] | bytes,
         *,
         reject_duplicate: bool = False,
     ) -> DuplicateDecision:
-        decision = self.check(packet)
-        if decision.duplicate:
-            if reject_duplicate:
-                raise DuplicatePacketError(decision.packet_hash)
+        digest = self._coerce_hash(packet)
+        with self._lock:
+            duplicate = digest in self._hashes
+            decision = DuplicateDecision(digest, duplicate, not duplicate)
+            if duplicate:
+                if reject_duplicate:
+                    raise DuplicatePacketError(digest)
+                return decision
+            self._hashes.add(digest)
             return decision
-        self._hashes.add(decision.packet_hash)
-        return decision
 
     add = register
 
-    def reserve(self, packet: TaskPacket | str | bytes) -> DuplicateDecision:
+    def reserve(self, packet: TaskPacket | Mapping[str, Any] | bytes) -> DuplicateDecision:
         return self.register(packet, reject_duplicate=True)
 
-    def reject_duplicate(self, packet: TaskPacket | str | bytes) -> DuplicateDecision:
+    def reject_duplicate(self, packet: TaskPacket | Mapping[str, Any] | bytes) -> DuplicateDecision:
         return self.reserve(packet)
 
     def clear(self) -> None:
-        self._hashes.clear()
+        with self._lock:
+            self._hashes.clear()
 
 
 PacketDeduplicator = DuplicatePacketRegistry
+DuplicateTaskRegistry = DuplicatePacketRegistry
 
 
 @dataclass(frozen=True)
@@ -747,6 +997,7 @@ class WaveBudget:
         hard_cost: float | None = None,
         duplicate_registry: DuplicatePacketRegistry | None = None,
     ) -> None:
+        self._lock = threading.RLock()
         selected = get_profile(profile)
         self.soft_tokens = (
             selected.wave_soft_tokens if soft_tokens is None else soft_tokens
@@ -786,9 +1037,14 @@ class WaveBudget:
         if value is None:
             return
         if allow_float:
-            if type(value) not in {int, float} or not math.isfinite(float(value)) or value < 0:
+            if (
+                type(value) not in {int, float}
+                or not math.isfinite(float(value))
+                or value < 0
+                or value > MAX_BUDGET_COST
+            ):
                 raise TaskPacketError(f"{name} must be a finite non-negative number")
-        elif type(value) is not int or value < 0:
+        elif type(value) is not int or value < 0 or value > MAX_BUDGET_TOKENS:
             raise TaskPacketError(f"{name} must be a non-negative integer")
 
     def _amounts(
@@ -805,7 +1061,10 @@ class WaveBudget:
             digest = None
         self._validate_limit(tokens, "estimated_tokens")
         self._validate_limit(cost, "cost", allow_float=True)
-        return tokens, float(cost), digest
+        amount = float(cost)
+        if not math.isfinite(amount):
+            raise TaskPacketError("cost must remain finite")
+        return tokens, amount, digest
 
     def consume(
         self,
@@ -816,68 +1075,114 @@ class WaveBudget:
         packet_hash_value: str | None = None,
         packet_hash: str | None = None,
     ) -> BudgetDecision:
-        tokens, amount, digest = self._amounts(packet_or_tokens, estimated_tokens, cost)
-        digest = packet_hash or packet_hash_value or digest
-        duplicate = False
-        if digest is not None:
-            duplicate = self.duplicate_registry.is_duplicate(digest)
-        projected_tokens = self.used_tokens + tokens
-        projected_cost = self.used_cost + amount
-        hard_exceeded = (
-            self.hard_tokens is not None and projected_tokens > self.hard_tokens
-        ) or (self.hard_cost is not None and projected_cost > self.hard_cost)
-        soft_exceeded = (
-            self.soft_tokens is not None and projected_tokens > self.soft_tokens
-        ) or (self.soft_cost is not None and projected_cost > self.soft_cost)
-        if duplicate:
-            decision = BudgetDecision(
-                False,
-                True,
-                soft_exceeded,
-                False,
-                True,
-                digest,
-                0,
-                0.0,
-                self.used_tokens,
-                self.used_cost,
-                "duplicate packet hash",
+        tokens, amount, digest = self._amounts(
+            packet_or_tokens, estimated_tokens, cost
+        )
+        supplied = packet_hash if packet_hash is not None else packet_hash_value
+        if supplied is not None:
+            if (
+                type(supplied) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", supplied) is None
+            ):
+                raise TaskPacketError("packet hash is malformed")
+            if digest is not None and supplied != digest:
+                raise TaskPacketError("supplied packet hash does not match packet")
+            if digest is None:
+                raise TaskPacketError("packet hash requires a TaskPacket")
+            digest = supplied
+        with self._lock:
+            duplicate = (
+                digest is not None
+                and self.duplicate_registry.is_duplicate(packet_or_tokens)
             )
-        elif hard_exceeded:
-            decision = BudgetDecision(
-                False,
-                True,
-                soft_exceeded,
-                True,
-                False,
-                digest,
-                0,
-                0.0,
-                self.used_tokens,
-                self.used_cost,
-                "hard budget exhausted",
-                HARD_BUDGET_REMEDIATION,
+            projected_tokens = self.used_tokens + tokens
+            projected_cost = self.used_cost + amount
+            if (
+                projected_tokens > MAX_BUDGET_TOKENS
+                or not math.isfinite(projected_cost)
+            ):
+                raise TaskPacketError("cumulative budget would overflow")
+            hard_exceeded = (
+                self.hard_tokens is not None
+                and projected_tokens > self.hard_tokens
+            ) or (
+                self.hard_cost is not None
+                and projected_cost > self.hard_cost
             )
-        else:
-            if digest is not None:
-                self.duplicate_registry.register(digest)
-            self.used_tokens = projected_tokens
-            self.used_cost = projected_cost
-            decision = BudgetDecision(
-                True,
-                soft_exceeded,
-                soft_exceeded,
-                False,
-                False,
-                digest,
-                tokens,
-                amount,
-                self.used_tokens,
-                self.used_cost,
-                "soft budget exceeded" if soft_exceeded else None,
+            soft_exceeded = (
+                self.soft_tokens is not None
+                and projected_tokens > self.soft_tokens
+            ) or (
+                self.soft_cost is not None
+                and projected_cost > self.soft_cost
             )
-        self.last_decision = decision
-        return decision
+            if duplicate:
+                decision = BudgetDecision(
+                    False,
+                    True,
+                    soft_exceeded,
+                    False,
+                    True,
+                    digest,
+                    0,
+                    0.0,
+                    self.used_tokens,
+                    self.used_cost,
+                    "duplicate packet hash",
+                )
+            elif hard_exceeded:
+                decision = BudgetDecision(
+                    False,
+                    True,
+                    soft_exceeded,
+                    True,
+                    False,
+                    digest,
+                    0,
+                    0.0,
+                    self.used_tokens,
+                    self.used_cost,
+                    "hard budget exhausted",
+                    HARD_BUDGET_REMEDIATION,
+                )
+            else:
+                if digest is not None:
+                    registration = self.duplicate_registry.register(packet_or_tokens)
+                    if registration.duplicate:
+                        # Another budget owner may have reserved this packet
+                        # between the initial check and this atomic register.
+                        decision = BudgetDecision(
+                            False,
+                            True,
+                            soft_exceeded,
+                            False,
+                            True,
+                            digest,
+                            0,
+                            0.0,
+                            self.used_tokens,
+                            self.used_cost,
+                            "duplicate packet hash",
+                        )
+                        self.last_decision = decision
+                        return decision
+                self.used_tokens = projected_tokens
+                self.used_cost = projected_cost
+                decision = BudgetDecision(
+                    True,
+                    soft_exceeded,
+                    soft_exceeded,
+                    False,
+                    False,
+                    digest,
+                    tokens,
+                    amount,
+                    self.used_tokens,
+                    self.used_cost,
+                    "soft budget exceeded" if soft_exceeded else None,
+                )
+            self.last_decision = decision
+            return decision
 
     def reserve(self, *args: Any, **kwargs: Any) -> BudgetDecision:
         decision = self.consume(*args, **kwargs)
@@ -985,6 +1290,7 @@ __all__ = [
     "DuplicateDecision",
     "DuplicatePacketError",
     "DuplicatePacketRegistry",
+    "DuplicateTaskRegistry",
     "PACKET_KEYS",
     "PACKET_VERSION",
     "PacketDeduplicator",
@@ -1001,6 +1307,9 @@ __all__ = [
     "VERSION",
     "WaveBudget",
     "WaveTokenBudget",
+    "MAX_PACKET_CANONICAL_BYTES",
+    "MAX_PACKET_ESTIMATED_TOKENS",
+    "MAX_PACKET_ITEMS",
     "build_packet",
     "build_task_packet",
     "canonical_bytes",

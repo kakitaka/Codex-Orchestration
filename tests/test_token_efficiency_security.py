@@ -10,6 +10,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 import bounded_run  # noqa: E402
 import task_packet  # noqa: E402
+import token_budget  # noqa: E402
 
 
 def _packet_values() -> dict[str, object]:
@@ -66,6 +67,14 @@ class TokenEfficiencySecurityTests(unittest.TestCase):
             self.assertEqual(result.exit_category, "ok")
             self.assertIn(literal, result.stdout_first)
             self.assertFalse(marker.exists())
+
+    def test_budget_remediation_never_replays_raw_evidence(self) -> None:
+        sentinel = "PRIVATE_SOURCE_SENTINEL"
+        result = token_budget.remediate_hard_budget(
+            [sentinel, sentinel, f"ERROR {sentinel}"], max_snippets=2
+        )
+        self.assertNotIn(sentinel, repr(result))
+        self.assertLessEqual(len(result["deduplicated_digests"]), 64)
 
 
 if __name__ == "__main__":

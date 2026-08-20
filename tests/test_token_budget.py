@@ -48,12 +48,24 @@ class TokenBudgetTests(unittest.TestCase):
             max_items_per_packet=1,
         )
         self.assertEqual(result["steps"], list(budgets.HARD_BUDGET_REMEDIATION))
-        self.assertEqual(len(result["deduplicated_evidence"]), 3)
+        self.assertNotIn("deduplicated_evidence", result)
+        self.assertEqual(result["deduplicated_count"], 3)
+        self.assertEqual(len(result["deduplicated_digests"]), 3)
+        self.assertFalse(result["deduplicated_digests_truncated"])
         self.assertLessEqual(sum(len(item) for item in result["bounded_relevant_snippets"]), 24)
         packets = result["independent_packets"]
         flattened = [item for packet in packets for item in packet]
         self.assertEqual(flattened, result["bounded_relevant_snippets"])
         self.assertEqual(len(flattened), len(set(flattened)))
+
+    def test_remediation_digest_output_is_bounded_and_contains_no_source(self) -> None:
+        marker = "PRIVATE_SOURCE_SENTINEL"
+        result = budgets.remediate_hard_budget(
+            [f"{marker}-{index}" for index in range(100)], max_snippets=1
+        )
+        self.assertEqual(len(result["deduplicated_digests"]), 64)
+        self.assertTrue(result["deduplicated_digests_truncated"])
+        self.assertNotIn(marker, repr(result))
 
     def test_split_never_breaks_item_or_character_bounds_to_meet_count(self) -> None:
         with self.assertRaisesRegex(budgets.TokenBudgetError, "evidence item"):

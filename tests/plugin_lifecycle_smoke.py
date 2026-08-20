@@ -25,8 +25,13 @@ import tempfile
 from threading import Thread
 from typing import Any, Iterator
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
+BOUNDED_RUN_ROOT = REPO_ROOT / "plugins" / "codex-orchestration" / "skills" / "codex-orchestration" / "scripts"
+if str(BOUNDED_RUN_ROOT) not in sys.path:
+    sys.path.insert(0, str(BOUNDED_RUN_ROOT))
+from bounded_run import run_bounded  # noqa: E402
+
+
 PLUGIN_ROOT = REPO_ROOT / "plugins" / "codex-orchestration"
 PLUGIN_ID = "codex-orchestration@codex-orchestration"
 MARKETPLACE_NAME = "codex-orchestration"
@@ -34,6 +39,7 @@ OLD_RELEASE = "a1d9c546665c3253cdcaa8fe5c0c060199a6126c"
 OLD_VERSION = "0.5.0"
 NEW_VERSION = "0.10.0"
 COMMAND_TIMEOUT_SECONDS = 60
+COMMAND_OUTPUT_BYTES = 1 * 1024 * 1024
 
 
 class SmokeFailure(RuntimeError):
@@ -45,20 +51,29 @@ def run(
     *,
     cwd: Path,
     env: dict[str, str],
+    input_data: str | bytes | None = None,
 ) -> subprocess.CompletedProcess[str]:
     try:
-        completed = subprocess.run(
+        bounded = run_bounded(
             command,
             cwd=cwd,
             env=env,
-            capture_output=True,
-            text=True,
-            check=False,
             timeout=COMMAND_TIMEOUT_SECONDS,
+            max_bytes=COMMAND_OUTPUT_BYTES,
+            head_bytes=128 * 1024,
+            tail_bytes=128 * 1024,
+            input_data=input_data,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except (OSError, subprocess.SubprocessError, TypeError, ValueError) as exc:
         raise SmokeFailure(f"Could not run {command!r}: {exc}") from exc
-    if completed.returncode != 0:
+    stdout = bounded.stdout_first
+    if bounded.stdout_last and bounded.stdout_last != stdout:
+        stdout += "\n...[bounded output middle omitted]...\n" + bounded.stdout_last
+    stderr = bounded.stderr_first
+    if bounded.stderr_last and bounded.stderr_last != stderr:
+        stderr += "\n...[bounded output middle omitted]...\n" + bounded.stderr_last
+    completed = subprocess.CompletedProcess(command, bounded.exit_code or 0, stdout, stderr)
+    if bounded.exit_category != "ok" or completed.returncode != 0:
         output = completed.stderr.strip() or completed.stdout.strip() or "no output"
         raise SmokeFailure(
             f"Command failed ({completed.returncode}): {command!r}\n{output}"
@@ -98,19 +113,7 @@ def probe_mcp_subprocess(script: Path, *, cwd: Path, env: dict[str, str]) -> Non
             {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
         )
     ) + "\n"
-    try:
-        completed = subprocess.run(
-            [sys.executable, str(script)],
-            cwd=cwd,
-            env=env,
-            input=requests,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=COMMAND_TIMEOUT_SECONDS,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise SmokeFailure(f"Installed Fable MCP subprocess failed: {exc}") from exc
+    completed = run([sys.executable, str(script)], cwd=cwd, env=env, input_data=requests)
     if completed.returncode != 0:
         raise SmokeFailure(
             "Installed Fable MCP subprocess did not shut down cleanly: "

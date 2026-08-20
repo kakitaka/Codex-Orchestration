@@ -11,16 +11,50 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
+import tempfile
 import threading
 from typing import Any, Mapping, Sequence, TextIO
+
+from bounded_run import run_bounded
 
 
 MAX_INPUT_BYTES = 64 * 1024
 MAX_INPUT_SECONDS = 2.0
 MAX_REASON_CHARS = 500
 MAX_CONTEXT_CHARS = 400
+MIN_CODEX_HOOK_VERSION = (0, 147, 0)
+PROBE_TIMEOUT_SECONDS = 2.0
+_PRE_REQUIRED = frozenset(
+    {
+        "cwd",
+        "hook_event_name",
+        "model",
+        "permission_mode",
+        "session_id",
+        "tool_input",
+        "tool_name",
+        "tool_use_id",
+        "transcript_path",
+        "turn_id",
+    }
+)
+_PROMPT_REQUIRED = frozenset(
+    {
+        "cwd",
+        "hook_event_name",
+        "model",
+        "permission_mode",
+        "prompt",
+        "session_id",
+        "transcript_path",
+        "turn_id",
+    }
+)
+_OPTIONAL_HOOK_FIELDS = frozenset({"agent_id", "agent_type"})
+_HOOK_EVENTS = frozenset({"PreToolUse", "UserPromptSubmit"})
 
 _RECURSIVE_RE = re.compile(
     r"(?ix)(?:\bfind\s+\.(?:\s|$)|\b(?:find|tree)\b[^\n]*\s(?:-|/)(?:r|R)\b|"
@@ -77,6 +111,146 @@ def _emit(value: Mapping[str, Any], output: TextIO) -> None:
 def _diagnostic(message: str, diagnostics: TextIO) -> None:
     safe = " ".join(str(message).split())[:300]
     diagnostics.write(f"token_hook: {safe}\n")
+
+
+def _validate_nested_tool_input(value: Any, *, depth: int = 0, items: list[int] | None = None) -> None:
+    if items is None:
+        items = [0]
+    if depth > 12:
+        raise ValueError("tool input nesting exceeds bound")
+    if isinstance(value, Mapping):
+        items[0] += len(value)
+        if items[0] > 512:
+            raise ValueError("tool input item bound exceeded")
+        for key, child in value.items():
+            if not isinstance(key, str) or len(key) > 512:
+                raise ValueError("tool input key is malformed")
+            _validate_nested_tool_input(child, depth=depth + 1, items=items)
+    elif isinstance(value, (list, tuple)):
+        items[0] += len(value)
+        if items[0] > 512:
+            raise ValueError("tool input item bound exceeded")
+        for child in value:
+            _validate_nested_tool_input(child, depth=depth + 1, items=items)
+    elif isinstance(value, (str, int, float, bool)) or value is None:
+        if isinstance(value, str) and len(value) > 16 * 1024:
+            raise ValueError("tool input string bound exceeded")
+        if isinstance(value, int) and not isinstance(value, bool):
+            raise ValueError("tool input integer is unsupported")
+        if isinstance(value, float) and not value.is_integer():
+            raise ValueError("tool input number is malformed")
+    else:
+        raise ValueError("tool input value is malformed")
+
+
+def _official_event(payload: Mapping[str, Any]) -> str | None:
+    if "hook_event_name" not in payload:
+        return None
+    event = payload.get("hook_event_name")
+    if not isinstance(event, str) or event not in _HOOK_EVENTS:
+        return None
+    required = _PRE_REQUIRED if event == "PreToolUse" else _PROMPT_REQUIRED
+    if not required <= set(payload) <= required | _OPTIONAL_HOOK_FIELDS:
+        return None
+    if event == "PreToolUse":
+        if not isinstance(payload.get("tool_input"), Mapping):
+            return None
+        try:
+            _validate_nested_tool_input(payload["tool_input"])
+        except (TypeError, ValueError, RecursionError):
+            return None
+    fields = required - {"tool_input"}
+    for field in fields:
+        value = payload.get(field)
+        if not isinstance(value, str) or not value or len(value) > 32 * 1024:
+            return None
+        if any(0xD800 <= ord(char) <= 0xDFFF for char in value):
+            return None
+    if event == "UserPromptSubmit":
+        prompt = payload.get("prompt")
+        if not isinstance(prompt, str) or len(prompt) > 32 * 1024:
+            return None
+    for field in _OPTIONAL_HOOK_FIELDS & set(payload):
+        value = payload[field]
+        if not isinstance(value, str) or len(value) > 1024:
+            return None
+    return event
+
+
+def _parse_version(text: str) -> tuple[int, int, int] | None:
+    match = re.fullmatch(r"\s*(?:codex-cli\s+)?(\d+)\.(\d+)(?:\.(\d+))?\s*", text)
+    if not match:
+        return None
+    return (
+        int(match.group(1)),
+        int(match.group(2)),
+        int(match.group(3) or 0),
+    )
+
+
+def probe_host_capability(executable: str | None = None) -> bool:
+    """Bounded, read-only probe for the current Codex hooks capability."""
+
+    binary = executable or os.environ.get("CODEX_BIN") or "codex"
+    if not isinstance(binary, str) or not binary or len(binary) > 512:
+        return False
+    try:
+        with tempfile.TemporaryDirectory(prefix="codex-hook-probe-") as probe_home:
+            env = os.environ.copy()
+            env["CODEX_HOME"] = probe_home
+            version_result = run_bounded(
+                [binary, "--version"],
+                env=env,
+                timeout=PROBE_TIMEOUT_SECONDS,
+                max_bytes=8 * 1024,
+                head_bytes=4 * 1024,
+                tail_bytes=4 * 1024,
+            )
+            if version_result.exit_category != "ok":
+                return False
+            version = _parse_version(version_result.stdout_first or "")
+            if version is None or version < MIN_CODEX_HOOK_VERSION:
+                return False
+            feature_result = run_bounded(
+                [binary, "features", "list"],
+                env=env,
+                timeout=PROBE_TIMEOUT_SECONDS,
+                max_bytes=8 * 1024,
+                head_bytes=4 * 1024,
+                tail_bytes=4 * 1024,
+            )
+    except (OSError, ValueError):
+        return False
+    if feature_result.exit_category != "ok":
+        return False
+    feature_output = (
+        feature_result.stdout_first + "\n" + feature_result.stdout_last
+    )
+    lines = [
+        " ".join(line.strip().split()).lower()
+        for line in feature_output.splitlines()
+    ]
+    if any(
+        re.fullmatch(
+            r"(?:hooks|codex_hooks|hook_events)(?:\s*=\s*|\s+)"
+            r"(?:(?:stable|under[- ]development|experimental)\s+)?(?:true|enabled)",
+            line,
+        )
+        for line in lines
+    ):
+        return True
+    for line in feature_output.splitlines():
+        try:
+            value = json.loads(line)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(value, Mapping):
+            if value.get("hooks") is True or value.get("hooks_enabled") is True:
+                return True
+            features = value.get("features")
+            if isinstance(features, Mapping) and features.get("hooks") is True:
+                return True
+    return False
 
 
 def _event(payload: Mapping[str, Any]) -> str:
@@ -139,13 +313,32 @@ def process_payload(
     payload: Mapping[str, Any],
     *,
     enabled: bool = True,
+    host_capable: bool | None = None,
     diagnostics: TextIO | None = None,
 ) -> dict[str, Any]:
     """Return one supported hook response, or an empty fail-open response."""
     diagnostics = diagnostics or sys.stderr
-    if not enabled:
+    if not isinstance(payload, Mapping):
         return {}
-    event = _event(payload)
+    if host_capable is None:
+        host_capable = "hook_event_name" not in payload
+    if (
+        type(enabled) is not bool
+        or not enabled
+        or type(host_capable) is not bool
+        or not host_capable
+    ):
+        return {}
+    official_event = _official_event(payload)
+    if "hook_event_name" in payload:
+        if official_event is None:
+            _diagnostic("malformed official hook input; manual fallback", diagnostics)
+            return {}
+        event = official_event
+    else:
+        # Compatibility for callers that use the pre-0.147 helper API. The
+        # live CLI always validates official schemas before dispatch.
+        event = _event(payload)
     if event == "PreToolUse":
         command = _command(payload)
         if command is None:
@@ -185,7 +378,7 @@ def _parse_input(data: bytes) -> Mapping[str, Any] | None:
         return None
     try:
         parsed = json.loads(data.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, MemoryError):
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, MemoryError, ValueError):
         return None
     return parsed if isinstance(parsed, Mapping) else None
 
@@ -196,6 +389,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--enable", "--opt-in", "--enabled",
         action="store_true",
         help="enable the opt-in guard (without this switch it emits an empty response)",
+    )
+    parser.add_argument(
+        "--codex-bin",
+        default=None,
+        help="Codex executable used for the bounded live capability probe",
     )
     return parser
 
@@ -225,7 +423,26 @@ def main(
             _diagnostic("malformed or unsupported JSON input; manual fallback", stderr)
         _emit({}, stdout)
         return 0
-    _emit(process_payload(payload, enabled=args.enable, diagnostics=stderr), stdout)
+    host_capable = False
+    if args.enable:
+        # Legacy helper payloads are retained for local/manual callers. Only
+        # the official 0.147 envelope may claim a live host capability.
+        host_capable = (
+            True
+            if "hook_event_name" not in payload
+            else probe_host_capability(args.codex_bin)
+        )
+        if "hook_event_name" in payload and not host_capable:
+            _diagnostic("Codex hook capability unavailable; manual fallback", stderr)
+    _emit(
+        process_payload(
+            payload,
+            enabled=args.enable,
+            host_capable=host_capable,
+            diagnostics=stderr,
+        ),
+        stdout,
+    )
     return 0
 
 

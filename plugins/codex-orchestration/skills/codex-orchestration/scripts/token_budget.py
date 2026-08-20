@@ -9,7 +9,9 @@ the work before trying again.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
+import re
 from typing import Any, Iterable, Mapping
 import unicodedata
 
@@ -32,6 +34,19 @@ HARD_BUDGET_REMEDIATION_SEQUENCE = HARD_BUDGET_REMEDIATION
 HARD_BUDGET_REMEDIATION_STEPS = HARD_BUDGET_REMEDIATION
 REMEDIATION_SEQUENCE = HARD_BUDGET_REMEDIATION
 REMEDIATION_STEPS = HARD_BUDGET_REMEDIATION
+MAX_EVIDENCE_ITEMS = 4096
+MAX_EVIDENCE_ITEM_CHARS = 64 * 1024
+MAX_EVIDENCE_TOTAL_CHARS = 256 * 1024
+MAX_REMEDIATION_DIGESTS = 64
+MAX_BUDGET_TOKENS = 10**12
+_SECRET_PATTERNS = (
+    re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_-]{12,}\b"),
+    re.compile(r"\b(?:gh[pousr]|sk-)[A-Za-z0-9_-]{12,}\b"),
+    re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{12,}\b", re.I),
+    re.compile(r"\b(?:api[_-]?key|secret|password|token)\s*[:=]\s*[^\s,;]+", re.I),
+)
 
 
 class TokenBudgetError(ValueError):
@@ -41,7 +56,7 @@ class TokenBudgetError(ValueError):
 def _non_negative_int(value: Any, name: str, *, allow_none: bool = False) -> int | None:
     if value is None and allow_none:
         return None
-    if type(value) is not int or value < 0:
+    if type(value) is not int or value < 0 or value > MAX_BUDGET_TOKENS:
         raise TokenBudgetError(f"{name} must be a non-negative integer")
     return value
 
@@ -51,32 +66,83 @@ def _canonical_text(value: Any) -> str:
         raise TokenBudgetError("evidence items must be strings")
     # Whitespace-only differences are repeated evidence for budgeting purposes;
     # normalize them before hashing/deduplication, without retaining raw logs.
-    return unicodedata.normalize("NFC", value.replace("\r\n", "\n").replace("\r", "\n")).strip()
+    if len(value) > MAX_EVIDENCE_ITEM_CHARS:
+        raise TokenBudgetError("evidence item exceeds bound")
+    if any(0xD800 <= ord(char) <= 0xDFFF for char in value):
+        raise TokenBudgetError("evidence contains a lone surrogate")
+    try:
+        if len(value.encode("utf-8", "strict")) > MAX_EVIDENCE_ITEM_CHARS * 4:
+            raise TokenBudgetError("evidence item exceeds bound")
+    except UnicodeEncodeError as exc:
+        raise TokenBudgetError("evidence is not valid UTF-8") from exc
+    normalized = unicodedata.normalize(
+        "NFC", value.replace("\r\n", "\n").replace("\r", "\n")
+    ).strip()
+    if len(normalized) > MAX_EVIDENCE_ITEM_CHARS:
+        raise TokenBudgetError("evidence item exceeds bound")
+    try:
+        normalized.encode("utf-8", "strict")
+    except UnicodeEncodeError as exc:
+        raise TokenBudgetError("evidence is not valid UTF-8") from exc
+    return normalized
 
 
 def _evidence_items(evidence: Any) -> list[str]:
     if isinstance(evidence, str):
-        values = evidence.splitlines() or [evidence]
+        # Keep the string as one bounded item; splitlines would materialize an
+        # unbounded source before the cap can be applied.
+        values: Iterable[Any] = [evidence]
     elif isinstance(evidence, Mapping):
-        values = []
-        for key in sorted(evidence, key=lambda item: str(item)):
+        values_list: list[Any] = []
+        for index, key in enumerate(evidence):
+            if index >= MAX_EVIDENCE_ITEMS:
+                raise TokenBudgetError("evidence exceeds item bound")
             value = evidence[key]
             if isinstance(value, str):
-                values.extend(value.splitlines() or [value])
+                values_list.append(value)
             elif isinstance(value, Iterable):
-                values.extend(value)
+                for nested_index, item in enumerate(value):
+                    if len(values_list) >= MAX_EVIDENCE_ITEMS:
+                        raise TokenBudgetError("evidence exceeds item bound")
+                    values_list.append(item)
             else:
-                values.append(str(value))
+                raise TokenBudgetError("evidence items must be strings")
+            if len(values_list) > MAX_EVIDENCE_ITEMS:
+                raise TokenBudgetError("evidence exceeds item bound")
+        values = values_list
     else:
         if evidence is None:
             values = []
         else:
-            try:
-                values = list(evidence)
-            except TypeError as exc:
-                raise TokenBudgetError("evidence must be text or an iterable") from exc
-    normalized = [_canonical_text(item) for item in values]
+            if isinstance(evidence, (bytes, bytearray)) or not isinstance(evidence, Iterable):
+                raise TokenBudgetError("evidence must be text or an iterable")
+            values_list = []
+            for index, item in enumerate(evidence):
+                if index >= MAX_EVIDENCE_ITEMS:
+                    raise TokenBudgetError("evidence exceeds item bound")
+                values_list.append(item)
+            values = values_list
+    normalized: list[str] = []
+    total_chars = 0
+    for item in values:
+        text = _canonical_text(item)
+        total_chars += len(text)
+        if total_chars > MAX_EVIDENCE_TOTAL_CHARS:
+            raise TokenBudgetError("evidence exceeds total bound")
+        normalized.append(text)
     return [item for item in normalized if item]
+
+
+def _redact(text: str) -> str:
+    redacted = text
+    for pattern in _SECRET_PATTERNS:
+        redacted = pattern.sub(
+            lambda match: "[REDACTED:"
+            + hashlib.sha256(match.group(0).encode("utf-8")).hexdigest()[:12]
+            + "]",
+            redacted,
+        )
+    return redacted
 
 
 def deduplicate_repeated_evidence(evidence: Any) -> tuple[str, ...]:
@@ -119,15 +185,14 @@ def bounded_relevant_snippets(
     _non_negative_int(max_snippets, "max_snippets")
     if max_chars == 0 or max_snippets == 0:
         return ()
-    terms = tuple(
-        sorted(
-            {
-                _canonical_text(term).lower()
-                for term in relevant_terms
-                if _canonical_text(term)
-            }
-        )
-    )
+    terms_values: list[str] = []
+    for index, term in enumerate(relevant_terms):
+        if index >= MAX_EVIDENCE_ITEMS:
+            raise TokenBudgetError("relevance terms exceed bound")
+        normalized_term = _canonical_text(term)
+        if normalized_term:
+            terms_values.append(normalized_term.lower())
+    terms = tuple(sorted(set(terms_values)))
     unique = deduplicate_repeated_evidence(evidence)
     ranked = sorted(
         unique,
@@ -147,7 +212,7 @@ def bounded_relevant_snippets(
         room = remaining if not selected else remaining - 1
         if room <= 0:
             break
-        snippet = item[:room]
+        snippet = _redact(item)[:room]
         if not snippet:
             continue
         selected.append(snippet)
@@ -297,7 +362,7 @@ def evaluate_hard_budget(
     estimated_tokens = _non_negative_int(estimated_tokens, "estimated_tokens")
     hard_tokens = _non_negative_int(hard_tokens, "hard_tokens", allow_none=True)
     used_tokens = _non_negative_int(used_tokens, "used_tokens")
-    if type(kind) is not str or not kind.strip():
+    if type(kind) is not str or not kind.strip() or len(kind) > 256:
         raise TokenBudgetError("kind must be a non-empty string")
     projected = used_tokens + estimated_tokens
     exceeded = hard_tokens is not None and projected > hard_tokens
@@ -376,20 +441,43 @@ def remediate_hard_budget(
     """Apply the three remediation stages and return a stable summary."""
 
     deduplicated = deduplicate_repeated_evidence(evidence)
+    digests = tuple(
+        hashlib.sha256(item.encode("utf-8", "strict")).hexdigest()
+        for item in deduplicated[:MAX_REMEDIATION_DIGESTS]
+    )
     snippets = bounded_relevant_snippets(
         deduplicated,
         max_chars=max_chars,
         max_snippets=max_snippets,
     )
+    safe_values = [
+        "[S:"
+        + hashlib.sha256(_redact(item).encode("utf-8", "strict")).hexdigest()[:12]
+        + "]"
+        for item in snippets
+    ]
+    safe_snippets_list: list[str] = []
+    used_safe = 0
+    for value in safe_values:
+        room = max_chars - used_safe - (1 if safe_snippets_list else 0)
+        if room <= 0:
+            break
+        safe_snippets_list.append(value[:room])
+        used_safe += len(safe_snippets_list[-1]) + (
+            1 if len(safe_snippets_list) > 1 else 0
+        )
+    safe_snippets = tuple(sorted(safe_snippets_list))
     packets = split_independent_packets(
-        snippets,
+        safe_snippets,
         max_items=max_items_per_packet,
         packet_count=packet_count,
     )
     return {
         "steps": list(HARD_BUDGET_REMEDIATION),
-        "deduplicated_evidence": list(deduplicated),
-        "bounded_relevant_snippets": list(snippets),
+        "deduplicated_count": len(deduplicated),
+        "deduplicated_digests": list(digests),
+        "deduplicated_digests_truncated": len(deduplicated) > len(digests),
+        "bounded_relevant_snippets": list(safe_snippets),
         "independent_packets": [list(packet) for packet in packets],
     }
 

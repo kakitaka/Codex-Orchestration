@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -68,6 +69,20 @@ class TempRepository:
 
 
 class ReleaseCheckTests(unittest.TestCase):
+    def test_disk_reader_rejects_hardlinked_release_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            scope = Path(temporary)
+            root = scope / "repo"
+            root.mkdir()
+            outside = scope / "outside.json"
+            outside.write_text('{"version":"1.0.0"}\n', encoding="utf-8")
+            target = root / "metadata.json"
+            os.link(outside, target)
+            with self.assertRaisesRegex(
+                RELEASE.ReleaseCheckError, "not a regular file"
+            ):
+                RELEASE._disk_reader(root)("metadata.json")
+
     def test_git_text_is_decoded_as_utf8_not_host_locale(self) -> None:
         completed = subprocess.CompletedProcess(
             args=["git", "show"],

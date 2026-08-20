@@ -60,6 +60,24 @@ Ran 2 tests
     def test_missing_test_count_is_detectable(self) -> None:
         self.assertIsNone(GATE.parse_test_count("FAILED without summary"))
 
+    def test_test_id_discovery_keeps_subtest_and_interleaved_start_lines(self) -> None:
+        output = "\n".join(
+            (
+                "test_plain (test_mod.Tests.test_plain) ... ok",
+                "test_subtests (test_mod.Tests.test_subtests) ... ",
+                "  test_subtests (test_mod.Tests.test_subtests) (case=1) ... FAIL",
+                "test_prints (test_mod.Tests.test_prints) ... diagnostic text",
+            )
+        )
+        self.assertEqual(
+            GATE.discover_test_ids(output),
+            (
+                "test_plain (test_mod.Tests.test_plain)",
+                "test_prints (test_mod.Tests.test_prints)",
+                "test_subtests (test_mod.Tests.test_subtests)",
+            ),
+        )
+
     def test_run_gate_rejects_test_loss_and_unparseable_nonzero(self) -> None:
         scenarios = (
             (
