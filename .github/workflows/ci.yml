@@ -105,3 +105,98 @@ jobs:
           python-version: "3.11"
       - name: Run strict portability gate
         run: python scripts/preflight.py portability --ci
+
+  coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.11"
+      - name: Install pinned metrics tools
+        run: python -m pip install --disable-pip-version-check -r requirements-metrics.txt
+      - name: Measure branch coverage
+        run: |
+          mkdir -p ci-metrics
+          python -m coverage erase
+          set +e
+          python -m coverage run -m unittest discover -s tests -q
+          test_status=$?
+          set -e
+          python -m coverage json -o ci-metrics/coverage.json
+          python -m coverage report
+          exit "$test_status"
+      - name: Upload coverage metric
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage-${{ github.sha }}
+          path: ci-metrics/coverage.json
+          if-no-files-found: error
+          retention-days: 14
+
+  mutation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.11"
+      - name: Install pinned metrics tools
+        run: python -m pip install --disable-pip-version-check -r requirements-metrics.txt
+      - name: Run bounded mutation analysis
+        run: |
+          mkdir -p ci-metrics
+          cosmic-ray baseline cosmic-ray.toml
+          cosmic-ray init cosmic-ray.toml ci-metrics/mutation.sqlite
+          cosmic-ray exec cosmic-ray.toml ci-metrics/mutation.sqlite
+          cr-rate --no-estimate ci-metrics/mutation.sqlite | tee ci-metrics/mutation-survival-rate.txt
+      - name: Upload mutation metrics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: mutation-${{ github.sha }}
+          path: ci-metrics/mutation-survival-rate.txt
+          if-no-files-found: error
+          retention-days: 14
+
+  required-gate:
+    name: required-gate
+    if: ${{ always() }}
+    needs:
+      - quality
+      - test
+      - plugin-lifecycle
+      - legacy-client-guard
+      - portability
+      - coverage
+      - mutation
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+
+    steps:
+      - name: Fail closed unless every CI component succeeded
+        env:
+          QUALITY_RESULT: ${{ needs.quality.result }}
+          TEST_RESULT: ${{ needs.test.result }}
+          LIFECYCLE_RESULT: ${{ needs.plugin-lifecycle.result }}
+          LEGACY_RESULT: ${{ needs.legacy-client-guard.result }}
+          PORTABILITY_RESULT: ${{ needs.portability.result }}
+          COVERAGE_RESULT: ${{ needs.coverage.result }}
+          MUTATION_RESULT: ${{ needs.mutation.result }}
+        run: |
+          for result in \
+            "$QUALITY_RESULT" \
+            "$TEST_RESULT" \
+            "$LIFECYCLE_RESULT" \
+            "$LEGACY_RESULT" \
+            "$PORTABILITY_RESULT" \
+            "$COVERAGE_RESULT" \
+            "$MUTATION_RESULT"
+          do
+            test "$result" = "success"
+          done

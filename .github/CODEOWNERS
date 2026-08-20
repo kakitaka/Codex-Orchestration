@@ -1,5 +1,11 @@
 * @Cjbuilds
 
 /.github/ @Cjbuilds
+/scripts/ @Cjbuilds
+/tests/ @Cjbuilds
 /plugins/codex-orchestration/skills/codex-orchestration/scripts/ @Cjbuilds
+/.coveragerc @Cjbuilds
+/cosmic-ray.toml @Cjbuilds
+/requirements-dev.txt @Cjbuilds
+/requirements-metrics.txt @Cjbuilds
 /SECURITY.md @Cjbuilds

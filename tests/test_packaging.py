@@ -212,9 +212,9 @@ class PackagingTests(unittest.TestCase):
             "github/codeql-action/analyze@02c5e83432fe5497fd85b873b6c9f16a8578e1d9"
         )
 
-        self.assertEqual(ci.count(checkout), 5)
+        self.assertEqual(ci.count(checkout), 7)
         self.assertEqual(codeql.count(checkout), 1)
-        self.assertEqual(ci.count(setup_python), 5)
+        self.assertEqual(ci.count(setup_python), 7)
         self.assertEqual(codeql.count(setup_python), 0)
         self.assertEqual(ci.count(setup_node), 2)
         self.assertEqual(codeql.count(codeql_init), 1)
@@ -226,6 +226,74 @@ class PackagingTests(unittest.TestCase):
             codeql,
             r"(?ms)^permissions:\n  contents: read\n  security-events: write\n\njobs:",
         )
+        self.assert_metrics_and_single_required_gate_are_fail_closed()
+
+    def assert_metrics_and_single_required_gate_are_fail_closed(self) -> None:
+        workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(
+            encoding="utf-8"
+        )
+        coverage_config = (REPO_ROOT / ".coveragerc").read_text(encoding="utf-8")
+        mutation_config = (REPO_ROOT / "cosmic-ray.toml").read_text(
+            encoding="utf-8"
+        )
+        requirements = (REPO_ROOT / "requirements-metrics.txt").read_text(
+            encoding="utf-8"
+        )
+        owners = (REPO_ROOT / ".github/CODEOWNERS").read_text(encoding="utf-8")
+
+        trigger_block = workflow.split("permissions:", 1)[0]
+        self.assertNotRegex(trigger_block, r"(?m)^\s+paths(?:-ignore)?:")
+        self.assertNotIn("pull_request_target", trigger_block)
+        self.assertEqual(workflow.count("\n  required-gate:\n"), 1)
+        gate = workflow.split("\n  required-gate:\n", 1)[1]
+        self.assertIn("name: required-gate", gate)
+        self.assertIn("if: ${{ always() }}", gate)
+        self.assertNotIn("continue-on-error", workflow)
+        for dependency in (
+            "quality",
+            "test",
+            "plugin-lifecycle",
+            "legacy-client-guard",
+            "portability",
+            "coverage",
+            "mutation",
+        ):
+            self.assertIn(f"      - {dependency}\n", gate)
+            self.assertIn(f"needs.{dependency}.result", gate)
+        self.assertEqual(gate.count('test "$result" = "success"'), 1)
+
+        self.assertIn("branch = True", coverage_config)
+        self.assertIn("fail_under = 68.0", coverage_config)
+        self.assertIn("    scripts", coverage_config)
+        self.assertIn(
+            "plugins/codex-orchestration/skills/codex-orchestration/scripts",
+            coverage_config,
+        )
+        self.assertIn("python -m coverage json", workflow)
+        self.assertIn("python -m coverage report", workflow)
+
+        self.assertIn('module-path = "plugins/codex-orchestration/skills/', mutation_config)
+        self.assertIn("external_cli_trust.py", mutation_config)
+        self.assertIn('test-command = "python -m unittest tests.test_external_cli_trust"', mutation_config)
+        self.assertIn("timeout = 5.0", mutation_config)
+        self.assertNotIn("--fail-over", workflow)
+        self.assertEqual(requirements.count("coverage==7.15.3"), 1)
+        self.assertEqual(requirements.count("cosmic-ray==8.4.6"), 1)
+
+        artifact = (
+            "actions/upload-artifact@"
+            "ea165f8d65b6e75b540449e92b4886f43607fa02"
+        )
+        self.assertEqual(workflow.count(artifact), 2)
+        for protected in (
+            "/.github/ @Cjbuilds",
+            "/scripts/ @Cjbuilds",
+            "/tests/ @Cjbuilds",
+            "/.coveragerc @Cjbuilds",
+            "/cosmic-ray.toml @Cjbuilds",
+            "/requirements-metrics.txt @Cjbuilds",
+        ):
+            self.assertIn(protected, owners)
 
     def test_quality_uses_immutable_comparison_shas_and_no_replaced_inline_checks(self) -> None:
         workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(
