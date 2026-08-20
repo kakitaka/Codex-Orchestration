@@ -51,10 +51,14 @@ RUNTIME_PROBE_PATH = (
 RUNTIME_PROBE_TUPLE = ("openrouter", "moonshotai/kimi-k3", "max")
 SECURITY_PATHS = {
     "AGENTS.md",
+    ".coveragerc",
     ".github/CODEOWNERS",
     ".github/dependabot.yml",
     ".github/pull_request_template.md",
+    "cosmic-ray.toml",
     "requirements-dev.txt",
+    "requirements-metrics.txt",
+    "SECURITY.md",
     "plugins/codex-orchestration/.codex-plugin/plugin.json",
     "plugins/codex-orchestration/.mcp.json",
     "scripts/install_hooks.py",
@@ -64,8 +68,10 @@ SECURITY_PATHS = {
     "scripts/review_attestation.py",
 }
 SECURITY_PREFIXES = (
-    ".github/workflows/",
+    ".github/",
     ".githooks/",
+    "scripts/",
+    "tests/",
     "plugins/codex-orchestration/skills/",
     "plugins/codex-orchestration/skills/codex-orchestration/scripts/",
 )

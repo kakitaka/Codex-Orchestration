@@ -31,9 +31,10 @@ Protect `main` with one ruleset:
 
 1. Require pull requests, one code-owner approval, dismissal of stale approvals,
    approval after the latest push, resolved conversations, and an up-to-date base.
-2. Require the default-branch `.github/workflows/ci.yml` workflow when supported;
-   otherwise require the `required-gate` check from GitHub Actions. Also require
-   the existing `analyze (python)` CodeQL check.
+2. Require the default-branch `.github/workflows/ci.yml` workflow. If the host
+   cannot require a base-owned workflow, use a dedicated status provider bound
+   to base-owned policy; do not fall back to a candidate-defined check name.
+   Also require the existing `analyze (python)` CodeQL check.
 3. Block force pushes and branch deletion. Give routine contributors no bypass.
 
 `CODEOWNERS` covers workflows, tests, production scripts, and metric settings, so

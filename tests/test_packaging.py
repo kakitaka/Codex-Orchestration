@@ -240,6 +240,9 @@ class PackagingTests(unittest.TestCase):
             encoding="utf-8"
         )
         owners = (REPO_ROOT / ".github/CODEOWNERS").read_text(encoding="utf-8")
+        gate_docs = (REPO_ROOT / "docs/ci-quality-gate.md").read_text(
+            encoding="utf-8"
+        )
 
         trigger_block = workflow.split("permissions:", 1)[0]
         self.assertNotRegex(trigger_block, r"(?m)^\s+paths(?:-ignore)?:")
@@ -279,6 +282,9 @@ class PackagingTests(unittest.TestCase):
         self.assertNotIn("--fail-over", workflow)
         self.assertEqual(requirements.count("coverage==7.15.3"), 1)
         self.assertEqual(requirements.count("cosmic-ray==8.4.6"), 1)
+        self.assertIn(
+            "do not fall back to a candidate-defined check name", gate_docs
+        )
 
         artifact = (
             "actions/upload-artifact@"

@@ -433,7 +433,13 @@ class ReviewAttestationTests(unittest.TestCase):
     def test_docs_allowlist_cannot_hide_agent_dependency_or_plugin_changes(self) -> None:
         for path, expected in (
             ("AGENTS.md", "security-state"),
+            (".coveragerc", "security-state"),
+            (".github/FUNDING.yml", "security-state"),
+            ("cosmic-ray.toml", "security-state"),
             ("requirements-dev.txt", "security-state"),
+            ("requirements-metrics.txt", "security-state"),
+            ("scripts/token_lint.py", "security-state"),
+            ("tests/test_packaging.py", "security-state"),
             (
                 "plugins/codex-orchestration/skills/codex-orchestration/SKILL.md",
                 "security-state",
