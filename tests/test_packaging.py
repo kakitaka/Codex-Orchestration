@@ -243,6 +243,7 @@ class PackagingTests(unittest.TestCase):
         gate_docs = (REPO_ROOT / "docs/ci-quality-gate.md").read_text(
             encoding="utf-8"
         )
+        attributes = (REPO_ROOT / ".gitattributes").read_text(encoding="utf-8")
 
         trigger_block = workflow.split("permissions:", 1)[0]
         self.assertNotRegex(trigger_block, r"(?m)^\s+paths(?:-ignore)?:")
@@ -285,6 +286,9 @@ class PackagingTests(unittest.TestCase):
         self.assertIn(
             "do not fall back to a candidate-defined check name", gate_docs
         )
+        self.assertIn(
+            "tests/baselines/windows-ee43f3a.json text eol=lf", attributes
+        )
 
         artifact = (
             "actions/upload-artifact@"
@@ -293,6 +297,7 @@ class PackagingTests(unittest.TestCase):
         self.assertEqual(workflow.count(artifact), 2)
         for protected in (
             "/.github/ @Cjbuilds",
+            "/.gitattributes @Cjbuilds",
             "/scripts/ @Cjbuilds",
             "/tests/ @Cjbuilds",
             "/.coveragerc @Cjbuilds",

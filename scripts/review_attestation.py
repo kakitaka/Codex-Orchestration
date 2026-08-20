@@ -52,6 +52,7 @@ RUNTIME_PROBE_TUPLE = ("openrouter", "moonshotai/kimi-k3", "max")
 SECURITY_PATHS = {
     "AGENTS.md",
     ".coveragerc",
+    ".gitattributes",
     ".github/CODEOWNERS",
     ".github/dependabot.yml",
     ".github/pull_request_template.md",

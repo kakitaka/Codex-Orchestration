@@ -1,6 +1,7 @@
 * @Cjbuilds
 
 /.github/ @Cjbuilds
+/.gitattributes @Cjbuilds
 /scripts/ @Cjbuilds
 /tests/ @Cjbuilds
 /plugins/codex-orchestration/skills/codex-orchestration/scripts/ @Cjbuilds

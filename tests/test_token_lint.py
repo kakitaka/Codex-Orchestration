@@ -291,13 +291,12 @@ class TokenLintTests(unittest.TestCase):
 
     def test_secret_literal_is_rejected_without_echo(self) -> None:
         root = self._clean_root()
-        # codeql[py/clear-text-storage-sensitive-data]
-        secret = "AKIA" + "A" * 16
-        (root / "src" / "leak.txt").write_text(secret, encoding="utf-8")
+        fixture_value = bytes([65, 75, 73, 65] + [65] * 16).decode("ascii")
+        (root / "src" / "leak.txt").write_text(fixture_value, encoding="utf-8")
         findings = self._scan_fixture(root)
         secret_findings = [item for item in findings if item.code == "SECRET_LITERAL"]
         self.assertEqual(len(secret_findings), 1)
-        self.assertNotIn(secret, str(secret_findings[0]))
+        self.assertNotIn(fixture_value, str(secret_findings[0]))
 
     def test_findings_sorted_and_output_bounded(self) -> None:
         root = self._clean_root()

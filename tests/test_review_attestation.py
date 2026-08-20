@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 from pathlib import Path
+import tempfile
 import unittest
 
 
@@ -208,14 +211,61 @@ class ReviewAttestationTests(unittest.TestCase):
                     )
 
     def test_non_pr_event_needs_no_attestation(self) -> None:
+        event_payload = {
+            "repository": {"full_name": "Cjbuilds/Codex-Orchestration"}
+        }
         self.assertIsNone(
             ATTESTATION.validate_pull_request_event(
-                {"repository": {"full_name": "Cjbuilds/Codex-Orchestration"}},
+                event_payload,
                 expected_base=BASE,
                 expected_head=HEAD,
                 changed_paths=["scripts/preflight.py"],
             )
         )
+        with tempfile.TemporaryDirectory() as temporary:
+            event_path = Path(temporary) / "event.json"
+            event_path.write_text(json.dumps(event_payload), encoding="utf-8")
+            arguments = [
+                "--event-path",
+                str(event_path),
+                "--repo-root",
+                str(REPO_ROOT),
+                "--base-sha",
+                BASE,
+                "--head-sha",
+                HEAD,
+            ]
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(ATTESTATION.main(arguments), 0)
+            self.assertIn("not required for this non-PR event", output.getvalue())
+
+            errors = io.StringIO()
+            invalid = [*arguments[:-1], "not-a-sha"]
+            with contextlib.redirect_stderr(errors):
+                self.assertEqual(ATTESTATION.main(invalid), 2)
+            self.assertIn("requires exact lowercase commit SHAs", errors.getvalue())
+
+            missing_path = Path(temporary) / "missing.json"
+            with self.assertRaisesRegex(ATTESTATION.AttestationError, "missing"):
+                ATTESTATION.validate_event_file(
+                    missing_path,
+                    repo_root=REPO_ROOT,
+                    base_sha=BASE,
+                    head_sha=HEAD,
+                )
+            for raw_event, expected in (("{", "valid"), ("[]", "object")):
+                with self.subTest(raw_event=raw_event):
+                    event_path.write_text(raw_event, encoding="utf-8")
+                    with self.assertRaisesRegex(
+                        ATTESTATION.AttestationError, expected
+                    ):
+                        ATTESTATION.validate_event_file(
+                            event_path,
+                            repo_root=REPO_ROOT,
+                            base_sha=BASE,
+                            head_sha=HEAD,
+                        )
 
     def test_missing_malformed_and_duplicate_blocks_fail(self) -> None:
         duplicate = body() + "\n" + body()
@@ -434,6 +484,7 @@ class ReviewAttestationTests(unittest.TestCase):
         for path, expected in (
             ("AGENTS.md", "security-state"),
             (".coveragerc", "security-state"),
+            (".gitattributes", "security-state"),
             (".github/FUNDING.yml", "security-state"),
             ("cosmic-ray.toml", "security-state"),
             ("requirements-dev.txt", "security-state"),
