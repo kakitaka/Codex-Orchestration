@@ -15,9 +15,11 @@ from typing import Any
 
 START_MARKER = "<!-- codex-review-attestation:start -->"
 END_MARKER = "<!-- codex-review-attestation:end -->"
-EXPECTED_REPOSITORY = "Cjbuilds/Codex-Orchestration"
-EXPECTED_BASE = "main"
 EXACT_SHA_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+REPOSITORY_FULL_NAME_RE = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}"
+)
+INVALID_REF_CHAR_RE = re.compile(r"[\x00-\x20\x7f~^:?*\[\\]")
 MAX_EVENT_BYTES = 1_000_000
 MAX_GIT_OUTPUT_BYTES = 1_000_000
 PLACEHOLDERS = {"", "not-required", "todo", "replace-me", "n/a", "none"}
@@ -106,6 +108,35 @@ def _read_event(path: Path) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise AttestationError("GitHub event payload must be an object")
     return payload
+
+
+def _event_repository_name(value: Any) -> str:
+    if not isinstance(value, str) or not REPOSITORY_FULL_NAME_RE.fullmatch(value):
+        raise AttestationError("event repository full_name is invalid")
+    return value
+
+
+def _event_base_ref(value: Any) -> str:
+    if (
+        not isinstance(value, str)
+        or not 1 <= len(value) <= 255
+        or value == "@"
+        or value.startswith("/")
+        or value.endswith(("/", "."))
+        or ".." in value
+        or "@{" in value
+        or INVALID_REF_CHAR_RE.search(value)
+    ):
+        raise AttestationError("event base branch is invalid")
+    components = value.split("/")
+    if any(
+        not component
+        or component.startswith(".")
+        or component.endswith(".lock")
+        for component in components
+    ):
+        raise AttestationError("event base branch is invalid")
+    return value
 
 
 def _git_changed_paths(root: Path, base_sha: str, head_sha: str) -> list[str]:
@@ -294,18 +325,18 @@ def validate_pull_request_event(
     if not isinstance(pull_request, dict):
         raise AttestationError("pull_request event value must be an object")
     repository = event.get("repository")
-    if not isinstance(repository, dict) or repository.get("full_name") != EXPECTED_REPOSITORY:
-        raise AttestationError("event repository does not match the protected repository")
+    if not isinstance(repository, dict):
+        raise AttestationError("event repository is invalid")
+    event_repository = _event_repository_name(repository.get("full_name"))
     head = pull_request.get("head")
     base = pull_request.get("base")
     if not isinstance(head, dict) or head.get("sha") != expected_head:
         raise AttestationError("event head SHA does not match the strict quality input")
-    if (
-        not isinstance(base, dict)
-        or base.get("ref") != EXPECTED_BASE
-        or base.get("sha") != expected_base
-    ):
-        raise AttestationError("event base branch is not main")
+    if not isinstance(base, dict):
+        raise AttestationError("event base branch is invalid")
+    event_base = _event_base_ref(base.get("ref"))
+    if base.get("sha") != expected_base:
+        raise AttestationError("event base SHA does not match the strict quality input")
     body = pull_request.get("body")
     if not isinstance(body, str):
         raise AttestationError("pull request body is missing")
@@ -313,10 +344,10 @@ def validate_pull_request_event(
     value = parse_attestation(body)
     if type(value["schema"]) is not int or value["schema"] not in {1, 2}:
         raise AttestationError("attestation schema must be the integer 1 or 2")
-    if value["repository"] != EXPECTED_REPOSITORY:
-        raise AttestationError("attestation repository does not match")
-    if value["base_branch"] != EXPECTED_BASE:
-        raise AttestationError("attestation base branch is not main")
+    if value["repository"] != event_repository:
+        raise AttestationError("attestation repository does not match the event")
+    if value["base_branch"] != event_base:
+        raise AttestationError("attestation base branch does not match the event")
     if value["reviewed_head_sha"] != expected_head:
         raise AttestationError("attestation reviewed SHA is stale or incorrect")
 

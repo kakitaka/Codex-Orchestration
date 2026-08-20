@@ -72,15 +72,20 @@ def body(**updates: object) -> str:
 
 
 def event(
-    pr_body: str, *, head: str = HEAD, draft: bool = True
+    pr_body: str,
+    *,
+    head: str = HEAD,
+    draft: bool = True,
+    repository: str = "Cjbuilds/Codex-Orchestration",
+    base_ref: str = "main",
 ) -> dict[str, object]:
     return {
-        "repository": {"full_name": "Cjbuilds/Codex-Orchestration"},
+        "repository": {"full_name": repository},
         "pull_request": {
             "body": pr_body,
             "draft": draft,
             "head": {"sha": head},
-            "base": {"ref": "main", "sha": BASE},
+            "base": {"ref": base_ref, "sha": BASE},
         },
     }
 
@@ -351,10 +356,65 @@ class ReviewAttestationTests(unittest.TestCase):
                         changed_paths=["scripts/preflight.py"],
                     )
 
+        fork_repository = "kakitaka/Codex-Orchestration"
+        fork_base = "docs/codex-token-efficiency-implementation"
+        fork_body = body(
+            repository=fork_repository,
+            base_branch=fork_base,
+        )
+        self.assertEqual(
+            ATTESTATION.validate_pull_request_event(
+                event(
+                    fork_body,
+                    repository=fork_repository,
+                    base_ref=fork_base,
+                ),
+                expected_base=BASE,
+                expected_head=HEAD,
+                changed_paths=["scripts/preflight.py"],
+            ),
+            "security-state",
+        )
+
+        for malformed_repository in (
+            "",
+            "owner-only",
+            "owner/repository/extra",
+            " owner/repository",
+        ):
+            with self.subTest(malformed_repository=malformed_repository):
+                with self.assertRaisesRegex(
+                    ATTESTATION.AttestationError, "event repository"
+                ):
+                    ATTESTATION.validate_pull_request_event(
+                        event(body(), repository=malformed_repository),
+                        expected_base=BASE,
+                        expected_head=HEAD,
+                        changed_paths=["scripts/preflight.py"],
+                    )
+
+        for malformed_base in (
+            "",
+            "../main",
+            "feature..branch",
+            "feature@{branch",
+            "feature.lock",
+        ):
+            with self.subTest(malformed_base=malformed_base):
+                with self.assertRaisesRegex(
+                    ATTESTATION.AttestationError, "event base branch"
+                ):
+                    ATTESTATION.validate_pull_request_event(
+                        event(body(), base_ref=malformed_base),
+                        expected_base=BASE,
+                        expected_head=HEAD,
+                        changed_paths=["scripts/preflight.py"],
+                    )
+
     def test_event_base_sha_is_bound_to_quality_input(self) -> None:
         value = event(body())
         value["pull_request"]["base"]["sha"] = "c" * 40  # type: ignore[index]
-        with self.assertRaisesRegex(ATTESTATION.AttestationError, "base branch"):
+        with self.assertRaisesRegex(ATTESTATION.AttestationError, "base SHA"):
             ATTESTATION.validate_pull_request_event(
                 value,
                 expected_base=BASE,
