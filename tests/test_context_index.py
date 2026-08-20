@@ -64,6 +64,75 @@ class ContextIndexTests(unittest.TestCase):
                 database = Path(context.db_path).read_bytes()
                 self.assertNotIn(b"body secret should not be stored", database)
 
+    def test_secret_bearing_markdown_metadata_is_omitted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "adr" / "secret.md"
+            source.parent.mkdir()
+            sentinel = "INDEX_SECRET_SENTINEL_9F2"
+            credential = "credential-value-42"
+            source.write_text(
+                "---\n"
+                f"title: api_key={credential}\n"
+                f"validated_at: password={sentinel}\n"
+                f"source_files: [docs/password={sentinel}.md]\n"
+                "---\n"
+                f"# password={sentinel}\n"
+                "# Safe Architecture\n"
+                f"body password={sentinel} api_key={credential}\n",
+                encoding="utf-8",
+            )
+            with index.ContextIndex(root) as context:
+                info = context.index_file(source)
+                result = context.query("safe")
+                database = Path(context.db_path).read_bytes()
+                self.assertEqual(info["heading_count"], 1)
+                self.assertTrue(result)
+                self.assertNotIn(sentinel, repr(result))
+                self.assertNotIn(credential, repr(result))
+                self.assertNotIn(sentinel.encode(), database)
+                self.assertNotIn(credential.encode(), database)
+
+    def test_benign_token_and_credential_topics_remain_indexable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "token-efficiency.md"
+            source.write_text(
+                "# Token Efficiency\n## Credential Rotation Playbook\n",
+                encoding="utf-8",
+            )
+            with index.ContextIndex(root) as context:
+                info = context.index_file(source)
+                result = context.query("token")
+            self.assertEqual(info["heading_count"], 2)
+            self.assertEqual(result[0]["path"], "token-efficiency.md")
+            self.assertIn(
+                "Token Efficiency",
+                [heading["name"] for heading in result[0]["headings"]],
+            )
+
+    def test_secret_bearing_tampered_row_is_quarantined_before_query(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "README.md"
+            source.write_text("# Safe Architecture\n", encoding="utf-8")
+            database: Path
+            with index.ContextIndex(root) as context:
+                context.index_file(source)
+                database = Path(context.db_path)
+            sentinel = "INDEX_TAMPERED_SECRET_7A1"
+            with contextlib.closing(sqlite3.connect(database)) as connection:
+                connection.execute(
+                    "INSERT INTO headings(path, level, name, line) "
+                    "VALUES (?, ?, ?, ?)",
+                    ("README.md", 1, f"password={sentinel}", 2),
+                )
+                connection.commit()
+            with index.ContextIndex(root) as context:
+                self.assertEqual(context.query("safe"), [])
+                self.assertNotIn(sentinel.encode(), database.read_bytes())
+            self.assertTrue(list(database.parent.glob("index.sqlite.sqlite-schema-*")))
+
     def test_blob_invalidation_and_wildcard_escaping(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

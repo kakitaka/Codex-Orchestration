@@ -113,6 +113,44 @@ _PY_SYMBOL_KINDS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
 _PY_IMPORT_KINDS = (ast.Import, ast.ImportFrom)
 _PATH_FORBIDDEN = re.compile(r"[\x00\r\n]")
 _QUERY_TOKEN_RE = re.compile(r"[^\w.:%_-]+", re.UNICODE)
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?ix)\b(?:password|passwd|passphrase|secret|token|api[\s_-]?key|"
+    r"access[\s_-]?key|private[\s_-]?key|client[\s_-]?secret|"
+    r"auth(?:entication)?[\s_-]?(?:token|key)|refresh[\s_-]?token|"
+    r"session[\s_-]?token|credential(?:s)?|authorization)\b\s*[=:]\s*"
+    r"[\"'`]?[^\s\"'`,;}\]]+"
+)
+_SECRET_BEARER_RE = re.compile(r"(?ix)\b(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]{12,}")
+_SECRET_URL_RE = re.compile(r"(?i)://[^/\s:@]+:[^/\s@]+@")
+_SECRET_MARKER_RE = re.compile(
+    r"(?i)(?:secret|credential|password|token)[_-](?:sentinel|value|marker)"
+)
+_SECRET_KEY_RE = re.compile(
+    r"(?x)(?:-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----|"
+    r"\bAKIA[0-9A-Z]{16}\b|\b(?:ghp|gho|ghu|ghs|ghr|github_pat|xox[baprs])[-_][A-Za-z0-9_-]{10,}\b|"
+    r"\bsk-[A-Za-z0-9_-]{20,}\b|\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b)"
+)
+_VALIDATED_AT_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}(?:[T ][0-9]{2}:[0-9]{2}"
+    r"(?::[0-9]{2}(?:\.[0-9]{1,6})?)?(?:Z|[+-][0-9]{2}:?[0-9]{2})?)?$"
+)
+_LANGUAGES = frozenset(
+    {
+        "python",
+        "javascript",
+        "typescript",
+        "go",
+        "rust",
+        "java",
+        "c",
+        "cpp",
+        "markdown",
+        "json",
+        "toml",
+        "yaml",
+        "text",
+    }
+)
 _EXCLUDED_COMPONENTS = frozenset(
     {
         ".git",
@@ -266,6 +304,68 @@ def _clean_text(value: Any, *, field: str, max_length: int = 512) -> str:
     return value
 
 
+def _contains_secret(value: str) -> bool:
+    """Return whether bounded metadata text resembles credential material."""
+
+    # All callers already cap metadata fields.  The slice keeps this helper
+    # bounded even when it is used for a path or a hostile SQLite value.
+    bounded = value[:4096]
+    return any(
+        pattern.search(bounded) is not None
+        for pattern in (
+            _SECRET_ASSIGNMENT_RE,
+            _SECRET_BEARER_RE,
+            _SECRET_URL_RE,
+            _SECRET_MARKER_RE,
+            _SECRET_KEY_RE,
+        )
+    )
+
+
+def _metadata_text_is_safe(value: Any, *, max_length: int = 512) -> bool:
+    """Check one derived metadata value without exposing its contents."""
+
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and len(value) <= max_length
+        and _PATH_FORBIDDEN.search(value) is None
+        and not _contains_secret(value)
+    )
+
+
+def _validate_metadata_text(value: Any, *, field: str, max_length: int = 512) -> str:
+    """Validate stored metadata while keeping rejected values out of errors."""
+
+    try:
+        text = _clean_text(value, field=field, max_length=max_length)
+    except ContextIndexError as exc:
+        raise CorruptIndexError(f"invalid {field}") from exc
+    if _contains_secret(text):
+        raise CorruptIndexError(f"unsafe {field}")
+    return text
+
+
+def _source_files_json_is_safe(value: Any) -> bool:
+    if not isinstance(value, str) or len(value) > MAX_RESULT_ITEMS_PER_KIND * 4096:
+        return False
+    try:
+        source_files = json.loads(value)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    if not isinstance(source_files, list) or len(source_files) > MAX_RESULT_ITEMS_PER_KIND:
+        return False
+    for source in source_files:
+        if not isinstance(source, str) or not _metadata_text_is_safe(source, max_length=4096):
+            return False
+        try:
+            if normalize_relative_path(source) != source:
+                return False
+        except UnsafePathError:
+            return False
+    return True
+
+
 def _clean_hash(value: Any, *, field: str) -> str:
     text = _clean_text(value, field=field, max_length=128).lower()
     if _HASH_RE.fullmatch(text) is None:
@@ -321,8 +421,9 @@ def _headings(lines: Sequence[str]) -> list[tuple[int, str, int]]:
             continue
         name = match.group(2).strip()
         name = re.sub(r"\s+#+\s*$", "", name).strip()
-        if name:
-            result.append((len(match.group(1)), name[:512], line_number))
+        name = name[:512]
+        if _metadata_text_is_safe(name):
+            result.append((len(match.group(1)), name, line_number))
     return result
 
 
@@ -404,6 +505,17 @@ def _line_metadata(data: bytes, path: str) -> tuple[str, list[tuple[int, str, in
                 match.group(1)
                 for match in re.finditer(r"^\s*([A-Za-z][A-Za-z0-9_.-]{1,127})", text, re.MULTILINE)
             )
+    symbols = [
+        item
+        for item in symbols
+        if _metadata_text_is_safe(item[0], max_length=512)
+        and _metadata_text_is_safe(item[1], max_length=64)
+    ]
+    imports = [
+        item[:256]
+        for item in imports
+        if _metadata_text_is_safe(item[:256], max_length=256)
+    ]
     headings = headings[:MAX_METADATA_ITEMS_PER_KIND]
     symbols = sorted(set(symbols), key=lambda item: (item[2], item[1], item[0]))[
         :MAX_METADATA_ITEMS_PER_KIND
@@ -424,6 +536,8 @@ def _artifact_metadata(path: str, headings: Sequence[tuple[int, str, int]]) -> t
         return None
     kind = "adr" if is_adr else "playbook"
     title = next((heading[1] for heading in headings if heading[0] == 1), Path(path).stem)
+    if not _metadata_text_is_safe(title):
+        title = "artifact"
     status = ""
     validated_at = ""
     source_files: list[str] = []
@@ -454,20 +568,26 @@ def _parse_artifact_frontmatter(
             value = raw_value.strip().strip("'\"")
             if len(value) > 512 or _PATH_FORBIDDEN.search(value):
                 continue
-            if key == "title" and value:
+            if key == "title" and _metadata_text_is_safe(value):
                 title = value
             elif key == "status" and value.lower() in {"confirmed", "provisional", "stale", "draft"}:
                 status = value.lower()
-            elif key in {"validated_at", "validated"} and value:
-                validated_at = value[:128]
+            elif (
+                key in {"validated_at", "validated"}
+                and _metadata_text_is_safe(value, max_length=128)
+                and _VALIDATED_AT_RE.fullmatch(value)
+            ):
+                validated_at = value
             elif key in {"source_files", "sources"}:
                 values = [part.strip() for part in value.strip("[]").split(",") if part.strip()]
                 normalized: list[str] = []
                 for part in values:
                     try:
-                        normalized.append(normalize_relative_path(part.strip("'\"")))
+                        source = normalize_relative_path(part.strip("'\""))
                     except UnsafePathError:
                         continue
+                    if _metadata_text_is_safe(source, max_length=4096):
+                        normalized.append(source)
                 source_files_json = json.dumps(sorted(set(normalized)), separators=(",", ":"))
     return kind, title[:512], status, validated_at, source_files_json
 
@@ -526,9 +646,12 @@ def _validate_path_value(value: Any, *, field: str) -> str:
     if not isinstance(value, str) or len(value) > 4096:
         raise CorruptIndexError(f"invalid {field}")
     try:
-        return normalize_relative_path(value)
+        normalized = normalize_relative_path(value)
     except UnsafePathError as exc:
         raise CorruptIndexError(f"invalid {field}") from exc
+    if not _metadata_text_is_safe(normalized, max_length=4096):
+        raise CorruptIndexError(f"unsafe {field}")
+    return normalized
 
 
 class ContextIndex:
@@ -693,7 +816,9 @@ class ContextIndex:
         for row in self._connection.execute("SELECT path, blob_id, language FROM files"):
             _validate_path_value(row[0], field="file path")
             _clean_hash(row[1], field="blob_id")
-            _clean_text(row[2], field="language", max_length=32)
+            language = _validate_metadata_text(row[2], field="language", max_length=32)
+            if language not in _LANGUAGES:
+                raise CorruptIndexError("invalid language")
 
         table_bounds = {
             "headings": MAX_TOTAL_INDEXED_FILES * MAX_METADATA_ITEMS_PER_KIND,
@@ -709,29 +834,40 @@ class ContextIndex:
             _validate_path_value(row[0], field="heading path")
             if type(row[1]) is not int or not 1 <= row[1] <= 6:
                 raise CorruptIndexError("invalid heading level")
-            _clean_text(row[2], field="heading name")
+            _validate_metadata_text(row[2], field="heading name")
             if type(row[3]) is not int or row[3] < 1:
                 raise CorruptIndexError("invalid heading line")
         for row in self._connection.execute("SELECT path, name, kind, line FROM symbols"):
             _validate_path_value(row[0], field="symbol path")
-            _clean_text(row[1], field="symbol name")
-            _clean_text(row[2], field="symbol kind", max_length=64)
+            _validate_metadata_text(row[1], field="symbol name")
+            _validate_metadata_text(row[2], field="symbol kind", max_length=64)
             if type(row[3]) is not int or row[3] < 1:
                 raise CorruptIndexError("invalid symbol line")
         for row in self._connection.execute("SELECT path, name FROM dependencies"):
             _validate_path_value(row[0], field="dependency path")
-            _clean_text(row[1], field="dependency name", max_length=256)
+            _validate_metadata_text(row[1], field="dependency name", max_length=256)
         for row in self._connection.execute(
             "SELECT path, kind, title, status, validated_at, source_files FROM adr_playbooks"
         ):
             _validate_path_value(row[0], field="artifact path")
-            _clean_text(row[1], field="artifact kind", max_length=32)
-            _clean_text(row[2], field="artifact title")
+            kind = _validate_metadata_text(row[1], field="artifact kind", max_length=32)
+            if kind not in {"adr", "playbook"}:
+                raise CorruptIndexError("invalid artifact kind")
+            _validate_metadata_text(row[2], field="artifact title")
             if row[3] != "":
-                _clean_text(row[3], field="artifact status", max_length=64)
+                status = _validate_metadata_text(row[3], field="artifact status", max_length=64)
+                if status not in {"confirmed", "provisional", "stale", "draft"}:
+                    raise CorruptIndexError("invalid artifact status")
             if row[4] != "":
-                _clean_text(row[4], field="artifact validated_at", max_length=128)
-            source_files = json.loads(str(row[5]))
+                validated_at = _validate_metadata_text(
+                    row[4], field="artifact validated_at", max_length=128
+                )
+                if _VALIDATED_AT_RE.fullmatch(validated_at) is None:
+                    raise CorruptIndexError("invalid artifact validated_at")
+            try:
+                source_files = json.loads(row[5])
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise CorruptIndexError("invalid artifact source_files") from exc
             if not isinstance(source_files, list) or len(source_files) > MAX_RESULT_ITEMS_PER_KIND:
                 raise CorruptIndexError("invalid artifact source_files")
             for source in source_files:
@@ -758,6 +894,28 @@ class ContextIndex:
                 ) from exc
             self._connection = self._connect()
             self._create_schema()
+
+    def _ensure_safe_database(self) -> None:
+        """Validate rows before a query can materialize persisted metadata."""
+
+        with self._lock, _file_lock(self.db_path):
+            try:
+                self._validate_database()
+                return
+            except (CorruptIndexError, ContextIndexError, sqlite3.DatabaseError, OSError) as exc:
+                with contextlib.suppress(Exception):
+                    self._connection.close()
+                quarantined = quarantine_file(
+                    self.repo_root,
+                    self.db_target,
+                    suffix="sqlite-unsafe",
+                )
+                if quarantined is None:
+                    raise CorruptIndexError(
+                        "context index unsafe database could not be quarantined"
+                    ) from exc
+                self._connection = self._connect()
+                self._create_schema()
 
     def close(self) -> None:
         with self._lock:
@@ -789,6 +947,48 @@ class ContextIndex:
         imports: Sequence[str],
         artifact: tuple[str, str, str, str, str] | None,
     ) -> None:
+        if not _metadata_text_is_safe(relative_path, max_length=4096):
+            raise ContextIndexError("source path metadata is unsafe")
+        if not _metadata_text_is_safe(language, max_length=32):
+            raise ContextIndexError("source language metadata is unsafe")
+        if not isinstance(blob_id, str) or _HASH_RE.fullmatch(blob_id) is None:
+            raise ContextIndexError("source blob metadata is unsafe")
+        headings = [
+            item
+            for item in headings
+            if type(item) is tuple
+            and len(item) == 3
+            and type(item[0]) is int
+            and _metadata_text_is_safe(item[1])
+            and type(item[2]) is int
+        ]
+        symbols = [
+            item
+            for item in symbols
+            if type(item) is tuple
+            and len(item) == 3
+            and _metadata_text_is_safe(item[0])
+            and _metadata_text_is_safe(item[1], max_length=64)
+            and type(item[2]) is int
+        ]
+        imports = [
+            item
+            for item in imports
+            if _metadata_text_is_safe(item, max_length=256)
+        ]
+        if artifact is not None:
+            if (
+                len(artifact) != 5
+                or not _metadata_text_is_safe(artifact[0], max_length=32)
+                or not _metadata_text_is_safe(artifact[1])
+                or (artifact[2] and not _metadata_text_is_safe(artifact[2], max_length=64))
+                or (artifact[3] and not _metadata_text_is_safe(artifact[3], max_length=128))
+                or not _source_files_json_is_safe(artifact[4])
+                or artifact[0] not in {"adr", "playbook"}
+                or (artifact[2] and artifact[2] not in {"confirmed", "provisional", "stale", "draft"})
+                or (artifact[3] and _VALIDATED_AT_RE.fullmatch(artifact[3]) is None)
+            ):
+                artifact = None
         for attempt in range(4):
             try:
                 with self._lock:
@@ -843,9 +1043,14 @@ class ContextIndex:
     def index_file(self, path: os.PathLike[str] | str) -> dict[str, Any]:
         """Derive and persist metadata for one contained, non-link file."""
 
+        raw_path = os.fspath(path)
+        if isinstance(raw_path, str) and _contains_secret(raw_path):
+            raise ContextIndexError("source path metadata is unsafe")
         relative_path = self._safe_relative(path)
         if not _indexable_path(relative_path):
             raise ContextIndexError("source path is excluded from the metadata index")
+        if not _metadata_text_is_safe(relative_path, max_length=4096):
+            raise ContextIndexError("source path metadata is unsafe")
         data = self._read_source(relative_path)
         blob_id = git_blob_id(data, object_format=self.object_format)
         language, headings, symbols, imports, text = _line_metadata(data, relative_path)
@@ -920,6 +1125,7 @@ class ContextIndex:
         """Search metadata using escaped, parameterized LIKE predicates."""
 
         terms = _query_terms(query)
+        self._ensure_safe_database()
         if not terms:
             return []
         effective_limit = self.query_limit if limit is None else _exact_bounded_int(

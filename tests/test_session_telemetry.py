@@ -6,6 +6,7 @@ import sys
 import tempfile
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "plugins/codex-orchestration/skills/codex-orchestration/scripts"
@@ -68,6 +69,113 @@ class SessionTelemetryTests(unittest.TestCase):
             raw = (root / ".codex-state/session-lanes.json").read_bytes()
             self.assertNotIn(str(root).encode(), raw)
             self.assertNotIn(b"caller-capability", raw)
+
+    def test_capability_lane_rotates_task_bound_resume_tuple(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = telemetry.SessionLaneManager(
+                Path(tmp), resume_enabled=True, host_capability=True
+            )
+            expiry = int(time.time()) + 60
+            first = manager.get_or_create(
+                context(),
+                caller_capability="caller-capability",
+                resume_id="session-a",
+                task_packet_hash="a" * 64,
+                resume_expires_at=expiry,
+            )
+            second = manager.get_or_create(
+                context(),
+                caller_capability="caller-capability",
+                resume_id="session-b",
+                task_packet_hash="b" * 64,
+                resume_expires_at=expiry,
+            )
+            self.assertEqual(first["lane_id"], second["lane_id"])
+            self.assertEqual(second["resume_id"], "session-b")
+            self.assertEqual(
+                manager.resume(
+                    second["lane_id"],
+                    context(),
+                    caller_capability="caller-capability",
+                    resume_id="session-b",
+                    task_packet_hash="b" * 64,
+                    resume_expires_at=expiry,
+                )["resume_id"],
+                "session-b",
+            )
+            stale = manager.resume(
+                first["lane_id"],
+                context(),
+                caller_capability="caller-capability",
+                resume_id="session-a",
+                task_packet_hash="a" * 64,
+                resume_expires_at=expiry,
+            )
+            self.assertNotIn("resume_id", stale)
+            self.assertEqual(
+                set(manager.list_lanes()[0]) & set(telemetry._RESUME_FIELDS),
+                set(),
+            )
+            expired = manager.get_or_create(
+                context(),
+                caller_capability="caller-capability",
+                resume_id="session-expired",
+                task_packet_hash="e" * 64,
+                resume_expires_at=int(time.time()) - 1,
+            )
+            self.assertNotIn("resume_id", expired)
+            fresh = manager.get_or_create(
+                context(),
+                caller_capability="caller-capability",
+                resume_id="session-c",
+                task_packet_hash="c" * 64,
+                resume_expires_at=int(time.time()) + 60,
+            )
+            self.assertEqual(fresh["resume_id"], "session-c")
+
+    def test_concurrent_rotations_keep_one_complete_resume_tuple(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = telemetry.SessionLaneManager(
+                Path(tmp), resume_enabled=True, host_capability=True
+            )
+            expiry = int(time.time()) + 60
+            registrations = [
+                (f"session-{index}", f"{index:064x}") for index in range(16)
+            ]
+
+            def register(item: tuple[str, str]) -> dict[str, object]:
+                resume_id, packet_hash = item
+                return manager.get_or_create(
+                    context(),
+                    caller_capability="caller-capability",
+                    resume_id=resume_id,
+                    task_packet_hash=packet_hash,
+                    resume_expires_at=expiry,
+                )
+
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                results = list(pool.map(register, registrations))
+            self.assertEqual(len({item["lane_id"] for item in results}), 1)
+            lanes = manager.list_lanes()
+            self.assertEqual(len(lanes), 1)
+            lane = lanes[0]
+            self.assertEqual(lane["resume_expires_at"], expiry)
+            matching_hashes = {
+                telemetry._resume_tag(
+                    manager._key,
+                    "caller-capability",
+                    lane["lane_id"],
+                    resume_id,
+                    packet_hash,
+                    telemetry._normalize_lane_context(context()),
+                    expiry,
+                ): packet_hash
+                for resume_id, packet_hash in registrations
+            }
+            self.assertIn(lane["resume_tag"], matching_hashes)
+            self.assertEqual(
+                lane["resume_task_packet_hash"], matching_hashes[lane["resume_tag"]]
+            )
 
     def test_copied_lane_state_is_scoped_to_repository_path(self) -> None:
         with tempfile.TemporaryDirectory() as first_tmp, tempfile.TemporaryDirectory() as second_tmp:

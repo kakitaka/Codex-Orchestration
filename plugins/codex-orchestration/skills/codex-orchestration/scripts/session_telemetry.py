@@ -126,6 +126,11 @@ _LANE_FIELDS = _LANE_IDENTITY_FIELDS | {
     "resume_expires_at",
     "resume_task_packet_hash",
 }
+_RESUME_FIELDS = (
+    "resume_tag",
+    "resume_expires_at",
+    "resume_task_packet_hash",
+)
 _LANE_FORBIDDEN_NAMES = frozenset(
     {
         "prompt",
@@ -611,6 +616,24 @@ class SessionLaneManager:
         task_packet_hash: str | None = None,
         resume_expires_at: int | None = None,
     ) -> dict[str, Any]:
+        return self._get_or_create(
+            context,
+            caller_capability=caller_capability,
+            resume_id=resume_id,
+            task_packet_hash=task_packet_hash,
+            resume_expires_at=resume_expires_at,
+        )
+
+    def _get_or_create(
+        self,
+        context: Mapping[str, Any],
+        *,
+        caller_capability: str | None = None,
+        resume_id: str | None = None,
+        task_packet_hash: str | None = None,
+        resume_expires_at: int | None = None,
+        clear_existing_resume: bool = False,
+    ) -> dict[str, Any]:
         normalized = _normalize_lane_context(context)
         normalized_resume: str | None = None
         if self.resume_enabled and self.host_capability and resume_id is not None:
@@ -654,11 +677,27 @@ class SessionLaneManager:
                 normalized,
                 resume_data["resume_expires_at"],
             )
+        # A host that cannot safely handle resume must never preserve a
+        # resume tuple read from copied/shared local state.  An explicitly
+        # supplied handle (including an invalid or expired one) also marks
+        # the current tuple as stale.  A plain get_or_create without a
+        # handle keeps an unexpired tuple available for a later exact
+        # resume request; expired tuples are cleared below.
+        clear_stale_resume = (
+            clear_existing_resume
+            or resume_id is not None
+            or not (self.resume_enabled and self.host_capability)
+        )
         with _state_file_lock(
             self.lanes_path,
             ancestor_snapshot=_ancestor_snapshot(self.repo_root, self.lanes_path),
         ):
             lanes = self._load()
+            if resume_data and resume_data["resume_expires_at"] <= int(time.time()):
+                # Do not register a handle which expired while waiting for
+                # the state lock.
+                resume_data = {}
+                resume_handle_allowed = False
             for index, lane in enumerate(lanes):
                 if lane.get("lane_id") != lane_id:
                     continue
@@ -671,18 +710,34 @@ class SessionLaneManager:
                             for field, value in resume_data.items()
                         ):
                             result["resume_id"] = normalized_resume
-                        elif any(field in lane for field in resume_data):
-                            raise LaneError("conflicting resume tag")
                         else:
+                            # A lane ID is capability/context bound, while
+                            # its resume tuple is task/session bound.  A new
+                            # registration therefore rotates the complete
+                            # tuple as one locked write instead of rejecting
+                            # the otherwise valid lane.
                             lanes[index] = {**lane, **resume_data}
                             self._write(lanes)
                             result = {**lanes[index], "resume_id": normalized_resume}
-                    elif normalized_resume is not None:
-                        for field in (
-                            "resume_tag",
-                            "resume_expires_at",
-                            "resume_task_packet_hash",
-                        ):
+                    elif any(field in lane for field in _RESUME_FIELDS) and (
+                        clear_stale_resume
+                        or lane.get("resume_expires_at", 0) <= int(time.time())
+                    ):
+                        # Mismatch/expiry fallback must update persisted
+                        # state, not merely hide stale fields in the return
+                        # value.  Remove all tuple fields together so a
+                        # concurrent reader can never observe mixed data.
+                        lanes[index] = {
+                            key: value
+                            for key, value in lane.items()
+                            if key not in _RESUME_FIELDS
+                        }
+                        self._write(lanes)
+                        result = dict(lanes[index])
+                    for field in _RESUME_FIELDS:
+                        # Never expose the opaque persisted tuple without an
+                        # exact, currently valid handle registration.
+                        if not resume_handle_allowed:
                             result.pop(field, None)
                     return result
             new_lane = {"lane_id": lane_id, **normalized}
@@ -708,6 +763,21 @@ class SessionLaneManager:
         resume_expires_at: int | None = None,
     ) -> dict[str, Any]:
         normalized = _normalize_lane_context(context)
+
+        def fresh_fallback() -> dict[str, Any]:
+            # A failed resume attempt revokes the persisted tuple for this
+            # exact context/capability lane.  The helper performs that
+            # mutation under the state lock and never returns its internals.
+            fresh = self._get_or_create(
+                normalized,
+                caller_capability=caller_capability,
+                clear_existing_resume=True,
+            )
+            fresh.pop("resume_id", None)
+            for field in _RESUME_FIELDS:
+                fresh.pop(field, None)
+            return fresh
+
         if (
             not self.resume_enabled
             or not self.host_capability
@@ -718,20 +788,12 @@ class SessionLaneManager:
             or resume_expires_at <= int(time.time())
             or resume_expires_at > MAX_RESUME_EXPIRY
         ):
-            fresh = self.get_or_create(normalized, caller_capability=caller_capability)
-            fresh.pop("resume_id", None)
-            for field in ("resume_tag", "resume_expires_at", "resume_task_packet_hash"):
-                fresh.pop(field, None)
-            return fresh
+            return fresh_fallback()
         try:
             normalized_resume = _lane_string(resume_id, "resume_id")
             normalized_hash = _task_packet_hash(task_packet_hash)
         except LaneError:
-            fresh = self.get_or_create(normalized, caller_capability=caller_capability)
-            fresh.pop("resume_id", None)
-            for field in ("resume_tag", "resume_expires_at", "resume_task_packet_hash"):
-                fresh.pop(field, None)
-            return fresh
+            return fresh_fallback()
         expected = _lane_id(
             self._key, normalized, caller_capability, self._repo_scope
         )
@@ -763,16 +825,10 @@ class SessionLaneManager:
                             result = dict(lane)
                             result["resume_id"] = normalized_resume
                             return result
+                return fresh_fallback()
         # A missing/mismatched lane becomes a context-derived local lane but
         # never carries a handle from either the requested or an existing lane.
-        fresh = self.get_or_create(
-            normalized,
-            caller_capability=caller_capability,
-        )
-        fresh.pop("resume_id", None)
-        for field in ("resume_tag", "resume_expires_at", "resume_task_packet_hash"):
-            fresh.pop(field, None)
-        return fresh
+        return fresh_fallback()
 
     def list_lanes(self) -> list[dict[str, Any]]:
         with _state_file_lock(

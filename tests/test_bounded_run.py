@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import math
 import os
 from pathlib import Path
@@ -28,6 +29,27 @@ class BoundedRunTests(unittest.TestCase):
         self.assertGreater(
             bounded_run._JOBOBJECT_BASIC_LIMIT_INFORMATION.LimitFlags.offset, 0
         )
+
+    @unittest.skipUnless(os.name == "nt", "Windows Job Object behavior")
+    def test_windows_job_process_id_list_has_a_fixed_bound(self) -> None:
+        info = bounded_run._JOBOBJECT_BASIC_PROCESS_ID_LIST()
+        self.assertEqual(
+            len(info.ProcessIdList), bounded_run.MAX_JOB_PROCESS_IDS
+        )
+        self.assertEqual(
+            bounded_run._WindowsJob._JOB_OBJECT_BASIC_PROCESS_ID_LIST, 3
+        )
+
+    @unittest.skipUnless(os.name == "nt", "Windows Job Object behavior")
+    def test_windows_job_verify_empty_terminates_and_waits_for_active_processes(self) -> None:
+        controller = object.__new__(bounded_run._WindowsJob)
+        controller._assigned = True
+        controller._empty_verified = False
+        controller._active_process_count = mock.Mock(side_effect=[1, 0])
+        controller.terminate = mock.Mock(return_value=True)
+        self.assertTrue(controller.verify_empty())
+        controller.terminate.assert_called_once_with()
+        self.assertTrue(controller._empty_verified)
 
     def test_redacts_secret_split_across_chunks(self) -> None:
         redactor = bounded_run.StreamingRedactor(["secret-value-123"])
@@ -99,6 +121,85 @@ class BoundedRunTests(unittest.TestCase):
                     secrets=[b"x" * (bounded_run.MAX_SECRET_BYTES + 1)],
                 )
             popen.assert_not_called()
+
+    def test_oversized_inherited_secret_is_rejected_without_log_leak(self) -> None:
+        secret = "inherited-secret-" + ("x" * bounded_run.MAX_SECRET_BYTES)
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "diagnostic.json"
+            with mock.patch.dict(
+                bounded_run.os.environ,
+                {"BOUNDED_RUN_SECRET_TOKEN": secret},
+                clear=False,
+            ), mock.patch.object(bounded_run.subprocess, "Popen") as popen:
+                with self.assertRaises(ValueError) as raised:
+                    bounded_run.run_bounded(
+                        [sys.executable, "-c", "print('must not run')"],
+                        log_path=log_path,
+                    )
+                popen.assert_not_called()
+            self.assertNotIn(secret, str(raised.exception))
+            self.assertFalse(log_path.exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows Job Object behavior")
+    def test_windows_spawn_assigns_before_resume_and_requires_close(self) -> None:
+        class FakeProcess:
+            pid = 1234
+            _handle = 1
+            stdin = None
+            stdout = io.BytesIO()
+            stderr = io.BytesIO()
+            returncode = 0
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        controller = object.__new__(bounded_run._WindowsJob)
+        events: list[str] = []
+        controller.attach = mock.Mock(side_effect=lambda process: events.append("attach"))
+        controller.resume = mock.Mock(side_effect=lambda process: events.append("resume"))
+        controller.verify_empty = mock.Mock(return_value=True)
+        controller.close = mock.Mock(return_value=True)
+        process = FakeProcess()
+        with mock.patch.object(bounded_run, "_prepare_tree_controller", return_value=controller), mock.patch.object(
+            bounded_run.subprocess, "Popen", return_value=process
+        ) as popen:
+            result = bounded_run.run_bounded([sys.executable, "-c", "print('ok')"])
+        flags = popen.call_args.kwargs["creationflags"]
+        self.assertTrue(flags & getattr(bounded_run.subprocess, "CREATE_SUSPENDED", 0x4))
+        self.assertEqual(events, ["attach", "resume"])
+        controller.verify_empty.assert_called_once_with()
+        controller.close.assert_called_once_with()
+        self.assertEqual(result.exit_category, "ok")
+
+    @unittest.skipUnless(os.name == "nt", "Windows Job Object behavior")
+    def test_windows_success_with_job_close_failure_is_cleanup_error(self) -> None:
+        class FakeProcess:
+            pid = 1234
+            _handle = 1
+            stdin = None
+            stdout = io.BytesIO()
+            stderr = io.BytesIO()
+            returncode = 0
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        controller = object.__new__(bounded_run._WindowsJob)
+        controller.attach = mock.Mock()
+        controller.resume = mock.Mock()
+        controller.verify_empty = mock.Mock(return_value=True)
+        controller.close = mock.Mock(return_value=False)
+        with mock.patch.object(bounded_run, "_prepare_tree_controller", return_value=controller), mock.patch.object(
+            bounded_run.subprocess, "Popen", return_value=FakeProcess()
+        ):
+            result = bounded_run.run_bounded([sys.executable, "-c", "print('ok')"])
+        self.assertEqual(result.exit_category, "cleanup_error")
 
     def test_caps_infinite_output_and_uses_no_shell(self) -> None:
         code = "import sys; sys.stdout.write('x' * 10000000); sys.stdout.flush()"

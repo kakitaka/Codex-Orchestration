@@ -12,6 +12,7 @@ import argparse
 from collections import deque
 from dataclasses import dataclass
 import ctypes
+from ctypes import wintypes
 import json
 import math
 import os
@@ -47,6 +48,8 @@ MAX_ARG_COUNT = 4096
 MAX_ARG_BYTES = 1 * 1024 * 1024
 MAX_ENV_COUNT = 4096
 MAX_ENV_BYTES = 4 * 1024 * 1024
+MAX_THREAD_SCAN = 4096
+MAX_JOB_PROCESS_IDS = 4096
 MAX_PATH_BYTES = 4096
 MAX_LOG_PATH_BYTES = 1024
 _SENSITIVE_ENV_RE = re.compile(
@@ -698,11 +701,36 @@ class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
     )
 
 
+class _THREADENTRY32(ctypes.Structure):
+    _fields_ = (
+        ("dwSize", wintypes.DWORD),
+        ("cntUsage", wintypes.DWORD),
+        ("th32ThreadID", wintypes.DWORD),
+        ("th32OwnerProcessID", wintypes.DWORD),
+        ("tpBasePri", wintypes.LONG),
+        ("tpDeltaPri", wintypes.LONG),
+        ("dwFlags", wintypes.DWORD),
+    )
+
+
+class _JOBOBJECT_BASIC_PROCESS_ID_LIST(ctypes.Structure):
+    _fields_ = (
+        ("NumberOfAssignedProcesses", wintypes.DWORD),
+        ("NumberOfProcessIdsInList", wintypes.DWORD),
+        ("ProcessIdList", ctypes.c_size_t * MAX_JOB_PROCESS_IDS),
+    )
+
+
 class _WindowsJob:
     """Small ctypes wrapper for a kill-on-close Windows Job Object."""
 
     _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+    _JOB_OBJECT_BASIC_PROCESS_ID_LIST = 3
     _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+    _TH32CS_SNAPTHREAD = 0x00000004
+    _THREAD_SUSPEND_RESUME = 0x0002
+    _ERROR_NO_MORE_FILES = 18
+    _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 
     def __init__(self) -> None:
         if os.name != "nt":
@@ -711,19 +739,75 @@ class _WindowsJob:
             self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
             self._create = self._kernel32.CreateJobObjectW
             self._set_info = self._kernel32.SetInformationJobObject
+            self._query_info = self._kernel32.QueryInformationJobObject
             self._assign = self._kernel32.AssignProcessToJobObject
+            self._terminate_process = self._kernel32.TerminateProcess
             self._close = self._kernel32.CloseHandle
             self._terminate = self._kernel32.TerminateJobObject
+            self._snapshot = self._kernel32.CreateToolhelp32Snapshot
+            self._thread_first = self._kernel32.Thread32First
+            self._thread_next = self._kernel32.Thread32Next
+            self._open_thread = self._kernel32.OpenThread
+            self._resume_thread = self._kernel32.ResumeThread
             self._create.restype = ctypes.c_void_p
             self._set_info.restype = ctypes.c_int
+            self._query_info.restype = ctypes.c_int
             self._assign.restype = ctypes.c_int
+            self._terminate_process.restype = ctypes.c_int
             self._close.restype = ctypes.c_int
             self._terminate.restype = ctypes.c_int
+            self._snapshot.restype = wintypes.HANDLE
+            self._thread_first.restype = ctypes.c_int
+            self._thread_next.restype = ctypes.c_int
+            self._open_thread.restype = wintypes.HANDLE
+            self._resume_thread.restype = wintypes.DWORD
+            self._create.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+            self._set_info.argtypes = [
+                wintypes.HANDLE,
+                wintypes.DWORD,
+                wintypes.LPVOID,
+                wintypes.DWORD,
+            ]
+            self._query_info.argtypes = [
+                wintypes.HANDLE,
+                wintypes.DWORD,
+                wintypes.LPVOID,
+                wintypes.DWORD,
+                ctypes.POINTER(wintypes.DWORD),
+            ]
+            self._assign.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+            self._terminate_process.argtypes = [wintypes.HANDLE, wintypes.UINT]
+            self._close.argtypes = [wintypes.HANDLE]
+            self._terminate.argtypes = [wintypes.HANDLE, wintypes.UINT]
+            self._snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+            self._thread_first.argtypes = [
+                wintypes.HANDLE,
+                ctypes.POINTER(_THREADENTRY32),
+            ]
+            self._thread_next.argtypes = [
+                wintypes.HANDLE,
+                ctypes.POINTER(_THREADENTRY32),
+            ]
+            self._open_thread.argtypes = [
+                wintypes.DWORD,
+                wintypes.BOOL,
+                wintypes.DWORD,
+            ]
+            self._resume_thread.argtypes = [wintypes.HANDLE]
         except (AttributeError, OSError) as exc:
             raise RuntimeError("Windows Job Object API is unavailable") from exc
+        try:
+            ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+            self._resume_process = ntdll.NtResumeProcess
+            self._resume_process.restype = ctypes.c_long
+            self._resume_process.argtypes = [wintypes.HANDLE]
+        except (AttributeError, OSError):
+            self._resume_process = None
         self.handle = self._create(None, None)
-        if not self.handle:
+        if not self._valid_handle(self.handle):
             raise RuntimeError("CreateJobObjectW failed")
+        self._assigned = False
+        self._empty_verified = False
         info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
         info.BasicLimitInformation.LimitFlags = (
             self._JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
@@ -737,27 +821,186 @@ class _WindowsJob:
             self.close()
             raise RuntimeError("SetInformationJobObject failed")
 
-    def assign(self, process: subprocess.Popen[bytes]) -> None:
+    @classmethod
+    def _valid_handle(cls, handle: object) -> bool:
+        value = getattr(handle, "value", handle)
+        return value not in {None, 0, -1, cls._INVALID_HANDLE_VALUE}
+
+    @staticmethod
+    def _process_handle(process: subprocess.Popen[bytes]) -> object:
         handle = getattr(process, "_handle", None)
         if handle is None:
             raise RuntimeError("process handle unavailable for Job Object assignment")
+        value = getattr(handle, "value", handle)
         try:
-            process_handle = int(handle)
+            return int(value)
         except (TypeError, ValueError):
-            process_handle = handle
+            return value
+
+    def assign(self, process: subprocess.Popen[bytes]) -> None:
+        if not self._valid_handle(self.handle):
+            raise RuntimeError("Job Object handle unavailable for assignment")
+        process_handle = self._process_handle(process)
         if not self._assign(self.handle, process_handle):
             raise RuntimeError("AssignProcessToJobObject failed")
+        self._assigned = True
+        self._empty_verified = False
 
     attach = assign
 
-    def terminate(self) -> bool:
-        return bool(self._terminate(self.handle, 1))
+    def resume(self, process: subprocess.Popen[bytes]) -> None:
+        """Resume the one primary thread created with CREATE_SUSPENDED."""
+        if not self._assigned:
+            raise RuntimeError("process is not assigned to Job Object")
+        pid = getattr(process, "pid", None)
+        if not isinstance(pid, int) or pid <= 0:
+            raise RuntimeError("process PID unavailable for resume")
+        snapshot = self._snapshot(self._TH32CS_SNAPTHREAD, 0)
+        if not self._valid_handle(snapshot):
+            raise RuntimeError("CreateToolhelp32Snapshot failed")
+        snapshot_close_failed = False
+        direct_resume = False
+        try:
+            entry = _THREADENTRY32()
+            entry.dwSize = ctypes.sizeof(entry)
+            if not self._thread_first(snapshot, ctypes.byref(entry)):
+                raise RuntimeError("Thread32First failed")
+            # Some constrained Windows environments expose the Toolhelp API
+            # but return an empty entry.  The process is still suspended, so
+            # resuming the process handle is safe after Job assignment.
+            if not entry.th32ThreadID or not entry.th32OwnerProcessID:
+                direct_resume = True
+            else:
+                scanned = 0
+                while scanned < MAX_THREAD_SCAN:
+                    scanned += 1
+                    if int(entry.th32OwnerProcessID) == pid:
+                        thread = self._open_thread(
+                            self._THREAD_SUSPEND_RESUME,
+                            False,
+                            int(entry.th32ThreadID),
+                        )
+                        if not self._valid_handle(thread):
+                            raise RuntimeError("OpenThread failed")
+                        thread_close_failed = False
+                        try:
+                            previous_count = int(self._resume_thread(thread))
+                            if previous_count == 0xFFFFFFFF:
+                                raise RuntimeError("ResumeThread failed")
+                            if previous_count != 1:
+                                raise RuntimeError("unexpected suspended-thread count")
+                        finally:
+                            if not self._close(thread):
+                                thread_close_failed = True
+                        if thread_close_failed:
+                            raise RuntimeError("thread handle close failed")
+                        break
+                    if not self._thread_next(snapshot, ctypes.byref(entry)):
+                        if ctypes.get_last_error() != self._ERROR_NO_MORE_FILES:
+                            raise RuntimeError("Thread32Next failed")
+                        raise RuntimeError("primary process thread not found")
+                else:
+                    raise RuntimeError("thread enumeration exceeded bounded limit")
+        finally:
+            if not self._close(snapshot):
+                snapshot_close_failed = True
+        if snapshot_close_failed:
+            raise RuntimeError("thread snapshot handle close failed")
+        if direct_resume:
+            resume_process = getattr(self, "_resume_process", None)
+            if resume_process is None or int(resume_process(self._process_handle(process))) != 0:
+                raise RuntimeError("NtResumeProcess failed")
+
+    def terminate(self, process: subprocess.Popen[bytes] | None = None) -> bool:
+        if getattr(self, "_assigned", False):
+            if not self._valid_handle(self.handle):
+                return False
+            return bool(self._terminate(self.handle, 1))
+        if process is None:
+            return False
+        try:
+            process_handle = self._process_handle(process)
+        except RuntimeError:
+            return False
+        return bool(self._terminate_process(process_handle, 1))
+
+    def _active_process_count(self) -> int:
+        if not getattr(self, "_assigned", False):
+            return 0
+        if not self._valid_handle(self.handle):
+            raise RuntimeError("Job Object handle unavailable for process query")
+        info = _JOBOBJECT_BASIC_PROCESS_ID_LIST()
+        returned = wintypes.DWORD()
+        if not self._query_info(
+            self.handle,
+            self._JOB_OBJECT_BASIC_PROCESS_ID_LIST,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+            ctypes.byref(returned),
+        ):
+            raise RuntimeError("QueryInformationJobObject failed")
+        if int(returned.value) > ctypes.sizeof(info):
+            raise RuntimeError("Job Object process query exceeded bounded size")
+        assigned = int(info.NumberOfAssignedProcesses)
+        listed = int(info.NumberOfProcessIdsInList)
+        if (
+            assigned > MAX_JOB_PROCESS_IDS
+            or listed > MAX_JOB_PROCESS_IDS
+            or assigned < listed
+        ):
+            raise RuntimeError("Job Object process list exceeded bounded limit")
+        return max(assigned, listed)
+
+    def _wait_empty(self, timeout: float = 1.0) -> bool:
+        if not getattr(self, "_assigned", False):
+            self._empty_verified = True
+            return True
+        try:
+            wait_limit = float(timeout)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if not math.isfinite(wait_limit) or wait_limit < 0:
+            return False
+        deadline = time.monotonic() + min(wait_limit, 1.0)
+        while True:
+            try:
+                count = self._active_process_count()
+            except (OSError, RuntimeError, ValueError, TypeError, ctypes.ArgumentError):
+                return False
+            if count == 0:
+                self._empty_verified = True
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(0.01, remaining))
+
+    def verify_empty(self) -> bool:
+        """Ensure no active process remains before closing the Job handle."""
+        if getattr(self, "_empty_verified", False):
+            return True
+        try:
+            count = self._active_process_count()
+        except (OSError, RuntimeError, ValueError, TypeError, ctypes.ArgumentError):
+            return False
+        if count == 0:
+            self._empty_verified = True
+            return True
+        if not self.terminate():
+            return False
+        return self._wait_empty()
 
     def close(self) -> bool:
-        handle, self.handle = getattr(self, "handle", None), None
-        if handle:
-            return bool(self._close(handle))
-        return True
+        handle = getattr(self, "handle", None)
+        if not self._valid_handle(handle):
+            self.handle = None
+            return True
+        if self._close(handle):
+            self.handle = None
+            return True
+        # Retain a failed handle so the bounded cleanup path can retry once.
+        # Reporting success here would leave a live Job Object unaccounted for.
+        return False
 
 
 class _PosixProcessGroup:
@@ -824,12 +1067,21 @@ def _terminate_tree(
             # Windows tree-kill path. TerminateJobObject makes the result
             # prompt; CloseHandle still exercises the configured kill-on-close
             # cleanup. No root-only taskkill fallback exists.
-            terminated = controller.terminate()
-            closed = controller.close()
-            return terminated and closed
+            terminated = controller.terminate(process)
+            if not terminated:
+                return False
+            try:
+                process.wait(timeout=1)
+            except (OSError, subprocess.TimeoutExpired):
+                return False
+            if process.poll() is None:
+                return False
+            if not controller._wait_empty():
+                return False
+            return controller.close()
         if isinstance(controller, _PosixProcessGroup):
             return controller.signal(signal.SIGKILL if force else signal.SIGTERM)
-    except (OSError, RuntimeError, ValueError):
+    except (OSError, RuntimeError, ValueError, TypeError, ctypes.ArgumentError):
         return False
     return False
 
@@ -936,11 +1188,11 @@ def _materialize_env(env: Mapping[str, str] | None) -> tuple[dict[str, str] | No
 
 
 def _inherited_env_secrets() -> tuple[str, ...]:
-    """Collect only bounded sensitive values inherited by a child process."""
+    """Collect bounded inherited secrets or reject an unsafe environment."""
     values: list[str] = []
     for index, (key, value) in enumerate(os.environ.items()):
         if index >= MAX_ENV_COUNT:
-            break
+            raise ValueError("inherited environment exceeds bounded entry count")
         if not isinstance(key, str) or not isinstance(value, str) or not value:
             continue
         if not (
@@ -948,8 +1200,11 @@ def _inherited_env_secrets() -> tuple[str, ...]:
             or key.upper() in {"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN", "GH_TOKEN"}
         ):
             continue
-        if len(value.encode("utf-8", "surrogatepass")) <= MAX_SECRET_BYTES:
-            values.append(value)
+        if len(value.encode("utf-8", "surrogatepass")) > MAX_SECRET_BYTES:
+            raise ValueError("inherited sensitive environment value exceeds bounded length")
+        values.append(value)
+        if len(values) > MAX_SECRET_COUNT:
+            raise ValueError("too many inherited secrets")
     return tuple(values)
 
 
@@ -1014,7 +1269,7 @@ def run_bounded(
     # Validate all public bounds before setting up a child process or any
     # process-tree capability.  Environment-derived values are protected even
     # when a caller did not duplicate them in ``secrets``.
-    inherited_secrets = _inherited_env_secrets()
+    inherited_secrets = _inherited_env_secrets() if checked_env is None else ()
 
     def all_secrets() -> Iterable[str | bytes]:
         yield from secrets
@@ -1050,7 +1305,10 @@ def run_bounded(
         "shell": False,
     }
     if os.name == "nt":
-        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        popen_kwargs["creationflags"] = (
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+            | getattr(subprocess, "CREATE_SUSPENDED", 0x00000004)
+        )
     else:
         popen_kwargs["start_new_session"] = True
 
@@ -1062,6 +1320,8 @@ def run_bounded(
     if proc is not None:
         try:
             controller.attach(proc)  # type: ignore[attr-defined]
+            if isinstance(controller, _WindowsJob):
+                controller.resume(proc)
             if checked_input is not None and proc.stdin is not None:
                 def write_input() -> None:
                     try:
@@ -1077,7 +1337,7 @@ def run_bounded(
 
                 input_thread = threading.Thread(target=write_input, daemon=True)
                 input_thread.start()
-        except (OSError, RuntimeError, ValueError) as exc:
+        except (OSError, RuntimeError, ValueError, TypeError, ctypes.ArgumentError) as exc:
             # Assignment/setup happened after CreateProcess but before any
             # output is consumed.  Kill through the verified controller and
             # expose cleanup_error if the tree cannot be proven gone.
@@ -1086,8 +1346,15 @@ def run_bounded(
                 proc.wait(timeout=1)
             except (OSError, subprocess.TimeoutExpired):
                 cleanup_ok = False
+            if proc.poll() is None:
+                cleanup_ok = False
             if isinstance(controller, _WindowsJob):
-                controller.close()
+                try:
+                    closed = controller.close()
+                except (OSError, RuntimeError, ValueError, TypeError, ctypes.ArgumentError):
+                    closed = False
+                if not closed:
+                    cleanup_ok = False
             if not cleanup_ok:
                 return BoundedResult(
                     "cleanup_error", getattr(proc, "returncode", None), True,
@@ -1142,6 +1409,19 @@ def run_bounded(
                 if not _terminate_tree(proc, controller):
                     cleanup_error = True
                 break
+            if (
+                isinstance(controller, _WindowsJob)
+                and proc.poll() is not None
+                and not getattr(controller, "_empty_verified", False)
+            ):
+                try:
+                    verified = controller.verify_empty()
+                except (OSError, RuntimeError, ValueError, TypeError, ctypes.ArgumentError):
+                    verified = False
+                if not verified:
+                    cleanup_error = True
+                else:
+                    controller._empty_verified = True
             try:
                 name, data = events.get(timeout=min(0.05, max(0.001, deadline - time.monotonic())))
             except queue.Empty:
@@ -1235,7 +1515,21 @@ def run_bounded(
             if controller.alive():
                 cleanup_error = True
     if isinstance(controller, _WindowsJob):
-        controller.close()
+        if not getattr(controller, "_empty_verified", False):
+            try:
+                verified = controller.verify_empty()
+            except (OSError, RuntimeError, ValueError, TypeError, ctypes.ArgumentError):
+                verified = False
+            if not verified:
+                cleanup_error = True
+        try:
+            closed = controller.close()
+        except (OSError, RuntimeError, ValueError, TypeError, ctypes.ArgumentError):
+            closed = False
+        if not closed:
+            # A successful child exit does not prove cleanup when the Job
+            # Object handle could not be closed. Keep the result fail-closed.
+            cleanup_error = True
     important_lines.finish()
 
     if start_error is not None:
