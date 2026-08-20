@@ -36,7 +36,7 @@
     },
     {
       "path": "plugins/codex-orchestration/skills/codex-orchestration/scripts/task_packet.py",
-      "blob": "16915c15d34c85add6632257317411dede0aeeae",
+      "blob": "6ffc67df0350b8c12385322332cb4f8b834320c6",
       "symbols": ["DuplicatePacketRegistry", "PacketBudget", "TaskPacket", "WaveBudget", "build_task_packet"],
       "headings": [],
       "failure_labels": ["duplicate_packet", "hard_budget", "secret_like_material", "unstable_static_prefix"],

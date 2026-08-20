@@ -31,6 +31,19 @@ class TokenLintTests(unittest.TestCase):
         (root / "src" / "app.py").write_text("print('targeted')\n", encoding="utf-8")
         return root
 
+    def _git_results(
+        self, root: Path, tracked: bytes
+    ) -> list[token_lint.subprocess.CompletedProcess[bytes]]:
+        top = token_lint.subprocess.CompletedProcess(
+            args=["git", "rev-parse"],
+            returncode=0,
+            stdout=(str(root.resolve()) + "\n").encode("utf-8"),
+        )
+        files = token_lint.subprocess.CompletedProcess(
+            args=["git", "ls-files"], returncode=0, stdout=tracked
+        )
+        return [top, files]
+
     def _scan_fixture(
         self, root: Path, *, max_findings: int = token_lint.DEFAULT_MAX_FINDINGS
     ) -> list[token_lint.Finding]:
@@ -39,12 +52,12 @@ class TokenLintTests(unittest.TestCase):
             for path in root.rglob("*")
             if path.is_file() and not path.is_symlink()
         )
-        result = token_lint.subprocess.CompletedProcess(
-            args=["git", "ls-files"],
-            returncode=0,
-            stdout=("\0".join(tracked) + "\0").encode("utf-8"),
-        )
-        with patch.object(token_lint.subprocess, "run", return_value=result):
+        tracked_bytes = ("\0".join(tracked) + "\0").encode("utf-8")
+        with patch.object(
+            token_lint.subprocess,
+            "run",
+            side_effect=self._git_results(root, tracked_bytes),
+        ):
             return token_lint.scan(root, max_findings=max_findings)
 
     def test_clean_minimal_fixture(self) -> None:
@@ -133,20 +146,22 @@ class TokenLintTests(unittest.TestCase):
         state_file = state / "conversation.jsonl"
         state_file.write_text("AKIA" + "A" * 16 + "\n", encoding="utf-8")
         tracked = b"AGENTS.md\0SKILL.md\0references/one.md\0src/app.py\0"
-        result = token_lint.subprocess.CompletedProcess(
-            args=["git", "ls-files"], returncode=0, stdout=tracked
-        )
-        with patch.object(token_lint.subprocess, "run", return_value=result):
+        with patch.object(
+            token_lint.subprocess,
+            "run",
+            side_effect=self._git_results(root, tracked),
+        ):
             findings = token_lint.scan(root)
         ignored_codes = {finding.code for finding in findings}
         self.assertNotIn("COMMITTED_CODEX_STATE", ignored_codes)
         self.assertNotIn("SECRET_LITERAL", ignored_codes)
 
         tracked_state = tracked + b".codex-state/conversation.jsonl\0"
-        result = token_lint.subprocess.CompletedProcess(
-            args=["git", "ls-files"], returncode=0, stdout=tracked_state
-        )
-        with patch.object(token_lint.subprocess, "run", return_value=result):
+        with patch.object(
+            token_lint.subprocess,
+            "run",
+            side_effect=self._git_results(root, tracked_state),
+        ):
             findings = token_lint.scan(root)
         self.assertIn("COMMITTED_CODEX_STATE", {finding.code for finding in findings})
 
@@ -158,10 +173,11 @@ class TokenLintTests(unittest.TestCase):
             encoding="utf-8",
         )
         tracked = b"AGENTS.md\0SKILL.md\0references/one.md\0src/app.py\0"
-        result = token_lint.subprocess.CompletedProcess(
-            args=["git", "ls-files"], returncode=0, stdout=tracked
-        )
-        with patch.object(token_lint.subprocess, "run", return_value=result):
+        with patch.object(
+            token_lint.subprocess,
+            "run",
+            side_effect=self._git_results(root, tracked),
+        ):
             findings = token_lint.scan(root)
         self.assertTrue(all(item.path != "private-untracked.py" for item in findings))
 
@@ -176,11 +192,12 @@ class TokenLintTests(unittest.TestCase):
             "raise RuntimeError('untracked')", encoding="utf-8"
         )
         tracked = b"AGENTS.md\0SKILL.md\0references/one.md\0src/app.py\0"
-        result = token_lint.subprocess.CompletedProcess(
-            args=["git", "ls-files"], returncode=0, stdout=tracked
-        )
         with (
-            patch.object(token_lint.subprocess, "run", return_value=result),
+            patch.object(
+                token_lint.subprocess,
+                "run",
+                side_effect=self._git_results(root, tracked),
+            ),
             patch.object(
                 token_lint,
                 "_literal_assignment",
@@ -195,10 +212,11 @@ class TokenLintTests(unittest.TestCase):
         (root / "AGENTS.md").write_text("[private](private.md)\n", encoding="utf-8")
         (root / "private.md").write_text("untracked private text", encoding="utf-8")
         tracked = b"AGENTS.md\0SKILL.md\0references/one.md\0src/app.py\0"
-        result = token_lint.subprocess.CompletedProcess(
-            args=["git", "ls-files"], returncode=0, stdout=tracked
-        )
-        with patch.object(token_lint.subprocess, "run", return_value=result):
+        with patch.object(
+            token_lint.subprocess,
+            "run",
+            side_effect=self._git_results(root, tracked),
+        ):
             findings = token_lint.scan(root)
         broken = [item for item in findings if item.code == "BROKEN_REFERENCE"]
         self.assertEqual(len(broken), 1)
@@ -213,6 +231,36 @@ class TokenLintTests(unittest.TestCase):
             findings = token_lint.scan(root)
         self.assertEqual([item.code for item in findings], ["GIT_TRACKING_UNAVAILABLE"])
         self.assertTrue(all(item.path != "private-untracked.py" for item in findings))
+
+    def test_repository_subdirectory_is_not_accepted_as_lint_root(self) -> None:
+        root = self._clean_root()
+        top = token_lint.subprocess.CompletedProcess(
+            args=["git", "rev-parse"],
+            returncode=0,
+            stdout=(str(root.resolve()) + "\n").encode("utf-8"),
+        )
+        with patch.object(token_lint.subprocess, "run", side_effect=[top]):
+            findings = token_lint.scan(root / "src")
+        self.assertEqual([item.code for item in findings], ["GIT_TRACKING_UNAVAILABLE"])
+
+    def test_unsafe_tracked_entry_is_reported_instead_of_skipped(self) -> None:
+        root = self._clean_root()
+        (root / ".venv").mkdir()
+        link = root / ".venv/link.py"
+        link.write_text("placeholder", encoding="utf-8")
+        tracked = b".venv/link.py\0"
+        with (
+            patch.object(
+                token_lint.subprocess,
+                "run",
+                side_effect=self._git_results(root, tracked),
+            ),
+            patch.object(token_lint, "_tracked_regular_file", return_value=False),
+        ):
+            findings = token_lint.scan(root)
+        unsafe = [item for item in findings if item.code == "UNSAFE_TRACKED_PATH"]
+        self.assertEqual(len(unsafe), 1)
+        self.assertEqual(unsafe[0].path, ".venv/link.py")
 
     def test_secret_literal_is_rejected_without_echo(self) -> None:
         root = self._clean_root()

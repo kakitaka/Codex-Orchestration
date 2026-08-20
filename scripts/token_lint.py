@@ -19,7 +19,7 @@ import posixpath
 import re
 import subprocess
 import sys
-from typing import Iterable, Iterator, Sequence
+from typing import Iterable, Sequence
 from urllib.parse import unquote
 
 
@@ -30,6 +30,7 @@ MAX_AGENTS_LINES = 500
 MAX_FILE_BYTES = 2 * 1024 * 1024
 DEFAULT_MAX_FINDINGS = 200
 MAX_TRACKED_PATH_BYTES = 8 * 1024 * 1024
+MAX_TOPLEVEL_PATH_BYTES = 64 * 1024
 _PROMPT_MAX_DEFAULT_RE = re.compile(
     r"(?i)(?:\bdefault(?:s|ed)?(?:\s+to)?\s+|"
     r"\b(?:model_)?reasoning_effort\b\s*[:=]\s*)[`\"']?(?:max|xhigh)\b"
@@ -98,6 +99,22 @@ def _git_tracked_paths(root: Path) -> set[str]:
     """Return the authoritative Git-tracked paths or fail closed."""
 
     try:
+        top = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+        )
+        raw_top = top.stdout
+        if not isinstance(raw_top, bytes) or len(raw_top) > MAX_TOPLEVEL_PATH_BYTES:
+            raise ValueError("repository top-level path exceeds bound")
+        top_text = raw_top.decode("utf-8", "strict").rstrip("\r\n")
+        if not top_text or "\r" in top_text or "\n" in top_text:
+            raise ValueError("invalid repository top-level path")
+        top_path = Path(top_text).resolve(strict=True)
+        if os.path.normcase(str(top_path)) != os.path.normcase(str(root.resolve())):
+            raise ValueError("token lint root is not the repository top level")
         completed = subprocess.run(
             ["git", "-C", str(root), "ls-files", "-z"],
             check=True,
@@ -136,18 +153,26 @@ def _tracked_regular_file(
     return path.is_file() and not path.is_symlink()
 
 
-def _iter_tracked_files(root: Path, tracked_paths: set[str]) -> Iterator[Path]:
-    """Yield only regular files named by the Git index."""
+def _classify_tracked_files(
+    root: Path, tracked_paths: set[str]
+) -> tuple[list[Path], list[str]]:
+    """Partition Git-index paths into safe regular files and unsafe entries."""
 
+    regular: list[Path] = []
+    unsafe: list[str] = []
     for relative_name in sorted(tracked_paths):
         pure = PurePosixPath(relative_name)
         if pure.is_absolute() or not pure.parts or ".." in pure.parts:
+            unsafe.append("<invalid-git-path>")
+            continue
+        path = root.joinpath(*pure.parts)
+        if not _tracked_regular_file(root, path, tracked_paths):
+            unsafe.append(relative_name)
             continue
         if any(part in _SKIP_DIRS for part in pure.parts[:-1]):
             continue
-        path = root.joinpath(*pure.parts)
-        if _tracked_regular_file(root, path, tracked_paths):
-            yield path
+        regular.append(path)
+    return regular, unsafe
 
 
 def _is_spec(path: Path) -> bool:
@@ -545,7 +570,17 @@ def scan(root: str | Path, *, max_findings: int = DEFAULT_MAX_FINDINGS) -> list[
                 "tracked file discovery failed; token lint did not scan filesystem fallbacks",
             )
         ]
-    for path in _iter_tracked_files(base, tracked_paths):
+    regular_files, unsafe_paths = _classify_tracked_files(base, tracked_paths)
+    for relative_name in unsafe_paths:
+        findings.append(
+            Finding(
+                "UNSAFE_TRACKED_PATH",
+                relative_name,
+                1,
+                "Git-index entry is missing, non-regular, or escapes through a link/reparse point",
+            )
+        )
+    for path in regular_files:
         if path.name == _IMPLEMENTATION_SPEC:
             # Still inspect its presence as an artifact only if it is not the
             # named implementation specification; all content rules exclude it.

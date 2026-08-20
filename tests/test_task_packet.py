@@ -119,11 +119,19 @@ class TaskPacketTests(unittest.TestCase):
     def test_stable_url_and_relative_paths_remain_allowed(self) -> None:
         packet = make_packet(
             known_facts=["source https://github.com/openai/codex"],
-            constraints=["inspect src/app.py"],
+            constraints=[
+                "inspect src/app.py",
+                "python ./scripts/check.py",
+                "git -Csrc/subdir status",
+                "cc -Iinclude/project file.c",
+            ],
         )
         text = packet.canonical_bytes.decode("utf-8")
         self.assertIn("https://github.com/openai/codex", text)
         self.assertIn("src/app.py", text)
+        self.assertIn("python ./scripts/check.py", text)
+        self.assertIn("git -Csrc/subdir status", text)
+        self.assertIn("cc -Iinclude/project file.c", text)
 
     def test_traversal_and_symlink_are_rejected(self) -> None:
         with self.assertRaises(packets.PacketPathError):
