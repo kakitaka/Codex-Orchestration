@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import math
 import os
 from pathlib import Path
 import sys
@@ -105,6 +106,17 @@ class BoundedRunTests(unittest.TestCase):
             [sys.executable, "-c", "import time; time.sleep(10)"], timeout=0.1, max_bytes=1024
         )
         self.assertEqual(result.exit_category, "timeout")
+
+    def test_non_finite_timeout_is_rejected_before_process_launch(self) -> None:
+        for timeout in (math.nan, math.inf, -math.inf):
+            with self.subTest(timeout=timeout), mock.patch.object(
+                bounded_run.subprocess, "Popen"
+            ) as popen, self.assertRaisesRegex(ValueError, "positive"):
+                bounded_run.run_bounded(
+                    [sys.executable, "-c", "print('must not run')"],
+                    timeout=timeout,
+                )
+            popen.assert_not_called()
 
     def test_binary_output_is_safe_json_text(self) -> None:
         result = bounded_run.run_bounded(

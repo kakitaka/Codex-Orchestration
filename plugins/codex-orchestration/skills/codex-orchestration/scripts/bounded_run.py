@@ -12,6 +12,7 @@ import argparse
 from collections import deque
 from dataclasses import dataclass
 import json
+import math
 import os
 from pathlib import Path
 import queue
@@ -556,7 +557,11 @@ def run_bounded(
     checked_argv = tuple(argv)
     if any(not isinstance(arg, str) or not arg for arg in checked_argv):
         raise ValueError("argv entries must be non-empty strings")
-    if timeout <= 0 or max_bytes <= 0:
+    try:
+        timeout_value = float(timeout)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("timeout must be a finite positive number") from exc
+    if not math.isfinite(timeout_value) or timeout_value <= 0 or max_bytes <= 0:
         raise ValueError("timeout and max_bytes must be positive")
     head = DEFAULT_HEAD_BYTES if head_bytes is None else max(0, head_bytes)
     tail = DEFAULT_TAIL_BYTES if tail_bytes is None else max(0, tail_bytes)
@@ -624,7 +629,7 @@ def run_bounded(
             thread.start()
             reader_threads.append(thread)
 
-        deadline = time.monotonic() + float(timeout)
+        deadline = time.monotonic() + timeout_value
         while True:
             if time.monotonic() >= deadline:
                 timed_out = True
@@ -752,9 +757,21 @@ def run_bounded(
 run = run_bounded
 
 
+def _finite_positive_timeout(value: str) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise argparse.ArgumentTypeError(
+            "timeout must be a finite positive number"
+        ) from exc
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("timeout must be a finite positive number")
+    return parsed
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
+    parser.add_argument("--timeout", type=_finite_positive_timeout, default=DEFAULT_TIMEOUT)
     parser.add_argument("--max-bytes", type=int, default=DEFAULT_MAX_BYTES)
     parser.add_argument("--head-bytes", type=int, default=None)
     parser.add_argument("--tail-bytes", type=int, default=None)
