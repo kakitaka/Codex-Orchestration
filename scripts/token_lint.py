@@ -552,6 +552,8 @@ def _check_repository_contracts(
 
 def scan(root: str | Path, *, max_findings: int = DEFAULT_MAX_FINDINGS) -> list[Finding]:
     """Scan root and return deterministic findings, capped at max_findings."""
+    if max_findings <= 0:
+        raise ValueError("max_findings must be positive")
     base = Path(root).resolve()
     if not base.exists() or not base.is_dir():
         raise ValueError(f"root is not a directory: {root}")
@@ -603,8 +605,6 @@ def scan(root: str | Path, *, max_findings: int = DEFAULT_MAX_FINDINGS) -> list[
     # Path/line order matches ordinary linter output and is independent of
     # filesystem traversal order.
     findings.sort(key=lambda finding: (finding.path, finding.line, finding.code, finding.message))
-    if max_findings < 0:
-        raise ValueError("max_findings must not be negative")
     return findings[:max_findings]
 
 
@@ -621,10 +621,13 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = _build_parser().parse_args(argv)
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    if args.max_findings <= 0:
+        parser.error("--max-findings must be positive")
     # Ask for one extra item so JSON output can accurately state truncation.
-    collected = scan(args.root, max_findings=args.max_findings + 1 if args.max_findings >= 0 else args.max_findings)
-    truncated = len(collected) > args.max_findings if args.max_findings >= 0 else False
+    collected = scan(args.root, max_findings=args.max_findings + 1)
+    truncated = len(collected) > args.max_findings
     findings = collected[:args.max_findings]
     if args.as_json:
         payload = {

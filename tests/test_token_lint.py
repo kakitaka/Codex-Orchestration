@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 from pathlib import Path
 import tempfile
@@ -278,7 +280,16 @@ class TokenLintTests(unittest.TestCase):
         findings = self._scan_fixture(root, max_findings=3)
         self.assertEqual(len(findings), 3)
         self.assertEqual(findings, sorted(findings, key=lambda finding: (finding.path, finding.line, finding.code, finding.message)))
-        self.assertEqual(len(self._scan_fixture(root, max_findings=0)), 0)
+        with self.assertRaisesRegex(ValueError, "positive"):
+            self._scan_fixture(root, max_findings=0)
+
+    def test_cli_rejects_zero_finding_limit(self) -> None:
+        root = self._clean_root()
+        with (
+            contextlib.redirect_stderr(io.StringIO()),
+            self.assertRaisesRegex(SystemExit, "2"),
+        ):
+            token_lint.main(["--root", str(root), "--max-findings", "0"])
 
 
 if __name__ == "__main__":

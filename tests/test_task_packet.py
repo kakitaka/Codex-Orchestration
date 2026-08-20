@@ -106,6 +106,9 @@ class TaskPacketTests(unittest.TestCase):
             {"goal": "Inspect //server/private/repo"},
             {"validation_command": "tar -C/root/private -cf archive.tar ."},
             {"known_facts": ["workspace:/root/private"]},
+            {"goal": "cd /"},
+            {"goal": "read /@scope/private"},
+            {"goal": r"read \Windows\System32"},
             {"validation_command": "python C:\\Users\\alice\\validate.py"},
             {"expected_output": "write /tmp/alice/report.json"},
         )
@@ -124,6 +127,8 @@ class TaskPacketTests(unittest.TestCase):
                 "python ./scripts/check.py",
                 "git -Csrc/subdir status",
                 "cc -Iinclude/project file.c",
+                r"python .\scripts\check.py",
+                r"inspect src\app.py",
             ],
         )
         text = packet.canonical_bytes.decode("utf-8")
@@ -132,6 +137,8 @@ class TaskPacketTests(unittest.TestCase):
         self.assertIn("python ./scripts/check.py", text)
         self.assertIn("git -Csrc/subdir status", text)
         self.assertIn("cc -Iinclude/project file.c", text)
+        self.assertIn(r"python .\scripts\check.py", packet.payload["CONSTRAINTS"])
+        self.assertIn(r"inspect src\app.py", packet.payload["CONSTRAINTS"])
 
     def test_traversal_and_symlink_are_rejected(self) -> None:
         with self.assertRaises(packets.PacketPathError):
