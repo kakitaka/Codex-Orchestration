@@ -202,16 +202,24 @@ def _add(findings: list[Finding], code: str, root: Path, path: Path, line: int, 
     findings.append(Finding(code, _relative(root, path), max(1, line), message))
 
 
-def _check_budgets(findings: list[Finding], root: Path, path: Path, text: str, size: int) -> None:
+def _check_byte_budgets(
+    findings: list[Finding], root: Path, path: Path, size: int
+) -> None:
     if path.name == "AGENTS.md":
         if size > MAX_AGENTS_BYTES:
             _add(findings, "AGENTS_BYTES", root, path, 1, f"AGENTS.md is {size} bytes; limit is {MAX_AGENTS_BYTES}")
+    if path.name == "SKILL.md":
+        if size > MAX_SKILL_BYTES:
+            _add(findings, "SKILL_BYTES", root, path, 1, f"core SKILL.md is {size} bytes; limit is {MAX_SKILL_BYTES}")
+
+
+def _check_budgets(findings: list[Finding], root: Path, path: Path, text: str, size: int) -> None:
+    _check_byte_budgets(findings, root, path, size)
+    if path.name == "AGENTS.md":
         lines = len(text.splitlines())
         if lines > MAX_AGENTS_LINES:
             _add(findings, "AGENTS_LINES", root, path, MAX_AGENTS_LINES + 1, f"AGENTS.md has {lines} lines; limit is {MAX_AGENTS_LINES}")
     if path.name == "SKILL.md":
-        if size > MAX_SKILL_BYTES:
-            _add(findings, "SKILL_BYTES", root, path, 1, f"core SKILL.md is {size} bytes; limit is {MAX_SKILL_BYTES}")
         lines = len(text.splitlines())
         if lines > MAX_SKILL_LINES:
             _add(findings, "SKILL_LINES", root, path, MAX_SKILL_LINES + 1, f"core SKILL.md has {lines} lines; limit is {MAX_SKILL_LINES}")
@@ -588,7 +596,12 @@ def scan(root: str | Path, *, max_findings: int = DEFAULT_MAX_FINDINGS) -> list[
             # named implementation specification; all content rules exclude it.
             continue
         read = _read(path)
-        if read is not None:
+        if read is None:
+            try:
+                _check_byte_budgets(findings, base, path, path.stat().st_size)
+            except OSError:
+                pass
+        else:
             text, size = read
             if path.suffix.lower() in _TEXT_SUFFIXES:
                 documents.append((path, text))

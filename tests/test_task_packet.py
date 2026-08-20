@@ -108,6 +108,8 @@ class TaskPacketTests(unittest.TestCase):
             {"goal": r"read \\server"},
             {"goal": "read ///"},
             {"validation_command": "tar -C/root/private -cf archive.tar ."},
+            {"validation_command": "tar -C//server/share -cf archive.tar ."},
+            {"validation_command": r"tar -C\\server\share -cf archive.tar ."},
             {"known_facts": ["workspace:/root/private"]},
             {"goal": "cd /"},
             {"goal": "read /@scope/private"},

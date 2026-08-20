@@ -76,6 +76,15 @@ class TokenLintTests(unittest.TestCase):
         self.assertIn("AGENTS_LINES", codes)
         self.assertIn("BROKEN_REFERENCE", codes)
 
+    def test_oversized_always_loaded_files_cannot_skip_byte_budgets(self) -> None:
+        root = self._clean_root()
+        for name in ("AGENTS.md", "SKILL.md"):
+            with (root / name).open("wb") as handle:
+                handle.truncate(token_lint.MAX_FILE_BYTES + 1)
+        codes = {finding.code for finding in self._scan_fixture(root)}
+        self.assertIn("AGENTS_BYTES", codes)
+        self.assertIn("SKILL_BYTES", codes)
+
     def test_duplicate_prompt_blocks(self) -> None:
         root = self._clean_root()
         block = "A stable instruction block that should only be present once. " * 8
