@@ -64,6 +64,7 @@ mutate_namespace_after_write = home / ".fake-mutate-namespace-after-write"
 mutate_feature_after_write = home / ".fake-mutate-feature-after-write"
 mutate_state_after_write = home / ".fake-mutate-state-after-write"
 mutate_disable_restore = home / ".fake-mutate-disable-restore"
+mutate_disable_model_overrides = home / ".fake-mutate-disable-model-overrides"
 ok_overridden = home / ".fake-ok-overridden"
 overridden_returned = home / ".fake-overridden-returned"
 fail_overridden_rollback = home / ".fake-fail-overridden-rollback"
@@ -235,6 +236,18 @@ for line in sys.stdin:
                 "collaboration",
             )
             mutate_disable_restore.unlink()
+        if mutate_disable_model_overrides.exists() and any(
+            edit.get("keyPath")
+            == "features.multi_agent_v2.expose_spawn_agent_model_overrides"
+            and edit.get("value") is None
+            for edit in params["edits"]
+        ):
+            set_path(
+                config,
+                "features.multi_agent_v2.expose_spawn_agent_model_overrides",
+                False,
+            )
+            mutate_disable_model_overrides.unlink()
         store.write_text(json.dumps(config, sort_keys=True), encoding="utf-8")
         if mutate_state_after_write.exists():
             state_path = home / ".codex-orchestration-routing.json"
@@ -559,6 +572,29 @@ class NativeRoutingTests(unittest.TestCase):
         self.assertIn("PLAN_APPROVED ends review early", mode)
         self.assertIn("one-review limit halts before Executor", mode)
         self.assertIn("Token profile lean", usage)
+
+    def test_preset_profile_summary_uses_only_token_budgets_and_worker_cap(self) -> None:
+        executor = {
+            "kind": "model",
+            "model": NATIVE.TERRA_LUNA_SOL_ESCALATION_EXECUTOR_MODEL,
+            "effort": NATIVE.TERRA_LUNA_SOL_ESCALATION_EXECUTOR_EFFORT,
+        }
+        mode, usage = NATIVE.build_policy(
+            executor,
+            None,
+            None,
+            None,
+            token_profile="lean",
+            preset=NATIVE.TERRA_LUNA_SOL_ESCALATION_PRESET,
+        )
+
+        for policy in (mode, usage):
+            self.assertIn("Token profile lean", policy)
+            self.assertIn("packet soft/hard token budgets 3000/6000", policy)
+            self.assertIn("wave soft/hard token budgets 12000/20000", policy)
+            self.assertIn("This profile does not cap worker count", policy)
+            self.assertNotIn("Advisor review limit", policy)
+            self.assertNotIn("blocks approval", policy)
 
     def test_terra_luna_sol_preset_policy_is_escalation_only(self) -> None:
         executor = {
@@ -925,6 +961,27 @@ if "features" in sys.argv and "list" in sys.argv:""",
         self.assertEqual(
             self.read_fake_config()["features"]["multi_agent_v2"]["tool_namespace"],
             "collaboration",
+        )
+
+    def test_disable_retains_state_when_model_override_restore_drifts(self) -> None:
+        self.run_script(
+            "--executor-model",
+            "gpt-5.6-luna",
+            "--executor-effort",
+            "high",
+            "--apply",
+        )
+        state_path = self.home / NATIVE.STATE_FILENAME
+        saved_state = state_path.read_bytes()
+        (self.home / ".fake-mutate-disable-model-overrides").touch()
+
+        disabled = self.run_script("--disable", "--apply", check=False)
+        self.assertEqual(disabled.returncode, 2)
+        self.assertIn("owned restore values could not be verified", disabled.stderr)
+        self.assertEqual(state_path.read_bytes(), saved_state)
+        self.assertFalse(
+            self.read_fake_config()["features"]["multi_agent_v2"]
+            [NATIVE.NATIVE_MODEL_OVERRIDE_FIELD]
         )
 
     def test_preset_effective_failure_restores_config_and_removes_new_state(self) -> None:
@@ -2307,12 +2364,17 @@ if "features" in sys.argv and "list" in sys.argv:""",
         self.assertTrue((self.home / NATIVE.STATE_FILENAME).exists())
 
     def test_state_write_works_when_fchmod_is_unavailable(self) -> None:
+        self.run_script(
+            "--executor-model",
+            "gpt-5.6-luna",
+            "--executor-effort",
+            "high",
+            "--apply",
+        )
         state_path = self.home / "portable-state.json"
-        state = {
-            "schema": NATIVE.STATE_SCHEMA,
-            "managed_by": "codex-orchestration",
-            "config_file": str(self.home / "config.toml"),
-        }
+        state = json.loads(
+            (self.home / NATIVE.STATE_FILENAME).read_text(encoding="utf-8")
+        )
         with mock.patch.object(NATIVE.os, "fchmod", None, create=True):
             NATIVE._write_state(state_path, state)
         self.assertEqual(json.loads(state_path.read_text(encoding="utf-8")), state)
@@ -3433,6 +3495,51 @@ if "features" in sys.argv and "list" in sys.argv:""",
 
         status = self.run_script("--status")
         self.assertIn("Token profile: lean", status.stdout)
+
+    def test_update_retains_existing_model_override_ownership_when_capability_is_hidden(
+        self,
+    ) -> None:
+        self.run_script(
+            "--executor-model",
+            "gpt-5.6-luna",
+            "--executor-effort",
+            "high",
+            "--apply",
+        )
+        state_path = self.home / NATIVE.STATE_FILENAME
+        existing_state = json.loads(state_path.read_text(encoding="utf-8"))
+        current_config = self.read_fake_config()
+        executor = {"kind": "model", "model": "gpt-5.6-terra", "effort": "high"}
+        mode, usage = NATIVE.build_policy(executor, None, None)
+
+        new_state, edits, _ = NATIVE._prepare_setup_state(
+            current_config,
+            existing_state,
+            mode,
+            usage,
+            executor,
+            None,
+            None,
+            None,
+            Path(existing_state["config_file"]),
+            False,
+            native_overrides=False,
+        )
+
+        self.assertTrue(new_state["managed"]["model_overrides"])
+        self.assertEqual(
+            new_state["previous"]["model_overrides"],
+            existing_state["previous"]["model_overrides"],
+        )
+        self.assertIn(
+            {
+                "keyPath": f"features.multi_agent_v2.{NATIVE.NATIVE_MODEL_OVERRIDE_FIELD}",
+                "value": True,
+                "mergeStrategy": "replace",
+            },
+            edits,
+        )
+        self.assertIs(NATIVE.validate_routing_state(new_state), new_state)
 
 
 if __name__ == "__main__":

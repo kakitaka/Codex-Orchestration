@@ -6,8 +6,8 @@
   router and operation-specific references while retaining the full published
   compatibility contract for rare audits.
 - Add deterministic `TASK_PACKET_V1`, profile and wave budgets, duplicate-work
-  detection, staged model/effort recommendations, and schema-6 opt-in profile
-  persistence without changing schema-5 behavior when no profile is selected.
+  detection, and staged model/effort recommendations. Schema 8 is the sole
+  current writer; schemas 1–7 remain read-only compatibility shapes.
 - Add derived-only blob-keyed knowledge indexing, conservative validation and
   failure reuse, exact-match local session lanes, privacy-allowlisted token
   telemetry, and bounded redacted command output.
@@ -21,13 +21,14 @@
   no-history, same-provider, callable-capability-checked escalation only for
   explicitly enumerated high-risk cases, without model substitution.
 - Preserve native setup, status, repair, disable, restore-state validation,
-  capability probing, provider isolation, and conflict-safe rollback. Schema 7
-  snapshots the stable multi-agent and default-subagent controls, rejects profile
-  boundary crossings until disable, writes no worker or concurrency limit, and
-  preserves any pre-existing limit.
-- Add schema 8 as the combined current write contract while accepting both
-  historical schema-6 shapes and the callable schema-7 preset without status-time
-  migration.
+  capability probing, provider isolation, and conflict-safe rollback. Fresh
+  preset state owns only mode/usage/metadata/namespace plus callable Luna
+  subagent controls; it never owns MCP launchers or model overrides. The preset
+  rejects profile boundary crossings until disable, writes no worker or
+  concurrency limit, and preserves any pre-existing limit.
+- Add schema 8 as the combined current write contract while accepting historical
+  schema-6 shapes and the callable schema-7 preset as read-only compatibility
+  without status-time migration.
 
 ## 0.9.3 — 2026-08-08
 

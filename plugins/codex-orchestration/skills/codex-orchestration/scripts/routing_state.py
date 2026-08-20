@@ -462,6 +462,15 @@ def validate_routing_state(value: Any) -> dict[str, Any]:
         managed_has_subagent == previous_has_subagent,
         "preset subagent state and restore data must pair",
     )
+    if preset is not None:
+        _require(
+            not managed_has_mcp,
+            "preset cannot persist MCP state",
+        )
+        _require(
+            not managed_has_overrides,
+            "preset cannot persist model override state",
+        )
     _require(not managed_has_mcp or schema >= 2, "schema 1 cannot contain MCP state")
 
     token_variant_schema6 = schema == 6 and has_token_profile

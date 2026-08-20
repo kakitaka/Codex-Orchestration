@@ -108,8 +108,8 @@ def configured_preset_state(schema: int) -> dict[str, object]:
     state["planner"] = None
     state["advisor"] = None
     state["designer"] = None
-    for server in state["managed"].get("mcp", {}):
-        state["managed"]["mcp"][server] = False
+    state["managed"].pop("mcp", None)
+    state["previous"].pop("mcp", None)
     state["managed"]["subagent"] = {
         "feature_enabled": True,
         "agents_enabled": True,
@@ -308,8 +308,8 @@ class RoutingStateTests(unittest.TestCase):
         state["planner"] = None
         state["advisor"] = None
         state["designer"] = None
-        for server in state["managed"].get("mcp", {}):
-            state["managed"]["mcp"][server] = False
+        state["managed"].pop("mcp")
+        state["previous"].pop("mcp")
         self.assertIs(STATE.validate_routing_state(state), state)
 
         mutations = {
@@ -324,6 +324,27 @@ class RoutingStateTests(unittest.TestCase):
             ),
             "designer route": lambda value: value.update(
                 designer={"kind": "model", "model": "gpt-designer", "effort": "high"}
+            ),
+            "disabled MCP ownership": lambda value: value.update(
+                managed={
+                    **value["managed"],
+                    "mcp": {
+                        "fable-advisor-python3": False,
+                    },
+                },
+                previous={
+                    **value["previous"],
+                    "mcp": {
+                        "fable-advisor-python3": snapshot(),
+                    },
+                },
+            ),
+            "model override ownership": lambda value: value.update(
+                managed={**value["managed"], "model_overrides": True},
+                previous={
+                    **value["previous"],
+                    "model_overrides": snapshot(),
+                },
             ),
         }
         for label, mutate in mutations.items():
@@ -344,8 +365,8 @@ class RoutingStateTests(unittest.TestCase):
         state["planner"] = None
         state["advisor"] = None
         state["designer"] = None
-        for server in state["managed"].get("mcp", {}):
-            state["managed"]["mcp"][server] = False
+        state["managed"].pop("mcp")
+        state["previous"].pop("mcp")
         state["managed"]["subagent"] = {
             "feature_enabled": True,
             "agents_enabled": True,
@@ -392,6 +413,27 @@ class RoutingStateTests(unittest.TestCase):
             "absent table had agent enabled": lambda value: value["previous"][
                 "subagent"
             ].update(agents_enabled=snapshot(False, present=True)),
+            "disabled MCP ownership": lambda value: value.update(
+                managed={
+                    **value["managed"],
+                    "mcp": {
+                        "fable-advisor-python3": False,
+                    },
+                },
+                previous={
+                    **value["previous"],
+                    "mcp": {
+                        "fable-advisor-python3": snapshot(),
+                    },
+                },
+            ),
+            "model override ownership": lambda value: value.update(
+                managed={**value["managed"], "model_overrides": True},
+                previous={
+                    **value["previous"],
+                    "model_overrides": snapshot(),
+                },
+            ),
         }
         for label, mutate in mutations.items():
             with self.subTest(label=label):
@@ -413,6 +455,17 @@ class RoutingStateTests(unittest.TestCase):
         self.assertIs(STATE.validate_routing_state(token_with_overrides), token_with_overrides)
 
         preset = genuine_state(6)
+        preset["preset"] = STATE.TERRA_LUNA_SOL_ESCALATION_PRESET
+        preset["executor"] = {
+            "kind": "model",
+            "model": STATE.TERRA_LUNA_SOL_ESCALATION_EXECUTOR_MODEL,
+            "effort": STATE.TERRA_LUNA_SOL_ESCALATION_EXECUTOR_EFFORT,
+        }
+        preset["planner"] = None
+        preset["advisor"] = None
+        preset["designer"] = None
+        preset["managed"].pop("mcp")
+        preset["previous"].pop("mcp")
         self.assertIs(STATE.validate_routing_state(preset), preset)
 
         neither = genuine_state(5)
@@ -487,7 +540,18 @@ class RoutingStateTests(unittest.TestCase):
         preset_with_overrides["previous"]["model_overrides"] = snapshot(
             False, present=True
         )
-        self.assertIs(STATE.validate_routing_state(preset_with_overrides), preset_with_overrides)
+        with self.assertRaises(STATE.RoutingStateError):
+            STATE.validate_routing_state(preset_with_overrides)
+
+        preset_with_mcp = deepcopy(preset)
+        preset_with_mcp["managed"]["mcp"] = {
+            "fable-advisor-python3": False,
+        }
+        preset_with_mcp["previous"]["mcp"] = {
+            "fable-advisor-python3": snapshot(),
+        }
+        with self.assertRaises(STATE.RoutingStateError):
+            STATE.validate_routing_state(preset_with_mcp)
 
         missing_subagent = deepcopy(configured_preset_state(8))
         missing_subagent["managed"].pop("subagent")

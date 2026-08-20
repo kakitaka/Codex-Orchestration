@@ -857,6 +857,10 @@ def _validate_state_config(state: dict[str, Any] | None, config_path: Path) -> N
 
 
 def _write_state(path: Path, state: dict[str, Any]) -> None:
+    try:
+        validate_routing_state(state)
+    except RoutingStateError as exc:
+        raise ConfigurationError("Routing state is invalid; refusing to persist it.") from exc
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists() or path.is_symlink():
         _read_state(path)
@@ -1516,15 +1520,24 @@ Never use fork_turns = "all" with model, reasoning_effort, or agent_type: a full
 If you are a spawned child, do not call this tool or create descendants. Finish only your assigned packet and return to the root.
 """
     if token_profile is not None:
-        profile_summary = (
-            f"Token profile {profile.name}: Advisor review limit "
-            f"{profile.advisor_loops}; packet soft/hard token budgets "
-            f"{profile.packet_soft_tokens}/{profile.packet_hard_tokens}; "
-            f"wave soft/hard token budgets "
-            f"{profile.wave_soft_tokens}/{profile.wave_hard_tokens}. "
-            "Soft or hard budget exhaustion blocks approval and never releases "
-            "Executor; this profile does not cap worker count."
-        )
+        if preset is not None:
+            profile_summary = (
+                f"Token profile {profile.name}: packet soft/hard token budgets "
+                f"{profile.packet_soft_tokens}/{profile.packet_hard_tokens}; "
+                f"wave soft/hard token budgets "
+                f"{profile.wave_soft_tokens}/{profile.wave_hard_tokens}. "
+                "This profile does not cap worker count."
+            )
+        else:
+            profile_summary = (
+                f"Token profile {profile.name}: Advisor review limit "
+                f"{profile.advisor_loops}; packet soft/hard token budgets "
+                f"{profile.packet_soft_tokens}/{profile.packet_hard_tokens}; "
+                f"wave soft/hard token budgets "
+                f"{profile.wave_soft_tokens}/{profile.wave_hard_tokens}. "
+                "Soft or hard budget exhaustion blocks approval and never releases "
+                "Executor; this profile does not cap worker count."
+            )
         mode = f"{mode}\n{profile_summary}\n"
         usage = f"{usage}\n{profile_summary}\n"
     return mode, usage
@@ -1785,6 +1798,14 @@ def _owned_restore_matches(state: dict[str, Any], current: dict[str, Any]) -> bo
             return False
         if saved.get("known") is True and not _snapshot_matches(
             current[current_key], saved
+        ):
+            return False
+    if "model_overrides" in previous:
+        saved_overrides = previous["model_overrides"]
+        if not isinstance(saved_overrides, dict):
+            return False
+        if saved_overrides.get("known") is True and not _snapshot_matches(
+            current["model_overrides"], saved_overrides
         ):
             return False
     previous_mcp = previous.get("mcp")
@@ -2236,6 +2257,10 @@ def _prepare_setup_state(
     current = _current_values(config)
     feature = current["feature"]
     scalar_feature = isinstance(feature, bool)
+    if preset is not None and native_overrides:
+        raise ConfigurationError(
+            "The Terra-Luna-Sol preset cannot manage native model overrides."
+        )
     _guard_subscription_transition(existing_state, planner, advisor)
     _guard_preset_transition(existing_state, preset)
 
@@ -2303,7 +2328,16 @@ def _prepare_setup_state(
         }
         scalar_origin = feature if scalar_feature else None
 
-    if native_overrides and "model_overrides" not in previous:
+    existing_managed = existing_state.get("managed", {}) if existing_state else {}
+    existing_previous = existing_state.get("previous", {}) if existing_state else {}
+    existing_overrides_owned = (
+        isinstance(existing_managed, dict)
+        and existing_managed.get("model_overrides") is True
+        and isinstance(existing_previous, dict)
+        and isinstance(existing_previous.get("model_overrides"), dict)
+    )
+    manage_overrides = native_overrides or existing_overrides_owned
+    if manage_overrides and "model_overrides" not in previous:
         previous["model_overrides"] = snapshot(current["model_overrides"])
 
     if scalar_feature and existing_state is None:
@@ -2405,7 +2439,6 @@ def _prepare_setup_state(
         ]
         managed_feature = None
 
-    existing_managed = existing_state.get("managed", {}) if existing_state else {}
     manage_mcp = (
         any(
             isinstance(route, dict)
@@ -2471,7 +2504,7 @@ def _prepare_setup_state(
         "metadata": False,
         "namespace": ROUTING_TOOL_NAMESPACE,
     }
-    if native_overrides:
+    if manage_overrides:
         if scalar_feature:
             replacement[NATIVE_MODEL_OVERRIDE_FIELD] = True
             edits[0]["value"] = replacement
@@ -2563,6 +2596,10 @@ def _prepare_setup_state(
         "scalar_origin": scalar_origin,
         "managed_feature": managed_feature,
     }
+    try:
+        validate_routing_state(state)
+    except RoutingStateError as exc:
+        raise ConfigurationError("Prepared routing state is invalid; refusing to write config.") from exc
     return state, edits, rollback
 
 
