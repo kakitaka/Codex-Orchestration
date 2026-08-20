@@ -200,7 +200,7 @@ def _schema_signature(connection: sqlite3.Connection) -> tuple[tuple[str, ...], 
 
     rows = connection.execute(
         "SELECT type, name, tbl_name, sql FROM sqlite_master "
-        "WHERE type IN ('table', 'index') AND name NOT LIKE 'sqlite_%' "
+        "WHERE name NOT LIKE 'sqlite_%' "
         "ORDER BY type, name"
     )
     return tuple(

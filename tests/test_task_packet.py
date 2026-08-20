@@ -104,6 +104,8 @@ class TaskPacketTests(unittest.TestCase):
             {"known_facts": ["checkout is /workspace/alice/repo"]},
             {"goal": r"Inspect \\server\private\repo"},
             {"goal": "Inspect //server/private/repo"},
+            {"validation_command": "tar -C/root/private -cf archive.tar ."},
+            {"known_facts": ["workspace:/root/private"]},
             {"validation_command": "python C:\\Users\\alice\\validate.py"},
             {"expected_output": "write /tmp/alice/report.json"},
         )
@@ -113,6 +115,15 @@ class TaskPacketTests(unittest.TestCase):
             ) as raised:
                 make_packet(**overrides)
             self.assertNotIn("alice", str(raised.exception))
+
+    def test_stable_url_and_relative_paths_remain_allowed(self) -> None:
+        packet = make_packet(
+            known_facts=["source https://github.com/openai/codex"],
+            constraints=["inspect src/app.py"],
+        )
+        text = packet.canonical_bytes.decode("utf-8")
+        self.assertIn("https://github.com/openai/codex", text)
+        self.assertIn("src/app.py", text)
 
     def test_traversal_and_symlink_are_rejected(self) -> None:
         with self.assertRaises(packets.PacketPathError):

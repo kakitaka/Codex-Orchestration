@@ -13,7 +13,9 @@ import argparse
 import ast
 from dataclasses import dataclass
 import json
-from pathlib import Path
+import os
+from pathlib import Path, PurePosixPath
+import posixpath
 import re
 import subprocess
 import sys
@@ -92,21 +94,6 @@ def _relative(root: Path, path: Path) -> str:
     return path.relative_to(root).as_posix()
 
 
-def _iter_files(root: Path) -> Iterator[Path]:
-    root = root.resolve()
-    if not root.exists() or not root.is_dir():
-        return
-    for directory, dirs, names in __import__("os").walk(root):
-        dirs[:] = sorted(name for name in dirs if name not in _SKIP_DIRS)
-        for name in sorted(names):
-            path = Path(directory) / name
-            try:
-                if path.is_file() and not path.is_symlink():
-                    yield path
-            except OSError:
-                continue
-
-
 def _git_tracked_paths(root: Path) -> set[str]:
     """Return the authoritative Git-tracked paths or fail closed."""
 
@@ -126,6 +113,41 @@ def _git_tracked_paths(root: Path) -> set[str]:
         # A failed or non-Git root has no safe filesystem fallback: arbitrary
         # local files may hold private state unrelated to repository content.
         raise GitTrackingUnavailable("git ls-files unavailable")
+
+
+def _tracked_regular_file(
+    root: Path, path: Path, tracked_paths: set[str]
+) -> bool:
+    """Check one tracked file without following a link/reparse escape."""
+
+    try:
+        relative_name = path.relative_to(root).as_posix()
+    except ValueError:
+        return False
+    if relative_name not in tracked_paths:
+        return False
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError:
+        return False
+    expected = Path(os.path.abspath(path))
+    if os.path.normcase(str(resolved)) != os.path.normcase(str(expected)):
+        return False
+    return path.is_file() and not path.is_symlink()
+
+
+def _iter_tracked_files(root: Path, tracked_paths: set[str]) -> Iterator[Path]:
+    """Yield only regular files named by the Git index."""
+
+    for relative_name in sorted(tracked_paths):
+        pure = PurePosixPath(relative_name)
+        if pure.is_absolute() or not pure.parts or ".." in pure.parts:
+            continue
+        if any(part in _SKIP_DIRS for part in pure.parts[:-1]):
+            continue
+        path = root.joinpath(*pure.parts)
+        if _tracked_regular_file(root, path, tracked_paths):
+            yield path
 
 
 def _is_spec(path: Path) -> bool:
@@ -184,7 +206,13 @@ def _check_budgets(findings: list[Finding], root: Path, path: Path, text: str, s
 _MD_LINK_RE = re.compile(r"!?(?:\[[^\]]*\])\(([^)]+)\)")
 
 
-def _check_links(findings: list[Finding], root: Path, path: Path, text: str) -> None:
+def _check_links(
+    findings: list[Finding],
+    root: Path,
+    path: Path,
+    text: str,
+    tracked_paths: set[str],
+) -> None:
     if _is_spec(path):
         return
     in_fence = False
@@ -200,10 +228,28 @@ def _check_links(findings: list[Finding], root: Path, path: Path, text: str) -> 
             if not target or target.startswith(("http://", "https://", "mailto:", "data:")):
                 continue
             if re.match(r"^[A-Za-z]:[\\/]", target) or target.startswith(("/", "\\")):
-                _add(findings, "BROKEN_REFERENCE", root, path, index, f"reference link is absolute: {target}")
+                _add(findings, "BROKEN_REFERENCE", root, path, index, "reference link is absolute")
                 continue
-            if not (path.parent / target).exists():
-                _add(findings, "BROKEN_REFERENCE", root, path, index, f"reference link does not exist: {target}")
+            source_parent = PurePosixPath(path.relative_to(root).as_posix()).parent
+            normalized = posixpath.normpath(
+                (source_parent / target.replace("\\", "/")).as_posix()
+            )
+            if normalized == "." or normalized == ".." or normalized.startswith("../"):
+                exists_in_index = False
+            else:
+                prefix = normalized.rstrip("/") + "/"
+                exists_in_index = normalized in tracked_paths or any(
+                    item.startswith(prefix) for item in tracked_paths
+                )
+            if not exists_in_index:
+                _add(
+                    findings,
+                    "BROKEN_REFERENCE",
+                    root,
+                    path,
+                    index,
+                    "reference link target is not tracked",
+                )
 
 
 def _check_secret_literals(
@@ -418,36 +464,55 @@ def _literal_assignment(path: Path, name: str) -> tuple[object, int] | None:
     return None
 
 
-def _check_repository_contracts(findings: list[Finding], root: Path) -> None:
+def _check_repository_contracts(
+    findings: list[Finding], root: Path, tracked_paths: set[str]
+) -> None:
     skill_root = root / "plugins/codex-orchestration/skills/codex-orchestration"
     manifest = root / "plugins/codex-orchestration/.codex-plugin/plugin.json"
-    if not manifest.is_file():
+    if not _tracked_regular_file(root, manifest, tracked_paths):
         return
     scripts = skill_root / "scripts"
     for name in sorted(REQUIRED_HELPERS):
         target = scripts / name
-        if not target.is_file():
+        if not _tracked_regular_file(root, target, tracked_paths):
             _add(findings, "PACKAGE_OMISSION", root, manifest, 1, f"required helper missing: {name}")
     packet_path = scripts / "task_packet.py"
-    assignment = _literal_assignment(packet_path, "PACKET_KEYS")
+    assignment = (
+        _literal_assignment(packet_path, "PACKET_KEYS")
+        if _tracked_regular_file(root, packet_path, tracked_paths)
+        else None
+    )
     if assignment is None or assignment[0] != EXPECTED_PACKET_KEYS:
         line = 1 if assignment is None else assignment[1]
         _add(findings, "TASK_PACKET_ORDER", root, packet_path, line, "TASK_PACKET_V1 fields do not match the stable canonical order")
     profiles_path = scripts / "token_profiles.py"
-    names = _literal_assignment(profiles_path, "PROFILE_NAMES")
-    default = _literal_assignment(profiles_path, "DEFAULT_PROFILE")
+    profiles_tracked = _tracked_regular_file(root, profiles_path, tracked_paths)
+    names = _literal_assignment(profiles_path, "PROFILE_NAMES") if profiles_tracked else None
+    default = _literal_assignment(profiles_path, "DEFAULT_PROFILE") if profiles_tracked else None
     if names is None or names[0] != ("legacy", "lean", "balanced", "quality"):
         _add(findings, "PROFILE_SCHEMA", root, profiles_path, 1 if names is None else names[1], "token profile names changed")
     if default is None or default[0] != "legacy":
         _add(findings, "PROFILE_SCHEMA", root, profiles_path, 1 if default is None else default[1], "implicit profile migration is forbidden")
     routing_path = scripts / "configure_native_routing.py"
-    profile_schema = _literal_assignment(routing_path, "PROFILE_STATE_SCHEMA")
+    routing_tracked = _tracked_regular_file(root, routing_path, tracked_paths)
+    profile_schema = (
+        _literal_assignment(routing_path, "PROFILE_STATE_SCHEMA")
+        if routing_tracked
+        else None
+    )
     if profile_schema is None or profile_schema[0] != 6:
         _add(findings, "PROFILE_SCHEMA", root, routing_path, 1 if profile_schema is None else profile_schema[1], "profile state schema must remain explicit version 6")
-    advisor_limit = _literal_assignment(routing_path, "ADVISOR_REVIEW_LIMIT")
-    try:
-        routing_text = routing_path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError):
+    advisor_limit = (
+        _literal_assignment(routing_path, "ADVISOR_REVIEW_LIMIT")
+        if routing_tracked
+        else None
+    )
+    if routing_tracked:
+        try:
+            routing_text = routing_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            routing_text = ""
+    else:
         routing_text = ""
     if advisor_limit is None or advisor_limit[0] != 8 or "profile.advisor_loops" not in routing_text:
         _add(
@@ -480,12 +545,7 @@ def scan(root: str | Path, *, max_findings: int = DEFAULT_MAX_FINDINGS) -> list[
                 "tracked file discovery failed; token lint did not scan filesystem fallbacks",
             )
         ]
-    for path in _iter_files(base):
-        relative_name = path.relative_to(base).as_posix()
-        if relative_name not in tracked_paths:
-            # Git is the only authority for repository scope.  Do not inspect
-            # unrelated untracked files, including private runtime state.
-            continue
+    for path in _iter_tracked_files(base, tracked_paths):
         if path.name == _IMPLEMENTATION_SPEC:
             # Still inspect its presence as an artifact only if it is not the
             # named implementation specification; all content rules exclude it.
@@ -497,14 +557,14 @@ def scan(root: str | Path, *, max_findings: int = DEFAULT_MAX_FINDINGS) -> list[
                 documents.append((path, text))
                 _check_budgets(findings, base, path, text, size)
                 if path.suffix.lower() in {".md", ".markdown"}:
-                    _check_links(findings, base, path, text)
+                    _check_links(findings, base, path, text, tracked_paths)
                 _check_secret_literals(findings, base, path, text)
                 _check_source_rules(findings, base, path, text)
                 _check_noisy_defaults(findings, base, path, text)
                 _check_mcp(findings, base, path, text)
         _check_artifacts(findings, base, path, tracked_paths)
     _check_duplicate_blocks(findings, base, documents)
-    _check_repository_contracts(findings, base)
+    _check_repository_contracts(findings, base, tracked_paths)
     # Path/line order matches ordinary linter output and is independent of
     # filesystem traversal order.
     findings.sort(key=lambda finding: (finding.path, finding.line, finding.code, finding.message))

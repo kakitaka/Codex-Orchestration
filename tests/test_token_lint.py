@@ -165,6 +165,46 @@ class TokenLintTests(unittest.TestCase):
             findings = token_lint.scan(root)
         self.assertTrue(all(item.path != "private-untracked.py" for item in findings))
 
+    def test_repository_contracts_never_read_an_untracked_plugin_tree(self) -> None:
+        root = self._clean_root()
+        plugin = root / "plugins/codex-orchestration"
+        scripts = plugin / "skills/codex-orchestration/scripts"
+        scripts.mkdir(parents=True)
+        (plugin / ".codex-plugin").mkdir()
+        (plugin / ".codex-plugin/plugin.json").write_text("{}", encoding="utf-8")
+        (scripts / "task_packet.py").write_text(
+            "raise RuntimeError('untracked')", encoding="utf-8"
+        )
+        tracked = b"AGENTS.md\0SKILL.md\0references/one.md\0src/app.py\0"
+        result = token_lint.subprocess.CompletedProcess(
+            args=["git", "ls-files"], returncode=0, stdout=tracked
+        )
+        with (
+            patch.object(token_lint.subprocess, "run", return_value=result),
+            patch.object(
+                token_lint,
+                "_literal_assignment",
+                side_effect=AssertionError("untracked contract read"),
+            ),
+        ):
+            findings = token_lint.scan(root)
+        self.assertTrue(all("plugins/" not in item.path for item in findings))
+
+    def test_markdown_links_use_the_tracked_index_not_untracked_files(self) -> None:
+        root = self._clean_root()
+        (root / "AGENTS.md").write_text("[private](private.md)\n", encoding="utf-8")
+        (root / "private.md").write_text("untracked private text", encoding="utf-8")
+        tracked = b"AGENTS.md\0SKILL.md\0references/one.md\0src/app.py\0"
+        result = token_lint.subprocess.CompletedProcess(
+            args=["git", "ls-files"], returncode=0, stdout=tracked
+        )
+        with patch.object(token_lint.subprocess, "run", return_value=result):
+            findings = token_lint.scan(root)
+        broken = [item for item in findings if item.code == "BROKEN_REFERENCE"]
+        self.assertEqual(len(broken), 1)
+        self.assertEqual(broken[0].path, "AGENTS.md")
+        self.assertNotIn("private text", str(broken[0]))
+
     def test_git_discovery_failure_fails_closed_without_filesystem_scan(self) -> None:
         root = self._clean_root()
         private = root / "private-untracked.py"

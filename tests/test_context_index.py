@@ -104,6 +104,11 @@ class ContextIndexTests(unittest.TestCase):
         mutations = {
             "column": "ALTER TABLE files RENAME COLUMN language TO lang",
             "index": "DROP INDEX symbols_name",
+            "trigger": (
+                "CREATE TRIGGER block_files BEFORE INSERT ON files "
+                "BEGIN SELECT RAISE(ABORT, 'blocked'); END"
+            ),
+            "view": "CREATE VIEW file_names AS SELECT path FROM files",
         }
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
