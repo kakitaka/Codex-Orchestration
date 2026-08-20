@@ -45,6 +45,16 @@ except ImportError:  # direct script/module import
 
 
 INDEX_FORMAT_VERSION = 1
+_INDEX_TABLE_NAMES = frozenset(
+    {
+        "index_meta",
+        "files",
+        "headings",
+        "symbols",
+        "dependencies",
+        "adr_playbooks",
+    }
+)
 DEFAULT_SOURCE_MAX_BYTES = 4 * 1024 * 1024
 DEFAULT_QUERY_LIMIT = 50
 MAX_REPOSITORY_PATH_BYTES = 8 * 1024 * 1024
@@ -404,7 +414,7 @@ class ContextIndex:
             "tracked_files": 0,
             "warning": None,
         }
-        self._create_schema()
+        self._initialize_schema_with_recovery()
 
     @property
     def repository_status(self) -> dict[str, Any]:
@@ -457,6 +467,24 @@ class ContextIndex:
 
     def _create_schema(self) -> None:
         with self._lock:
+            existing_tables = {
+                str(row[0])
+                for row in self._connection.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+                )
+            }
+            if existing_tables and existing_tables != _INDEX_TABLE_NAMES:
+                raise CorruptIndexError("context index table schema mismatch")
+            if existing_tables:
+                meta_rows = [
+                    (str(row[0]), str(row[1]))
+                    for row in self._connection.execute(
+                        "SELECT key, value FROM index_meta ORDER BY key"
+                    )
+                ]
+                if meta_rows != [("format_version", str(INDEX_FORMAT_VERSION))]:
+                    raise CorruptIndexError("context index format version mismatch")
             self._connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS index_meta (
@@ -499,9 +527,35 @@ class ContextIndex:
                 CREATE INDEX IF NOT EXISTS headings_name ON headings(name);
                 CREATE INDEX IF NOT EXISTS symbols_name ON symbols(name);
                 CREATE INDEX IF NOT EXISTS dependencies_name ON dependencies(name);
-                INSERT OR IGNORE INTO index_meta(key, value) VALUES ('format_version', '1');
                 """
             )
+            if not existing_tables:
+                self._connection.execute(
+                    "INSERT INTO index_meta(key, value) VALUES (?, ?)",
+                    ("format_version", str(INDEX_FORMAT_VERSION)),
+                )
+
+    def _initialize_schema_with_recovery(self) -> None:
+        try:
+            self._create_schema()
+        except (CorruptIndexError, sqlite3.DatabaseError, OSError) as exc:
+            try:
+                self._connection.close()
+            except Exception as close_error:
+                raise CorruptIndexError(
+                    "context index schema mismatch and database could not be closed"
+                ) from close_error
+            quarantined = quarantine_file(
+                self.repo_root,
+                self.db_target,
+                suffix="sqlite-schema",
+            )
+            if quarantined is None:
+                raise CorruptIndexError(
+                    "context index schema mismatch and database could not be quarantined"
+                ) from exc
+            self._connection = self._connect()
+            self._create_schema()
 
     def close(self) -> None:
         with self._lock:

@@ -134,6 +134,31 @@ class TokenLintTests(unittest.TestCase):
             findings = token_lint.scan(root)
         self.assertIn("COMMITTED_CODEX_STATE", {finding.code for finding in findings})
 
+    def test_git_scope_does_not_inspect_any_untracked_file(self) -> None:
+        root = self._clean_root()
+        untracked = root / "private-untracked.py"
+        untracked.write_text(
+            "DEFAULT_EFFORT = 'max'\nAKIA" + "A" * 16 + "\n",
+            encoding="utf-8",
+        )
+        tracked = b"AGENTS.md\0SKILL.md\0references/one.md\0src/app.py\0"
+        result = token_lint.subprocess.CompletedProcess(
+            args=["git", "ls-files"], returncode=0, stdout=tracked
+        )
+        with patch.object(token_lint.subprocess, "run", return_value=result):
+            findings = token_lint.scan(root)
+        self.assertTrue(all(item.path != "private-untracked.py" for item in findings))
+
+    def test_git_discovery_failure_fails_closed_without_filesystem_scan(self) -> None:
+        root = self._clean_root()
+        (root / ".git").mkdir()
+        private = root / "private-untracked.py"
+        private.write_text("AKIA" + "A" * 16, encoding="utf-8")
+        with patch.object(token_lint.subprocess, "run", side_effect=OSError("git missing")):
+            findings = token_lint.scan(root)
+        self.assertEqual([item.code for item in findings], ["GIT_TRACKING_UNAVAILABLE"])
+        self.assertTrue(all(item.path != "private-untracked.py" for item in findings))
+
     def test_secret_literal_is_rejected_without_echo(self) -> None:
         root = self._clean_root()
         secret = "AKIA" + "A" * 16

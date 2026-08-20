@@ -95,6 +95,21 @@ class TaskPacketTests(unittest.TestCase):
         with self.assertRaises(packets.PacketSchemaError):
             make_packet(static_rules=["read C:\\Users\\alice\\private.txt"])
 
+    def test_dynamic_text_cannot_serialize_user_absolute_paths(self) -> None:
+        cases = (
+            {"goal": "Inspect C:\\Users\\alice\\repo"},
+            {"known_facts": ["checkout is D:\\work\\repo"]},
+            {"constraints": ["read /home/alice/private"]},
+            {"validation_command": "python C:\\Users\\alice\\validate.py"},
+            {"expected_output": "write /tmp/alice/report.json"},
+        )
+        for overrides in cases:
+            with self.subTest(overrides=overrides), self.assertRaisesRegex(
+                packets.PacketSchemaError, "user-specific absolute path"
+            ) as raised:
+                make_packet(**overrides)
+            self.assertNotIn("alice", str(raised.exception))
+
     def test_traversal_and_symlink_are_rejected(self) -> None:
         with self.assertRaises(packets.PacketPathError):
             make_packet(files_allowed=["../outside"])

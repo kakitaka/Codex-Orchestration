@@ -84,6 +84,10 @@ class Finding:
         return f"{self.path}:{self.line}: {self.code}: {self.message}"
 
 
+class GitTrackingUnavailable(RuntimeError):
+    """A Git worktree could not provide its authoritative tracked path set."""
+
+
 def _relative(root: Path, path: Path) -> str:
     return path.relative_to(root).as_posix()
 
@@ -129,8 +133,10 @@ def _git_tracked_paths(root: Path) -> set[str] | None:
     except (OSError, subprocess.SubprocessError, UnicodeDecodeError, ValueError):
         # A non-Git fixture retains the historical filesystem behavior.  Once
         # a Git worktree is known, discovery failure is not permission to
-        # classify arbitrary local state as committed.
-        return set() if _git_metadata_exists(root) else None
+        # inspect arbitrary local files as repository content.
+        if _git_metadata_exists(root):
+            raise GitTrackingUnavailable("git ls-files unavailable")
+        return None
 
 
 def _is_spec(path: Path) -> bool:
@@ -472,16 +478,24 @@ def scan(root: str | Path, *, max_findings: int = DEFAULT_MAX_FINDINGS) -> list[
         raise ValueError(f"root is not a directory: {root}")
     findings: list[Finding] = []
     documents: list[tuple[Path, str]] = []
-    tracked_paths = _git_tracked_paths(base)
+    try:
+        tracked_paths = _git_tracked_paths(base)
+    except GitTrackingUnavailable:
+        if max_findings <= 0:
+            return []
+        return [
+            Finding(
+                "GIT_TRACKING_UNAVAILABLE",
+                ".git",
+                1,
+                "tracked file discovery failed; token lint did not scan filesystem fallbacks",
+            )
+        ]
     for path in _iter_files(base):
         relative_name = path.relative_to(base).as_posix()
-        if (
-            tracked_paths is not None
-            and ".codex-state" in {part.lower() for part in path.relative_to(base).parts}
-            and relative_name not in tracked_paths
-        ):
-            # Local runtime state is ignored and may contain private material;
-            # do not inspect it unless Git proves the exact file is tracked.
+        if tracked_paths is not None and relative_name not in tracked_paths:
+            # Git is the only authority for repository scope.  Do not inspect
+            # unrelated untracked files, including private runtime state.
             continue
         if path.name == _IMPLEMENTATION_SPEC:
             # Still inspect its presence as an artifact only if it is not the

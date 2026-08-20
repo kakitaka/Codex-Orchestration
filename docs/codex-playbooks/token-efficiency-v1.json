@@ -12,7 +12,7 @@
     },
     {
       "path": "plugins/codex-orchestration/skills/codex-orchestration/scripts/context_index.py",
-      "blob": "30a75d11999982f0757fd1a79a34a0dd9e3f7c95",
+      "blob": "07e11a1beb9fa49818b476c1eb0b136b0c88ab66",
       "symbols": ["ContextIndex", "RepeatedReadError", "git_blob_id"],
       "headings": [],
       "failure_labels": ["excluded_path", "repeated_read", "stale_blob"],
@@ -36,7 +36,7 @@
     },
     {
       "path": "plugins/codex-orchestration/skills/codex-orchestration/scripts/task_packet.py",
-      "blob": "ed4ae3cd8aac880efae0dd6fd2f149b508bb4883",
+      "blob": "26a0fe4f8142541ffec5b6a508d6bc969e1aa0ae",
       "symbols": ["DuplicatePacketRegistry", "PacketBudget", "TaskPacket", "WaveBudget", "build_task_packet"],
       "headings": [],
       "failure_labels": ["duplicate_packet", "hard_budget", "secret_like_material", "unstable_static_prefix"],
@@ -44,7 +44,7 @@
     },
     {
       "path": "plugins/codex-orchestration/skills/codex-orchestration/scripts/token_hook.py",
-      "blob": "f17c9656bd44b972354a350995fc1ae9c19efb5c",
+      "blob": "aa368267d7c9e4292683f3d8f9453c19ef46c98a",
       "symbols": ["process_payload"],
       "headings": [],
       "failure_labels": ["malformed_input", "noisy_command", "unsupported_event"],

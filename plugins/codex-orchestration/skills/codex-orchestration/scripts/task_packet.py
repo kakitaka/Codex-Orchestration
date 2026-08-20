@@ -277,6 +277,17 @@ def _reject_unstable_static(value: Any, field: str) -> None:
             raise PacketSchemaError(f"{field} contains a user-specific absolute path")
 
 
+def _reject_user_absolute_paths(value: Any, field: str) -> None:
+    """Reject local absolute paths from every serialized text field."""
+
+    values = value if isinstance(value, (list, tuple)) else (value,)
+    for item in values:
+        if isinstance(item, str) and _STATIC_ABSOLUTE_RE.search(item):
+            raise PacketSchemaError(
+                f"{field} contains a user-specific absolute path"
+            )
+
+
 def _normalize_text_list(value: Any, field: str) -> list[str]:
     normalized: set[str] = set()
     for item in _iter_values(value, field):
@@ -412,6 +423,7 @@ def _build_payload(
     }
     for field, value in payload.items():
         _reject_secrets(value, field)
+        _reject_user_absolute_paths(value, field)
     return payload
 
 

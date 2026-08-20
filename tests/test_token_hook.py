@@ -71,6 +71,19 @@ class TokenHookTests(unittest.TestCase):
         self.assertIn("output replacement", diagnostics.getvalue())
         self.assertEqual(token_hook.process_payload({"event": "FutureEvent"}, diagnostics=diagnostics), {})
 
+    def test_unknown_event_value_is_never_echoed_to_diagnostics(self) -> None:
+        diagnostics = io.StringIO()
+        secret_event = "FutureEvent-sk-123456789012345678901234"
+        self.assertEqual(
+            token_hook.process_payload(
+                {"event": secret_event}, diagnostics=diagnostics
+            ),
+            {},
+        )
+        self.assertIn("unsupported hook event", diagnostics.getvalue())
+        self.assertNotIn(secret_event, diagnostics.getvalue())
+        self.assertNotIn("123456789012", diagnostics.getvalue())
+
     def test_cli_is_opt_in_and_stdout_is_exact_json(self) -> None:
         payload = json.dumps({"event": "PreToolUse", "tool_input": {"command": "ls -R"}})
         output = io.StringIO()

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -75,6 +77,28 @@ class ContextIndexTests(unittest.TestCase):
             with index.ContextIndex(root, db_path=db) as context:
                 self.assertEqual(context.query("missing"), [])
             self.assertTrue(list(root.glob("index.sqlite.sqlite-corrupt-*")))
+
+    def test_unknown_logical_schema_is_quarantined_and_rebuilt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            database = root / "index.sqlite"
+            with index.ContextIndex(root, db_path=database):
+                pass
+            with contextlib.closing(sqlite3.connect(database)) as connection:
+                connection.execute(
+                    "UPDATE index_meta SET value = '999' WHERE key = 'format_version'"
+                )
+                connection.commit()
+            with index.ContextIndex(root, db_path=database) as context:
+                self.assertEqual(context.query("missing"), [])
+            self.assertTrue(list(root.glob("index.sqlite.sqlite-schema-*")))
+            with contextlib.closing(sqlite3.connect(database)) as connection:
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT value FROM index_meta WHERE key = 'format_version'"
+                    ).fetchone(),
+                    (str(index.INDEX_FORMAT_VERSION),),
+                )
 
     def test_sensitive_generated_lock_and_binary_paths_are_excluded(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

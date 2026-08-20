@@ -172,7 +172,9 @@ def process_payload(
         _diagnostic("PostToolUse output replacement is unsupported; inspect output manually", diagnostics)
         return {}
     if event:
-        _diagnostic(f"unsupported hook event {event!r}; manual fallback", diagnostics)
+        # Event names originate in untrusted hook JSON.  Never echo an
+        # unsupported value into diagnostics where it could disclose a token.
+        _diagnostic("unsupported hook event; manual fallback", diagnostics)
     else:
         _diagnostic("missing or unsupported hook event; manual fallback", diagnostics)
     return {}
