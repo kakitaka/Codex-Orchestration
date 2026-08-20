@@ -1,6 +1,6 @@
 # Token-efficiency architecture
 
-Codex-Orchestration 0.10.0 adds deterministic local helpers around the existing root/Executor/auditor workflow. Helpers reduce repeated context and noisy tool results; they do not replace Codex scheduling, sandboxing, approval, or provider routing.
+Codex-Orchestration 0.11.0 adds deterministic local helpers around the existing root/Executor/auditor workflow. Helpers reduce repeated context and noisy tool results; they do not replace Codex scheduling, sandboxing, approval, or provider routing.
 
 ## Data flow
 
@@ -25,7 +25,7 @@ Stable instructions precede dynamic packet/evidence so identical prefixes remain
 | Component | Deterministic input | Persistent output | Never persists |
 | --- | --- | --- | --- |
 | `task_packet.py` | fixed fields and repository-relative paths | none | conversation, secret-bearing or semantically redacted packets |
-| `token_profiles.py` | profile plus higher-priority route constraints | optional schema-6 profile | user/model override mutation |
+| `token_profiles.py` | profile plus higher-priority route constraints | nullable profile in current schema 8; historical schema 6 remains readable | user/model override mutation |
 | `context_index.py` | tracked files and Git blob IDs | derived headings, symbols, imports, line numbers | source, snippet, prompt, embedding, LLM summary |
 | `validation_cache.py` | domain-separated command, executable, environment, dependency, source, test, and configuration fingerprints | bounded untrusted advisory pass/failure metadata | argv text, output, source, secrets, absolute paths |
 | `session_telemetry.py` | exact lane fields or telemetry allowlist | separate lane state and telemetry state | capability secret, conversation, raw prompt, logs, cross-store IDs |

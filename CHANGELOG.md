@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.10.0 — Unreleased
+## 0.11.0 — Unreleased
 
 - Replace the always-loaded 56 KB orchestration Skill with a sub-12 KiB stable
   router and operation-specific references while retaining the full published
@@ -13,8 +13,23 @@
   telemetry, and bounded redacted command output.
 - Add current-schema hook fallbacks, token-regression lint, Git-blob playbook
   staleness checks, threat-model coverage, and malformed/security negative tests.
+- Add the strict `terra-luna-sol-escalation` reusable preset: an expected
+  GPT-5.6 Terra @ Max root, persisted GPT-5.6 Luna @ Max Executor, no
+  persisted Planner, Advisor, or Designer, and a reversible callable Luna
+  default-subagent route.
+- Keep GPT-5.6 Sol @ Max outside normal planning. The saved policy permits one
+  no-history, same-provider, callable-capability-checked escalation only for
+  explicitly enumerated high-risk cases, without model substitution.
+- Preserve native setup, status, repair, disable, restore-state validation,
+  capability probing, provider isolation, and conflict-safe rollback. Schema 7
+  snapshots the stable multi-agent and default-subagent controls, rejects profile
+  boundary crossings until disable, writes no worker or concurrency limit, and
+  preserves any pre-existing limit.
+- Add schema 8 as the combined current write contract while accepting both
+  historical schema-6 shapes and the callable schema-7 preset without status-time
+  migration.
 
-## 0.9.3 — Unreleased
+## 0.9.3 — 2026-08-08
 
 - Raise the bounded Advisor approval loop from five to eight reviews while
   preserving immediate approval exit and fail-closed plan, ledger, and

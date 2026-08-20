@@ -17,7 +17,7 @@ No timestamp, UUID, session ID, absolute path, unstable Git SHA, unordered JSON 
 
 ## Profiles
 
-`lean`, `balanced`, and `quality` constrain Advisor loops and packet/wave estimated-token budgets. `legacy` preserves the published eight-review behavior. Profiles recommend routes only after user instructions, `AGENTS.md`, and configured route. Omitted profile on legacy saved state preserves schema 5; explicit selection enables schema 6.
+`lean`, `balanced`, and `quality` constrain Advisor loops and packet/wave estimated-token budgets. `legacy` preserves the published eight-review behavior. Profiles recommend routes only after user instructions, `AGENTS.md`, and configured route. New setup records a nullable profile in combined schema 8; historical schema-6 token-profile state remains readable and is carried forward only during an explicit setup.
 
 ## Knowledge and validation reuse
 

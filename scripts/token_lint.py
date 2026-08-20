@@ -408,6 +408,9 @@ _MAX_RE = re.compile(
     r"(?ix)(?:(?:\b(?:model_reasoning_effort|reasoning_effort|effort|service_tier)\b|\b[A-Za-z_][A-Za-z0-9_]*effort\b)\s*[:=]\s*|"
     r"--(?:reasoning-)?effort\s+|\b(?:default|value)\s*[:=]\s*)[\"']?(max|xhigh)\b"
 )
+_REVIEWED_PRESET_MAX_RE = re.compile(
+    r'^TERRA_LUNA_SOL_ESCALATION_(?:ROOT|EXECUTOR|ADVISOR)_EFFORT = "max"$'
+)
 _FORK_ALL_RE = re.compile(r"(?i)\bfork_turns?\b\s*[=:]\s*[\"']all[\"']")
 _FIXED_WORKER_RE = re.compile(
     r"(?i)\b(?:max_(?:concurrent_)?workers?|worker_(?:count_)?limit|concurrency_limit)\b\s*[:=]\s*\d+"
@@ -425,7 +428,15 @@ def _check_source_rules(findings: list[Finding], root: Path, path: Path, text: s
     if path.suffix.lower() not in _SOURCE_SUFFIXES:
         return
     for index, line in enumerate(text.splitlines(), 1):
-        if not _max_allowed(path, root) and _MAX_RE.search(line):
+        reviewed_preset_max = (
+            path.name == "routing_state.py"
+            and _REVIEWED_PRESET_MAX_RE.fullmatch(line.strip()) is not None
+        )
+        if (
+            not _max_allowed(path, root)
+            and _MAX_RE.search(line)
+            and not reviewed_preset_max
+        ):
             _add(findings, "ACCIDENTAL_MAX_DEFAULT", root, path, index, "max/xhigh is used as a runtime default; keep high effort opt-in")
         if not _max_allowed(path, root) and _FORK_ALL_RE.search(line) and "Never use fork_turns" not in line:
             _add(findings, "FORK_TURNS_ALL", root, path, index, "runtime prompt/config must use fork_turns=none, not all")

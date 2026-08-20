@@ -80,6 +80,11 @@ def genuine_state(schema: int) -> dict[str, object]:
             "model": "gpt-designer",
             "effort": "high",
         }
+    if schema in (6, 7):
+        state["preset"] = None
+    if schema == 8:
+        state["token_profile"] = None
+        state["preset"] = None
     if schema >= 2:
         managed["mcp"] = {
             "fable-advisor-python3": True,
@@ -92,9 +97,38 @@ def genuine_state(schema: int) -> dict[str, object]:
     return state
 
 
+def configured_preset_state(schema: int) -> dict[str, object]:
+    state = genuine_state(schema)
+    state["preset"] = STATE.TERRA_LUNA_SOL_ESCALATION_PRESET
+    state["executor"] = {
+        "kind": "model",
+        "model": STATE.TERRA_LUNA_SOL_ESCALATION_EXECUTOR_MODEL,
+        "effort": STATE.TERRA_LUNA_SOL_ESCALATION_EXECUTOR_EFFORT,
+    }
+    state["planner"] = None
+    state["advisor"] = None
+    state["designer"] = None
+    for server in state["managed"].get("mcp", {}):
+        state["managed"]["mcp"][server] = False
+    state["managed"]["subagent"] = {
+        "feature_enabled": True,
+        "agents_enabled": True,
+        "model": STATE.TERRA_LUNA_SOL_ESCALATION_EXECUTOR_MODEL,
+        "effort": STATE.TERRA_LUNA_SOL_ESCALATION_EXECUTOR_EFFORT,
+    }
+    state["previous"]["subagent"] = {
+        "feature_enabled": snapshot(False, present=True),
+        "agents_enabled": snapshot(),
+        "model": snapshot(),
+        "effort": snapshot(),
+        "agents_table_was_absent": True,
+    }
+    return state
+
+
 class RoutingStateTests(unittest.TestCase):
-    def test_genuine_schemas_one_through_five_are_accepted(self) -> None:
-        for schema in (1, 2, 3, 4, 5):
+    def test_genuine_schemas_one_through_eight_are_accepted(self) -> None:
+        for schema in (1, 2, 3, 4, 5, 6, 7, 8):
             with self.subTest(schema=schema):
                 state = genuine_state(schema)
                 self.assertIs(STATE.validate_routing_state(state), state)
@@ -153,7 +187,7 @@ class RoutingStateTests(unittest.TestCase):
             STATE.validate_routing_state(legacy)
 
     def test_full_negative_invariant_matrix_fails_closed(self) -> None:
-        baseline = genuine_state(4)
+        baseline = genuine_state(7)
 
         def schema(value: object):
             return lambda state: state.__setitem__("schema", value)
@@ -162,12 +196,15 @@ class RoutingStateTests(unittest.TestCase):
             return lambda state: state.__setitem__("policy_version", value)
 
         mutations = [
-            *( (f"schema {value!r}", schema(value)) for value in (True, 1.0, "4", None, 0, 6) ),
-            *( (f"policy {value!r}", policy(value)) for value in (True, 4.0, "4", None, 0, 6, 3) ),
+            *( (f"schema {value!r}", schema(value)) for value in (True, 1.0, "7", None, 0, 8) ),
+            *( (f"policy {value!r}", policy(value)) for value in (True, 7.0, "7", None, 0, 8, 3) ),
             ("missing top key", lambda state: state.pop("managed_by")),
             ("extra top key", lambda state: state.__setitem__("future", True)),
             ("wrong owner", lambda state: state.__setitem__("managed_by", "other")),
             ("empty config path", lambda state: state.__setitem__("config_file", "")),
+            ("missing preset", lambda state: state.pop("preset")),
+            ("preset boolean", lambda state: state.__setitem__("preset", True)),
+            ("preset unknown", lambda state: state.__setitem__("preset", "future")),
             ("missing managed key", lambda state: state["managed"].pop("metadata")),
             ("extra managed key", lambda state: state["managed"].update(future=True)),
             ("missing previous key", lambda state: state["previous"].pop("mode")),
@@ -260,6 +297,242 @@ class RoutingStateTests(unittest.TestCase):
         with self.assertRaises(STATE.RoutingStateError):
             STATE.validate_routing_state(legacy)
 
+    def test_schema_six_preset_route_is_sealed(self) -> None:
+        state = genuine_state(6)
+        state["preset"] = STATE.TERRA_LUNA_SOL_ESCALATION_PRESET
+        state["executor"] = {
+            "kind": "model",
+            "model": STATE.TERRA_LUNA_SOL_ESCALATION_EXECUTOR_MODEL,
+            "effort": STATE.TERRA_LUNA_SOL_ESCALATION_EXECUTOR_EFFORT,
+        }
+        state["planner"] = None
+        state["advisor"] = None
+        state["designer"] = None
+        for server in state["managed"].get("mcp", {}):
+            state["managed"]["mcp"][server] = False
+        self.assertIs(STATE.validate_routing_state(state), state)
+
+        mutations = {
+            "wrong executor effort": lambda value: value["executor"].update(
+                effort="high"
+            ),
+            "planner route": lambda value: value.update(
+                planner={"kind": "model", "model": "gpt-planner", "effort": "high"}
+            ),
+            "advisor route": lambda value: value.update(
+                advisor={"kind": "model", "model": "gpt-advisor", "effort": "high"}
+            ),
+            "designer route": lambda value: value.update(
+                designer={"kind": "model", "model": "gpt-designer", "effort": "high"}
+            ),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                invalid = deepcopy(state)
+                mutate(invalid)
+                with self.assertRaises(STATE.RoutingStateError):
+                    STATE.validate_routing_state(invalid)
+
+    def test_schema_seven_preset_subagent_route_is_sealed(self) -> None:
+        state = genuine_state(7)
+        state["preset"] = STATE.TERRA_LUNA_SOL_ESCALATION_PRESET
+        state["executor"] = {
+            "kind": "model",
+            "model": STATE.TERRA_LUNA_SOL_ESCALATION_EXECUTOR_MODEL,
+            "effort": STATE.TERRA_LUNA_SOL_ESCALATION_EXECUTOR_EFFORT,
+        }
+        state["planner"] = None
+        state["advisor"] = None
+        state["designer"] = None
+        for server in state["managed"].get("mcp", {}):
+            state["managed"]["mcp"][server] = False
+        state["managed"]["subagent"] = {
+            "feature_enabled": True,
+            "agents_enabled": True,
+            "model": STATE.TERRA_LUNA_SOL_ESCALATION_EXECUTOR_MODEL,
+            "effort": STATE.TERRA_LUNA_SOL_ESCALATION_EXECUTOR_EFFORT,
+        }
+        state["previous"]["subagent"] = {
+            "feature_enabled": snapshot(False, present=True),
+            "agents_enabled": snapshot(),
+            "model": snapshot(),
+            "effort": snapshot(),
+            "agents_table_was_absent": True,
+        }
+        self.assertIs(STATE.validate_routing_state(state), state)
+
+        mutations = {
+            "missing subagent managed": lambda value: value["managed"].pop(
+                "subagent"
+            ),
+            "missing subagent restore": lambda value: value["previous"].pop(
+                "subagent"
+            ),
+            "wrong feature value": lambda value: value["managed"]["subagent"].update(
+                feature_enabled=False
+            ),
+            "wrong agents value": lambda value: value["managed"]["subagent"].update(
+                agents_enabled=False
+            ),
+            "wrong default model": lambda value: value["managed"]["subagent"].update(
+                model="gpt-5.6-terra"
+            ),
+            "wrong default effort": lambda value: value["managed"]["subagent"].update(
+                effort="high"
+            ),
+            "unknown subagent field": lambda value: value["managed"]["subagent"].update(
+                future=True
+            ),
+            "unknown restore field": lambda value: value["previous"]["subagent"].update(
+                future=True
+            ),
+            "table ownership wrong type": lambda value: value["previous"][
+                "subagent"
+            ].update(agents_table_was_absent=1),
+            "absent table had agent enabled": lambda value: value["previous"][
+                "subagent"
+            ].update(agents_enabled=snapshot(False, present=True)),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                invalid = deepcopy(state)
+                mutate(invalid)
+                with self.assertRaises(STATE.RoutingStateError):
+                    STATE.validate_routing_state(invalid)
+
+    def test_schema_six_variants_are_disambiguated_and_cross_features_rejected(self) -> None:
+        token = genuine_state(5)
+        token.update(schema=6, policy_version=6, token_profile="balanced")
+        self.assertIs(STATE.validate_routing_state(token), token)
+
+        token_with_overrides = deepcopy(token)
+        token_with_overrides["managed"]["model_overrides"] = True
+        token_with_overrides["previous"]["model_overrides"] = snapshot(
+            False, present=True
+        )
+        self.assertIs(STATE.validate_routing_state(token_with_overrides), token_with_overrides)
+
+        preset = genuine_state(6)
+        self.assertIs(STATE.validate_routing_state(preset), preset)
+
+        neither = genuine_state(5)
+        neither.update(schema=6, policy_version=6)
+        with self.assertRaises(STATE.RoutingStateError):
+            STATE.validate_routing_state(neither)
+
+        both = deepcopy(token)
+        both["preset"] = None
+        with self.assertRaises(STATE.RoutingStateError):
+            STATE.validate_routing_state(both)
+
+        token_with_subagent = deepcopy(token)
+        token_with_subagent["managed"]["subagent"] = {}
+        token_with_subagent["previous"]["subagent"] = {}
+        with self.assertRaises(STATE.RoutingStateError):
+            STATE.validate_routing_state(token_with_subagent)
+
+        preset_with_profile = deepcopy(preset)
+        preset_with_profile["token_profile"] = "lean"
+        with self.assertRaises(STATE.RoutingStateError):
+            STATE.validate_routing_state(preset_with_profile)
+
+        preset_with_overrides = deepcopy(preset)
+        preset_with_overrides["managed"]["model_overrides"] = True
+        preset_with_overrides["previous"]["model_overrides"] = snapshot()
+        with self.assertRaises(STATE.RoutingStateError):
+            STATE.validate_routing_state(preset_with_overrides)
+
+    def test_schema_seven_rejects_token_profile_and_model_overrides(self) -> None:
+        token = genuine_state(7)
+        token["token_profile"] = "balanced"
+        with self.assertRaises(STATE.RoutingStateError):
+            STATE.validate_routing_state(token)
+
+        overrides = genuine_state(7)
+        overrides["managed"]["model_overrides"] = True
+        overrides["previous"]["model_overrides"] = snapshot()
+        with self.assertRaises(STATE.RoutingStateError):
+            STATE.validate_routing_state(overrides)
+
+    def test_schema_eight_combines_nullable_profile_preset_and_paired_controls(self) -> None:
+        state = genuine_state(8)
+        self.assertIs(STATE.validate_routing_state(state), state)
+
+        profiled = deepcopy(state)
+        profiled["token_profile"] = "quality"
+        self.assertIs(STATE.validate_routing_state(profiled), profiled)
+
+        overrides = deepcopy(profiled)
+        overrides["managed"]["model_overrides"] = True
+        overrides["previous"]["model_overrides"] = snapshot(False, present=True)
+        overrides["scalar_origin"] = True
+        overrides["managed_feature"] = {
+            "enabled": True,
+            "hide_spawn_agent_metadata": False,
+            "tool_namespace": STATE.ROUTING_TOOL_NAMESPACE,
+            "multi_agent_mode_hint_text": overrides["managed"]["mode"],
+            "usage_hint_text": overrides["managed"]["usage"],
+            STATE.NATIVE_MODEL_OVERRIDE_FIELD: True,
+        }
+        self.assertIs(STATE.validate_routing_state(overrides), overrides)
+
+        preset = configured_preset_state(8)
+        self.assertIs(STATE.validate_routing_state(preset), preset)
+
+        preset["token_profile"] = "lean"
+        self.assertIs(STATE.validate_routing_state(preset), preset)
+
+        preset_with_overrides = deepcopy(preset)
+        preset_with_overrides["managed"]["model_overrides"] = True
+        preset_with_overrides["previous"]["model_overrides"] = snapshot(
+            False, present=True
+        )
+        self.assertIs(STATE.validate_routing_state(preset_with_overrides), preset_with_overrides)
+
+        missing_subagent = deepcopy(configured_preset_state(8))
+        missing_subagent["managed"].pop("subagent")
+        missing_subagent["previous"].pop("subagent")
+        with self.assertRaises(STATE.RoutingStateError):
+            STATE.validate_routing_state(missing_subagent)
+
+        nonpreset_subagent = genuine_state(8)
+        nonpreset_subagent["managed"]["subagent"] = {}
+        nonpreset_subagent["previous"]["subagent"] = {}
+        with self.assertRaises(STATE.RoutingStateError):
+            STATE.validate_routing_state(nonpreset_subagent)
+
+        invalid_profiles = ("", "future", 1, True)
+        for profile in invalid_profiles:
+            with self.subTest(profile=profile):
+                invalid = deepcopy(state)
+                invalid["token_profile"] = profile
+                with self.assertRaises(STATE.RoutingStateError):
+                    STATE.validate_routing_state(invalid)
+
+    def test_schema_eight_shape_type_and_unknown_field_rejections(self) -> None:
+        baseline = genuine_state(8)
+        mutations = (
+            lambda state: state.pop("token_profile"),
+            lambda state: state.pop("preset"),
+            lambda state: state.update(future=True),
+            lambda state: state["managed"].update(future=True),
+            lambda state: state["previous"].update(future=True),
+        )
+        for mutate in mutations:
+            with self.subTest(mutate=mutate):
+                invalid = deepcopy(baseline)
+                mutate(invalid)
+                with self.assertRaises(STATE.RoutingStateError):
+                    STATE.validate_routing_state(invalid)
+
+        for field in ("schema", "policy_version"):
+            for invalid_value in (True, 8.0, "8", None, 7, 9):
+                with self.subTest(field=field, value=invalid_value):
+                    invalid = deepcopy(baseline)
+                    invalid[field] = invalid_value
+                    with self.assertRaises(STATE.RoutingStateError):
+                        STATE.validate_routing_state(invalid)
+
     def test_reserved_claude_models_cannot_use_generic_model_routes(self) -> None:
         seats_by_schema = {
             1: ("executor", "advisor"),
@@ -267,6 +540,9 @@ class RoutingStateTests(unittest.TestCase):
             3: ("executor", "planner", "advisor"),
             4: ("executor", "planner", "advisor", "designer"),
             5: ("executor", "planner", "advisor", "designer"),
+            6: ("executor", "planner", "advisor", "designer"),
+            7: ("executor", "planner", "advisor", "designer"),
+            8: ("executor", "planner", "advisor", "designer"),
         }
         for schema, seats in seats_by_schema.items():
             for seat in seats:
@@ -332,6 +608,15 @@ class RoutingStateTests(unittest.TestCase):
             legacy = genuine_state(schema)
             legacy["designer"] = None
             scenarios.append((f"schema {schema} designer", legacy))
+        for schema in (1, 2, 3, 4, 5):
+            legacy = genuine_state(schema)
+            legacy["preset"] = None
+            scenarios.append((f"schema {schema} preset", legacy))
+        for schema in (1, 2, 3, 4, 5, 6):
+            legacy = genuine_state(schema)
+            legacy["managed"]["subagent"] = {}
+            legacy["previous"]["subagent"] = {}
+            scenarios.append((f"schema {schema} subagent", legacy))
 
         for label, state in scenarios:
             with self.subTest(label=label), self.assertRaises(STATE.RoutingStateError):

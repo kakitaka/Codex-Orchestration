@@ -266,7 +266,7 @@ class PackagingTests(unittest.TestCase):
 
         self.assertEqual(manifest["name"], "codex-orchestration")
         self.assertEqual(manifest["skills"], "./skills/")
-        self.assertEqual(manifest["version"], "0.10.0")
+        self.assertEqual(manifest["version"], "0.11.0")
         self.assertEqual(manifest["mcpServers"], "./.mcp.json")
         self.assertRegex(
             manifest["version"],
@@ -289,7 +289,8 @@ class PackagingTests(unittest.TestCase):
         self.assertFalse((SKILL_ROOT / "scripts" / "update_plugin.py").exists())
         self.assertIn("config/batchWrite", native.read_text(encoding="utf-8"))
         self.assertIn('"--repair"', native.read_text(encoding="utf-8"))
-        self.assertIn('"version": "0.10.0"', native.read_text(encoding="utf-8"))
+        self.assertIn('PLUGIN_VERSION = "0.11.0"', native.read_text(encoding="utf-8"))
+        self.assertIn('"version": "0.11.0"', native.read_text(encoding="utf-8"))
         self.assertIn("validate_routing_state", routing_state.read_text(encoding="utf-8"))
         self.assertIn("Standalone custom agent", custom.read_text(encoding="utf-8"))
 
@@ -463,6 +464,9 @@ class PackagingTests(unittest.TestCase):
         self.assertIn("available or callable as Designer", skill)
         self.assertIn("is Kimi available to use as Designer?", readme)
         self.assertIn(f"{invocation} setup executor:", readme)
+        self.assertIn(
+            f"{invocation} setup preset: Terra-Luna-Sol Escalation", readme
+        )
         self.assertIn("GPT-5.6 Luna Extra High", readme)
         self.assertIn(f"{invocation} create project role:", readme)
         self.assertIn(f"{invocation} status", readme)
@@ -507,6 +511,10 @@ class PackagingTests(unittest.TestCase):
         for prompt in prompts:
             self.assertTrue(prompt.strip())
             self.assertLessEqual(len(prompt), 128, prompt)
+        self.assertIn(
+            "$codex-orchestration:codex-orchestration setup preset: Terra-Luna-Sol Escalation",
+            prompts,
+        )
 
         metadata = (SKILL_ROOT / "agents" / "openai.yaml").read_text(encoding="utf-8")
         prompt_line = next(
@@ -530,7 +538,7 @@ class PackagingTests(unittest.TestCase):
         self.assertIn("@openai/codex@0.144.1", workflow)
         smoke_text = smoke.read_text(encoding="utf-8")
         self.assertIn('OLD_VERSION = "0.5.0"', smoke_text)
-        self.assertIn('NEW_VERSION = "0.10.0"', smoke_text)
+        self.assertIn('NEW_VERSION = "0.11.0"', smoke_text)
         self.assertIn("old Advisor-only cache unexpectedly supports Planner", smoke_text)
         self.assertIn("Upgraded installed skill is missing Planner contract", smoke_text)
         self.assertIn("reused the Advisor-only 0.5.0 cache directory", smoke_text)

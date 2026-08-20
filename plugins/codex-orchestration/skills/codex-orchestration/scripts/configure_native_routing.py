@@ -32,6 +32,15 @@ from routing_state import (
     OPUS_MODEL,
     ROUTING_TOOL_NAMESPACE,
     RoutingStateError,
+    TERRA_LUNA_SOL_ESCALATION_ADVISOR_EFFORT,
+    TERRA_LUNA_SOL_ESCALATION_ADVISOR_MODEL,
+    TERRA_LUNA_SOL_ESCALATION_EXECUTOR_EFFORT,
+    TERRA_LUNA_SOL_ESCALATION_EXECUTOR_MODEL,
+    TERRA_LUNA_SOL_ESCALATION_MULTI_AGENT_ENABLED,
+    TERRA_LUNA_SOL_ESCALATION_PRESET,
+    TERRA_LUNA_SOL_ESCALATION_ROOT_EFFORT,
+    TERRA_LUNA_SOL_ESCALATION_ROOT_MODEL,
+    TERRA_LUNA_SOL_ESCALATION_SUBAGENT_ENABLED,
     validate_routing_state,
 )
 from token_profiles import (
@@ -47,9 +56,12 @@ except ModuleNotFoundError as exc:  # pragma: no cover - Python < 3.11
     raise SystemExit("Python 3.11 or newer is required (missing tomllib).") from exc
 
 
-POLICY_VERSION = 5
-STATE_SCHEMA = 5
-PROFILE_STATE_SCHEMA = 6
+PLUGIN_VERSION = "0.11.0"
+POLICY_VERSION = 8
+STATE_SCHEMA = 8
+TOKEN_PROFILE_STATE_SCHEMA = 6
+PROFILE_STATE_SCHEMA = 6  # public compatibility constant used by token lint
+PRESET_STATE_SCHEMA = 7
 ADVISOR_REVIEW_LIMIT = 8
 STATE_FILENAME = ".codex-orchestration-routing.json"
 PROBE_VALUE = "CODEX_ORCHESTRATION_CAPABILITY_PROBE"
@@ -80,6 +92,12 @@ CUSTOM_AGENT_MANAGED_MARKER = (
     "# Managed by codex-orchestration. Standalone custom agent v2."
 )
 MISSING = object()
+PRESET_SUBAGENT_KEY_PATHS = {
+    "feature_enabled": "features.multi_agent",
+    "agents_enabled": "agents.enabled",
+    "model": "agents.default_subagent_model",
+    "effort": "agents.default_subagent_reasoning_effort",
+}
 
 
 class ConfigurationError(RuntimeError):
@@ -173,8 +191,16 @@ def parse_args() -> argparse.Namespace:
         "--token-profile",
         choices=PROFILE_NAMES,
         help=(
-            "Optional token budget profile. Omitting this option preserves the "
-            "legacy schema, or an already saved schema-6 profile."
+            "Optional token budget profile. Omitting this option preserves an "
+            "already saved profile; new state records a nullable profile."
+        ),
+    )
+    parser.add_argument(
+        "--preset",
+        choices=(TERRA_LUNA_SOL_ESCALATION_PRESET,),
+        help=(
+            "Apply a reviewed routing preset. Presets cannot be combined with "
+            "direct seat settings."
         ),
     )
 
@@ -231,7 +257,6 @@ def _validate_args(args: argparse.Namespace) -> None:
             args.planner_effort != "auto",
             args.advisor_effort != "auto",
             args.designer_effort != "auto",
-            getattr(args, "token_profile", None) is not None,
         )
     )
     for action, selected in (
@@ -239,16 +264,31 @@ def _validate_args(args: argparse.Namespace) -> None:
         ("--repair", args.repair),
         ("--disable", args.disable),
     ):
-        if selected and seat_settings:
-            raise ConfigurationError(f"{action} does not accept seat settings.")
+        if selected and (seat_settings or args.preset or args.token_profile):
+            raise ConfigurationError(
+                f"{action} does not accept seat settings, presets, or token profiles."
+            )
+    if args.preset and seat_settings:
+        raise ConfigurationError(
+            "--preset cannot be combined with direct seat settings or efforts."
+        )
+    if args.preset and args.confirm_unlisted_models:
+        raise ConfigurationError(
+            "--preset requires catalog-confirmed model capability; "
+            "--confirm-unlisted-models is not allowed."
+        )
     if args.repair and (
         args.replace_existing_policy or args.confirm_unlisted_models
     ):
         raise ConfigurationError(
             "--repair cannot be combined with setup replacement or model controls."
         )
-    if not args.status and not args.repair and not args.disable and not (
-        args.executor_model or args.executor_agent
+    if (
+        not args.status
+        and not args.repair
+        and not args.disable
+        and not args.preset
+        and not (args.executor_model or args.executor_agent)
     ):
         raise ConfigurationError(
             "Setup requires --executor-model or --executor-agent. "
@@ -369,36 +409,57 @@ def binary_version(binary: Path) -> str:
     return output or f"exit {result.returncode}"
 
 
-def supports_native_policy(binary: Path) -> tuple[bool, str]:
+def supports_native_policy(
+    binary: Path, *, require_luna_subagent_defaults: bool = False
+) -> tuple[bool, str]:
     """Capability-detect the structured field without reading the user's config."""
 
     with tempfile.TemporaryDirectory(prefix="codex-orchestration-probe-") as home:
         env = os.environ.copy()
         env["CODEX_HOME"] = home
+        command = [
+            str(binary),
+            "-c",
+            "features.multi_agent_v2.hide_spawn_agent_metadata=false",
+            "-c",
+            (
+                "features.multi_agent_v2.tool_namespace="
+                f'"{ROUTING_TOOL_NAMESPACE}"'
+            ),
+            "-c",
+            (
+                "features.multi_agent_v2.multi_agent_mode_hint_text="
+                f'"{PROBE_VALUE}"'
+            ),
+            "-c",
+            (
+                "features.multi_agent_v2.usage_hint_text="
+                f'"{PROBE_VALUE}"'
+            ),
+        ]
+        if require_luna_subagent_defaults:
+            command.extend(
+                (
+                    "-c",
+                    "features.multi_agent=true",
+                    "-c",
+                    "agents.enabled=true",
+                    "-c",
+                    (
+                        "agents.default_subagent_model="
+                        f'"{TERRA_LUNA_SOL_ESCALATION_EXECUTOR_MODEL}"'
+                    ),
+                    "-c",
+                    (
+                        "agents.default_subagent_reasoning_effort="
+                        f'"{TERRA_LUNA_SOL_ESCALATION_EXECUTOR_EFFORT}"'
+                    ),
+                )
+            )
+        command.extend(("features", "list"))
         try:
             result = subprocess.run(
-                [
-                    str(binary),
-                    "-c",
-                    "features.multi_agent_v2.hide_spawn_agent_metadata=false",
-                    "-c",
-                    (
-                        "features.multi_agent_v2.tool_namespace="
-                        f'"{ROUTING_TOOL_NAMESPACE}"'
-                    ),
-                    "-c",
-                    (
-                        "features.multi_agent_v2.multi_agent_mode_hint_text="
-                        f'"{PROBE_VALUE}"'
-                    ),
-                    "-c",
-                    (
-                        "features.multi_agent_v2.usage_hint_text="
-                        f'"{PROBE_VALUE}"'
-                    ),
-                    "features",
-                    "list",
-                ],
+                command,
                 env=env,
                 text=True,
                 stdout=subprocess.PIPE,
@@ -547,7 +608,7 @@ class AppServer:
                     "clientInfo": {
                         "name": "codex_orchestration_installer",
                         "title": "Codex Orchestration Installer",
-                        "version": "0.10.0",
+                        "version": "0.11.0",
                     },
                     "capabilities": {"experimentalApi": True},
                 },
@@ -947,6 +1008,8 @@ def resolve_model_effort(
     effort: str,
     catalog: dict[str, dict[str, Any]],
     confirm_unlisted: bool,
+    *,
+    require_catalog_effort: bool = False,
 ) -> str:
     item = catalog.get(model)
     if item is None:
@@ -959,14 +1022,21 @@ def resolve_model_effort(
                 f"{label} effort must be explicit when using an unlisted model."
             )
         return effort
+    raw_supported = item.get("supportedReasoningEfforts")
     supported = {
-        option.get("reasoningEffort")
-        for option in item.get("supportedReasoningEfforts", [])
+        candidate
+        for option in (raw_supported if isinstance(raw_supported, list) else [])
         if isinstance(option, dict)
+        if isinstance((candidate := option.get("reasoningEffort")), str) and candidate
     }
     resolved = item.get("defaultReasoningEffort") if effort == "auto" else effort
     if not isinstance(resolved, str) or not resolved:
         raise ConfigurationError(f"Could not resolve {label} effort for {model!r}.")
+    if require_catalog_effort and not supported:
+        raise ConfigurationError(
+            f"{label} model {model!r} did not publish a usable reasoning-effort "
+            "catalog; refusing to infer the required effort."
+        )
     if supported and resolved not in supported:
         values = ", ".join(sorted(value for value in supported if isinstance(value, str)))
         raise ConfigurationError(
@@ -1216,6 +1286,7 @@ def build_policy(
     advisor: dict[str, Any] | None,
     designer: dict[str, Any] | None = None,
     token_profile: str | TokenProfile | None = None,
+    preset: str | None = None,
 ) -> tuple[str, str]:
     profile = get_profile(token_profile)
     review_limit = (
@@ -1265,6 +1336,33 @@ def build_policy(
         if has_direct_route
         else "Configured custom agents and MCP seats own their provider routes."
     )
+    preset_mode = ""
+    preset_usage = ""
+    if preset is not None:
+        if preset != TERRA_LUNA_SOL_ESCALATION_PRESET:
+            raise ConfigurationError(f"Unsupported routing preset: {preset!r}.")
+        expected_executor = {
+            "kind": "model",
+            "model": TERRA_LUNA_SOL_ESCALATION_EXECUTOR_MODEL,
+            "effort": TERRA_LUNA_SOL_ESCALATION_EXECUTOR_EFFORT,
+        }
+        if (
+            executor != expected_executor
+            or planner is not None
+            or advisor is not None
+            or designer is not None
+        ):
+            raise ConfigurationError("Preset routes do not match their sealed contract.")
+        preset_mode = f"""Preset {TERRA_LUNA_SOL_ESCALATION_PRESET} expects {TERRA_LUNA_SOL_ESCALATION_ROOT_MODEL}@{TERRA_LUNA_SOL_ESCALATION_ROOT_EFFORT} as the task-start root. This expectation is not persisted as a root setting and is not runtime verification.
+
+Normal work has no Advisor approval loop and must not invoke {TERRA_LUNA_SOL_ESCALATION_ADVISOR_MODEL}. A fresh {TERRA_LUNA_SOL_ESCALATION_ADVISOR_MODEL}@{TERRA_LUNA_SOL_ESCALATION_ADVISOR_EFFORT} Advisor may be used only for security, authentication, or secret handling; DB schema or destructive migration; public API or backward-compatibility risk; cross-subsystem architecture change; repeated implementation or test failures; unresolved root cause; high-risk release; or explicit user request. This is an instruction-guided escalation route, not a persisted Advisor seat or technical access-control boundary.
+
+The preset enables Codex multi-agent tools and saves {TERRA_LUNA_SOL_ESCALATION_EXECUTOR_MODEL}@{TERRA_LUNA_SOL_ESCALATION_EXECUTOR_EFFORT} as the default subagent route. That default is same-provider only, is not an allowlist, and does not prove a live child until one is spawned without an explicit model or effort override.
+
+The preset imposes no worker or concurrency limit. It does not add, remove, or change platform or user concurrency settings."""
+        preset_usage = f"""Preset {TERRA_LUNA_SOL_ESCALATION_PRESET}: Codex resolves delegated implementation to the saved {TERRA_LUNA_SOL_ESCALATION_EXECUTOR_MODEL}@{TERRA_LUNA_SOL_ESCALATION_EXECUTOR_EFFORT} default. Do not invoke {TERRA_LUNA_SOL_ESCALATION_ADVISOR_MODEL} during normal planning.
+
+Only for security/auth/secrets, DB schema or destructive migration, public API or backward-compatibility risk, cross-subsystem architecture, repeated implementation/test failures, unresolved root cause, high-risk release, or an explicit user request, the root may create one fresh Advisor call with model = {json.dumps(TERRA_LUNA_SOL_ESCALATION_ADVISOR_MODEL)}, reasoning_effort = {json.dumps(TERRA_LUNA_SOL_ESCALATION_ADVISOR_EFFORT)}, fork_turns = \"none\". Immediately before that call, verify the same provider and current callable capability on the exposed child interface. If either check fails, report the route unavailable and never substitute another model."""
     planner_mode = (
         "When a plan is needed, the configured Planner drafts it and handles any "
         "Advisor-requested revision. The root supplies a self-contained packet, owns "
@@ -1273,22 +1371,28 @@ def build_policy(
         if planner is not None
         else "No Planner is configured. The root drafts and revises every plan."
     )
-    advisor_mode = (
-        "For a non-trivial plan, the root sends a fresh self-contained review call "
-        "to the configured Advisor before Executor work. PLAN_APPROVED ends review "
-        "early. PLAN_REVISE returns the canonical current plan and version, the "
-        "latest critique, and the cumulative findings ledger to the same configured "
-        "Planner route, or to the root when Planner is omitted, then reviews the "
-        "revised plan again. There may be at most "
-        f"{advisor_review_limit} total Advisor reviews."
-        if advisor is not None
-        else (
+    if preset is not None:
+        advisor_mode = (
+            "This preset configures no Advisor seat. Normal work must not create an "
+            "Advisor approval loop; the root plans, validates, and releases Executor work."
+        )
+    elif advisor is not None:
+        advisor_mode = (
+            "For a non-trivial plan, the root sends a fresh self-contained review call "
+            "to the configured Advisor before Executor work. PLAN_APPROVED ends review "
+            "early. PLAN_REVISE returns the canonical current plan and version, the "
+            "latest critique, and the cumulative findings ledger to the same configured "
+            "Planner route, or to the root when Planner is omitted, then reviews the "
+            "revised plan again. There may be at most "
+            f"{advisor_review_limit} total Advisor reviews."
+        )
+    else:
+        advisor_mode = (
             "No Advisor is configured. Do not create a review loop; after a configured "
             "Planner drafts, the root validates the plan before releasing Executor work."
             if planner is not None
             else "No Advisor is configured. Do not create an Advisor review step."
         )
-    )
     designer_mode = (
         "After any required plan approval, the root may send bounded visual, UX, "
         "interaction, information-architecture, or design-system work to the "
@@ -1304,6 +1408,13 @@ def build_policy(
             "them through ordinary bounded Executor work when useful."
         )
     )
+    advisor_protocol = (
+        f"""The root owns the plan version, cumulative findings ledger, review count, validation, adjudication, and release to Executor. There is no Finalizer seat. {review_rounds_instruction} Reject a stale plan version or an invalid or incomplete ledger and halt before Executor.
+
+On PLAN_REVISE, record the latest finding IDs before revision. After the Planner returns, validate and merge each INCORPORATED or reasoned REJECTED disposition into the cumulative ledger before another Advisor call. {review_limit_instruction} and produces a non-approval artifact containing the latest plan and version, full ledger, latest findings, and choices available to the user. It must not claim approval. Any required Planner or Advisor route failure also halts before Executor. Only an explicit current-task best-effort instruction changes failure handling: Planner failure permits the root to take over planning for the remaining rounds; Advisor failure may proceed only with the result labeled NOT_ADVISOR_APPROVED. No best-effort setting is persisted."""
+        if preset is None
+        else "There is no Finalizer seat. This preset creates no normal Advisor record, review count, or approval gate. The root owns planning, validation, escalation decisions, and Executor release."
+    )
     mode = f"""{MANAGED_MARKER}
 This adds model routing to Codex's existing multi-agent flow; it is not a second scheduler.
 
@@ -1313,11 +1424,11 @@ If you are the root task model, you are the orchestrator. Own intent, planning, 
 
 {advisor_mode}
 
+{preset_mode}
+
 {designer_mode}
 
-The root owns the plan version, cumulative findings ledger, review count, validation, adjudication, and release to Executor. There is no Finalizer seat. {review_rounds_instruction} Reject a stale plan version or an invalid or incomplete ledger and halt before Executor.
-
-On PLAN_REVISE, record the latest finding IDs before revision. After the Planner returns, validate and merge each INCORPORATED or reasoned REJECTED disposition into the cumulative ledger before another Advisor call. {review_limit_instruction} and produces a non-approval artifact containing the latest plan and version, full ledger, latest findings, and choices available to the user. It must not claim approval. Any required Planner or Advisor route failure also halts before Executor. Only an explicit current-task best-effort instruction changes failure handling: Planner failure permits the root to take over planning for the remaining rounds; Advisor failure may proceed only with the result labeled NOT_ADVISOR_APPROVED. No best-effort setting is persisted.
+{advisor_protocol}
 
 When executor delegation materially improves speed, cost, quality, or context isolation, use only the configured executor route. Give each executor one bounded, self-contained packet with objective, relevant facts, constraints, owned files or read-only scope, dependencies, acceptance criteria, verification, and handoff format. Inspect every handoff, integrate it, and run final checks yourself.
 
@@ -1374,10 +1485,23 @@ Planner and Advisor are policy-isolated, root-directed seats: they cannot contac
         )
     else:
         designer_hint = "No Designer route is configured."
+    executor_hint = (
+        "For delegated executor work, call the exposed spawn tool with "
+        'fork_turns = "none" and omit model and reasoning_effort so the saved '
+        "Luna default-subagent route resolves. Send a self-contained task packet."
+        if preset is not None
+        else (
+            "For delegated executor work, call this tool with "
+            f"{_spawn_route(executor)}, fork_turns = \"none\". Send a self-contained "
+            "task packet."
+        )
+    )
     usage = f"""{MANAGED_MARKER}
 If you are the root task model, you are the orchestrator. Apply these routes only to children you decide to create.
 
-For delegated executor work, call this tool with {_spawn_route(executor)}, fork_turns = "none". Send a self-contained task packet.
+{preset_usage}
+
+{executor_hint}
 
 {planner_hint}
 
@@ -1407,12 +1531,18 @@ If you are a spawned child, do not call this tool or create descendants. Finish 
 
 
 def _compatibility_report(
-    binaries: list[Path], allow_incompatible: bool
+    binaries: list[Path],
+    allow_incompatible: bool,
+    *,
+    require_luna_subagent_defaults: bool = False,
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     incompatible: list[str] = []
     for binary in binaries:
-        supported, detail = supports_native_policy(binary)
+        supported, detail = supports_native_policy(
+            binary,
+            require_luna_subagent_defaults=require_luna_subagent_defaults,
+        )
         overrides_supported, overrides_detail = supports_native_model_overrides(binary)
         version = binary_version(binary)
         results.append(
@@ -1425,16 +1555,31 @@ def _compatibility_report(
                 "model_overrides_detail": overrides_detail,
             }
         )
-        state = "supports native policy" if supported else f"incompatible: {detail}"
+        label = (
+            "supports native policy and Luna defaults"
+            if require_luna_subagent_defaults
+            else "supports native policy"
+        )
+        state = label if supported else f"incompatible: {detail}"
         print(f"Client: {binary} ({version}) - {state}")
         if not supported:
             incompatible.append(f"{binary} ({version})")
-    if incompatible and not allow_incompatible:
+    if incompatible and (require_luna_subagent_defaults or not allow_incompatible):
         joined = ", ".join(incompatible)
+        requirement = (
+            "Luna default-subagent profile"
+            if require_luna_subagent_defaults
+            else "Native setup"
+        )
+        next_step = (
+            "do not apply this profile."
+            if require_luna_subagent_defaults
+            else "repeat only after explicit approval with --allow-incompatible-client."
+        )
         raise ConfigurationError(
-            "Native setup would make the shared config unreadable to: "
+            f"{requirement} would make the shared config unreadable to: "
             f"{joined}. Update those clients, use the per-task skill fallback, or "
-            "repeat only after explicit approval with --allow-incompatible-client."
+            f"{next_step}"
         )
     return results
 
@@ -1459,6 +1604,15 @@ def _current_values(config: dict[str, Any]) -> dict[str, Any]:
             "features",
             "multi_agent_v2",
             NATIVE_MODEL_OVERRIDE_FIELD,
+        ),
+        "multi_agent_enabled": nested_get(config, "features", "multi_agent"),
+        "agents": nested_get(config, "agents"),
+        "agents_enabled": nested_get(config, "agents", "enabled"),
+        "subagent_model": nested_get(
+            config, "agents", "default_subagent_model"
+        ),
+        "subagent_effort": nested_get(
+            config, "agents", "default_subagent_reasoning_effort"
         ),
         "mcp": {
             server: nested_get(
@@ -1495,7 +1649,166 @@ def _strict_equal(left: Any, right: Any) -> bool:
     return left == right
 
 
-def _managed_matches(state: dict[str, Any], current: dict[str, Any]) -> bool:
+def _preset_subagent_managed() -> dict[str, Any]:
+    return {
+        "feature_enabled": TERRA_LUNA_SOL_ESCALATION_MULTI_AGENT_ENABLED,
+        "agents_enabled": TERRA_LUNA_SOL_ESCALATION_SUBAGENT_ENABLED,
+        "model": TERRA_LUNA_SOL_ESCALATION_EXECUTOR_MODEL,
+        "effort": TERRA_LUNA_SOL_ESCALATION_EXECUTOR_EFFORT,
+    }
+
+
+def _validate_preset_subagent_values(current: dict[str, Any]) -> None:
+    """Reject malformed controls instead of coercing a user-owned setting."""
+
+    agents = current["agents"]
+    if agents is not MISSING and not isinstance(agents, dict):
+        raise ConfigurationError(
+            "The existing [agents] setting is not a table; refusing to replace it."
+        )
+    expected_types = {
+        "multi_agent_enabled": bool,
+        "agents_enabled": bool,
+        "subagent_model": str,
+        "subagent_effort": str,
+    }
+    for key, expected_type in expected_types.items():
+        value = current[key]
+        if value is not MISSING and type(value) is not expected_type:
+            raise ConfigurationError(
+                f"Existing {key} has an invalid type; refusing to replace it."
+            )
+
+
+def _preset_subagent_previous(current: dict[str, Any]) -> dict[str, Any]:
+    _validate_preset_subagent_values(current)
+    return {
+        "feature_enabled": snapshot(current["multi_agent_enabled"]),
+        "agents_enabled": snapshot(current["agents_enabled"]),
+        "model": snapshot(current["subagent_model"]),
+        "effort": snapshot(current["subagent_effort"]),
+        "agents_table_was_absent": current["agents"] is MISSING,
+    }
+
+
+def _preset_manages_callable_subagent(state: dict[str, Any]) -> bool:
+    """Return whether this emitted state owns the schema-7 Luna controls."""
+
+    return (
+        state.get("schema") in {PRESET_STATE_SCHEMA, STATE_SCHEMA}
+        and state.get("preset") == TERRA_LUNA_SOL_ESCALATION_PRESET
+    )
+
+
+def _snapshot_matches(value: Any, saved: dict[str, Any]) -> bool:
+    if saved.get("known") is not True:
+        return False
+    if saved.get("present") is False:
+        return value is MISSING
+    return saved.get("present") is True and _strict_equal(value, saved.get("value"))
+
+
+def _preset_subagent_matches(
+    state: dict[str, Any],
+    current: dict[str, Any],
+    *,
+    strict_agents_table: bool,
+) -> bool:
+    managed = state.get("managed")
+    previous = state.get("previous")
+    if not isinstance(managed, dict) or not isinstance(previous, dict):
+        return False
+    subagent = managed.get("subagent")
+    previous_subagent = previous.get("subagent")
+    if not isinstance(subagent, dict) or not isinstance(previous_subagent, dict):
+        return False
+    expected = _preset_subagent_managed()
+    if subagent != expected:
+        return False
+    actual = {
+        "feature_enabled": current["multi_agent_enabled"],
+        "agents_enabled": current["agents_enabled"],
+        "model": current["subagent_model"],
+        "effort": current["subagent_effort"],
+    }
+    if any(not _strict_equal(actual[key], expected[key]) for key in expected):
+        return False
+    if previous_subagent.get("agents_table_was_absent") and strict_agents_table:
+        expected_agents = {
+            "enabled": expected["agents_enabled"],
+            "default_subagent_model": expected["model"],
+            "default_subagent_reasoning_effort": expected["effort"],
+        }
+        return _strict_equal(current["agents"], expected_agents)
+    return True
+
+
+def _preset_subagent_restored(
+    previous: dict[str, Any], current: dict[str, Any]
+) -> bool:
+    saved = previous.get("subagent")
+    if not isinstance(saved, dict):
+        return False
+    if not _snapshot_matches(current["multi_agent_enabled"], saved["feature_enabled"]):
+        return False
+    if saved.get("agents_table_was_absent"):
+        return current["agents"] is MISSING
+    return all(
+        _snapshot_matches(current[current_key], saved[saved_key])
+        for current_key, saved_key in (
+            ("agents_enabled", "agents_enabled"),
+            ("subagent_model", "model"),
+            ("subagent_effort", "effort"),
+        )
+    )
+
+
+def _owned_restore_matches(state: dict[str, Any], current: dict[str, Any]) -> bool:
+    """Verify every known field that disable was authorized to restore."""
+
+    previous = state.get("previous")
+    if not isinstance(previous, dict):
+        return False
+    scalar_origin = state.get("scalar_origin")
+    if isinstance(scalar_origin, bool) and not _strict_equal(
+        current["feature"], scalar_origin
+    ):
+        return False
+    for current_key, snapshot_key in (
+        ("mode", "mode"),
+        ("usage", "usage"),
+        ("metadata", "metadata"),
+        ("namespace", "namespace"),
+    ):
+        saved = previous.get(snapshot_key)
+        if not isinstance(saved, dict):
+            return False
+        if saved.get("known") is True and not _snapshot_matches(
+            current[current_key], saved
+        ):
+            return False
+    previous_mcp = previous.get("mcp")
+    if isinstance(previous_mcp, dict):
+        for server, saved in previous_mcp.items():
+            if not isinstance(saved, dict):
+                return False
+            if saved.get("known") is True and not _snapshot_matches(
+                current["mcp"].get(server, MISSING), saved
+            ):
+                return False
+    if _preset_manages_callable_subagent(state) and not _preset_subagent_restored(
+        previous, current
+    ):
+        return False
+    return True
+
+
+def _managed_matches(
+    state: dict[str, Any],
+    current: dict[str, Any],
+    *,
+    strict_agents_table: bool = True,
+) -> bool:
     managed = state.get("managed")
     base_matches = (
         isinstance(managed, dict)
@@ -1508,6 +1821,12 @@ def _managed_matches(state: dict[str, Any], current: dict[str, Any]) -> bool:
     if not base_matches:
         return False
     if "model_overrides" in managed and current.get("model_overrides") is not True:
+        return False
+    if _preset_manages_callable_subagent(state) and not _preset_subagent_matches(
+        state,
+        current,
+        strict_agents_table=strict_agents_table,
+    ):
         return False
     managed_mcp = managed.get("mcp")
     if managed_mcp is not None and not all(
@@ -1574,6 +1893,35 @@ def _guard_subscription_transition(
     )
 
 
+def _guard_preset_transition(
+    existing_state: dict[str, Any] | None,
+    requested_preset: str | None,
+) -> None:
+    """Require a full restore before crossing the sealed profile boundary."""
+
+    if existing_state is None:
+        return
+    existing_preset = existing_state.get("preset")
+    if existing_preset == requested_preset:
+        if (
+            requested_preset == TERRA_LUNA_SOL_ESCALATION_PRESET
+            and not _preset_manages_callable_subagent(existing_state)
+        ):
+            raise ConfigurationError(
+                "The existing Terra-Luna-Sol preset predates callable Luna defaults. "
+                "Run --disable --apply, then run one fresh preset setup."
+            )
+        return
+    if (
+        existing_preset == TERRA_LUNA_SOL_ESCALATION_PRESET
+        or requested_preset == TERRA_LUNA_SOL_ESCALATION_PRESET
+    ):
+        raise ConfigurationError(
+            "Do not cross the Terra-Luna-Sol preset boundary in place. Run "
+            "--disable --apply, then run one fresh setup."
+        )
+
+
 def _batch_write(
     app: AppServer,
     edits: list[dict[str, Any]],
@@ -1591,6 +1939,19 @@ def _batch_write(
     )
 
 
+def _unmanaged_concurrency_summary(feature: Any) -> str:
+    """Describe a visible inherited cap without treating it as policy state."""
+
+    if not isinstance(feature, dict):
+        return "not set in this configuration layer"
+    value = feature.get("max_concurrent_threads_per_session", MISSING)
+    if value is MISSING:
+        return "not set in this configuration layer"
+    if type(value) is int:
+        return str(value)
+    return "present with a non-integer value"
+
+
 def _status(
     target: Path,
     codex_home: Path | None,
@@ -1599,6 +1960,7 @@ def _status(
 ) -> int:
     clients_compatible = True
     override_capabilities: list[bool] = []
+    preset_clients_compatible = True
     for binary in binaries:
         supported, detail = supports_native_policy(binary)
         override_supported, override_detail = supports_native_model_overrides(binary)
@@ -1638,22 +2000,41 @@ def _status(
             current["usage"]
         )
         state_matches = state is not None and _managed_matches(state, current)
+        profile_installed = (
+            state is not None
+            and state.get("preset") == TERRA_LUNA_SOL_ESCALATION_PRESET
+        )
+        profile_manages_subagent = (
+            state is not None and _preset_manages_callable_subagent(state)
+        )
+        profile_effective_matches = (
+            not profile_manages_subagent
+            or _preset_subagent_matches(
+                state,
+                effective,
+                strict_agents_table=False,
+            )
+        )
         if state is not None and managed_pair and not state_matches:
             routing_state = "managed fields conflict with local restore state"
         elif managed_pair:
             controls_ready = (
                 current["metadata"] is False
                 and current["namespace"] == ROUTING_TOOL_NAMESPACE
+                and (not profile_manages_subagent or state_matches)
             )
-            if not controls_ready:
-                routing_state = "managed hints found but routing controls are incomplete"
-            else:
-                managed_overrides = (
-                    isinstance(state, dict)
-                    and isinstance(state.get("managed"), dict)
-                    and state["managed"].get("model_overrides") is True
+            managed_overrides = (
+                isinstance(state, dict)
+                and isinstance(state.get("managed"), dict)
+                and state["managed"].get("model_overrides") is True
+            )
+            if profile_installed and not profile_manages_subagent:
+                routing_state = (
+                    "installed but legacy preset requires disable and fresh setup"
                 )
-            if controls_ready and (
+            elif not controls_ready:
+                routing_state = "managed hints found but routing controls are incomplete"
+            elif (
                 effective["mode"] == current["mode"]
                 and effective["usage"] == current["usage"]
                 and effective["metadata"] is False
@@ -1662,9 +2043,10 @@ def _status(
                     not managed_overrides
                     or effective["model_overrides"] is True
                 )
+                and profile_effective_matches
             ):
                 routing_state = f"installed and effective in {workspace}"
-            elif controls_ready:
+            else:
                 routing_state = f"installed but overridden in {workspace}"
         elif current["mode"] is MISSING and current["usage"] is MISSING:
             routing_state = "inactive"
@@ -1684,7 +2066,7 @@ def _status(
         print(f"Config: {app.config_path}")
         subscription_available = True
         if state_matches:
-            if state.get("schema") == PROFILE_STATE_SCHEMA:
+            if state.get("token_profile") is not None:
                 print(f"Token profile: {state['token_profile']}")
             print(f"Executor: {_route_summary(state['executor'])}")
             planner = state.get("planner")
@@ -1693,6 +2075,50 @@ def _status(
             print(f"Planner: {_route_summary(planner) if planner else 'root'}")
             print(f"Advisor: {_route_summary(advisor) if advisor else 'none'}")
             print(f"Designer: {_route_summary(designer) if designer else 'none'}")
+            if profile_installed:
+                print(f"Preset: {TERRA_LUNA_SOL_ESCALATION_PRESET}")
+                print(
+                    "Preset root: expected "
+                    f"{TERRA_LUNA_SOL_ESCALATION_ROOT_MODEL}@"
+                    f"{TERRA_LUNA_SOL_ESCALATION_ROOT_EFFORT} - select it when the "
+                    "task starts; setup does not verify it."
+                )
+                print(
+                    "Preset escalation Advisor: "
+                    f"{TERRA_LUNA_SOL_ESCALATION_ADVISOR_MODEL}@"
+                    f"{TERRA_LUNA_SOL_ESCALATION_ADVISOR_EFFORT} - not a saved "
+                    "Advisor seat or a verified route."
+                )
+                if profile_manages_subagent:
+                    for binary in binaries:
+                        supported, detail = supports_native_policy(
+                            binary,
+                            require_luna_subagent_defaults=True,
+                        )
+                        label = (
+                            "compatible" if supported else f"incompatible ({detail})"
+                        )
+                        print(f"Preset Luna client: {binary} - {label}")
+                        preset_clients_compatible = (
+                            preset_clients_compatible and supported
+                        )
+                    print(
+                        "Preset Luna default subagent route: "
+                        f"{TERRA_LUNA_SOL_ESCALATION_EXECUTOR_MODEL}@"
+                        f"{TERRA_LUNA_SOL_ESCALATION_EXECUTOR_EFFORT} - configured; "
+                        "live spawn not yet verified."
+                    )
+                else:
+                    print(
+                        "Preset Luna default subagent route: unavailable - legacy "
+                        "schema state must be disabled and set up again."
+                    )
+                print(
+                    "Concurrency: no preset-imposed limit; user-layer "
+                    "max_concurrent_threads_per_session is "
+                    f"{_unmanaged_concurrency_summary(current['feature'])} and "
+                    "remains unmanaged."
+                )
             subscription_routes = [
                 route
                 for route in (planner, advisor)
@@ -1769,7 +2195,7 @@ def _status(
             "Routing validation: not performed - config compatibility and policy "
             "effectiveness do not prove route acceptance or the effective child model"
         )
-        direct_model_route = state_matches and any(
+        direct_model_route = state_matches and not profile_installed and any(
             isinstance(route, dict) and route.get("kind") == "model"
             for route in (
                 state.get("executor") if state else None,
@@ -1784,6 +2210,7 @@ def _status(
             and state_matches
             and agent_routes_available
             and subscription_available
+            and preset_clients_compatible
             and not role_issues
             and not orphaned_roles
             and (not direct_model_route or override_health == HEALTHY)
@@ -1804,24 +2231,26 @@ def _prepare_setup_state(
     replace_existing: bool,
     token_profile: str | TokenProfile | None = None,
     native_overrides: bool = False,
+    preset: str | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
     current = _current_values(config)
     feature = current["feature"]
     scalar_feature = isinstance(feature, bool)
     _guard_subscription_transition(existing_state, planner, advisor)
+    _guard_preset_transition(existing_state, preset)
 
-    # A profile is opt-in.  Keep the established schema-5 state when no
-    # profile was requested; an existing schema-6 state carries its profile
-    # forward on an omitted option.
+    # New writes use the combined schema. Omitted options carry forward an
+    # existing token profile, while status remains read-only for schemas 1-7.
     if token_profile is not None:
         selected_profile = normalize_profile_name(token_profile)
-        state_schema = PROFILE_STATE_SCHEMA
-    elif isinstance(existing_state, dict) and existing_state.get("schema") == PROFILE_STATE_SCHEMA:
+    elif (
+        isinstance(existing_state, dict)
+        and existing_state.get("token_profile") is not None
+    ):
         selected_profile = normalize_profile_name(existing_state.get("token_profile"))
-        state_schema = PROFILE_STATE_SCHEMA
     else:
         selected_profile = None
-        state_schema = STATE_SCHEMA
+    state_schema = STATE_SCHEMA
 
     if existing_state is not None:
         if not _managed_matches(existing_state, current):
@@ -2065,6 +2494,59 @@ def _prepare_setup_state(
     if managed_mcp is not None:
         managed["mcp"] = managed_mcp
 
+    if preset == TERRA_LUNA_SOL_ESCALATION_PRESET:
+        _validate_preset_subagent_values(current)
+        if existing_state is None:
+            previous_subagent = _preset_subagent_previous(current)
+            previous["subagent"] = previous_subagent
+        else:
+            previous_subagent = previous.get("subagent")
+            if not isinstance(previous_subagent, dict):
+                raise ConfigurationError(
+                    "Preset routing state is missing Luna subagent restore data."
+                )
+        managed_subagent = _preset_subagent_managed()
+        edits.extend(
+            {
+                "keyPath": PRESET_SUBAGENT_KEY_PATHS[key],
+                "value": value,
+                "mergeStrategy": "replace",
+            }
+            for key, value in managed_subagent.items()
+        )
+        if existing_state is None:
+            feature_rollback = snapshot_edit(
+                PRESET_SUBAGENT_KEY_PATHS["feature_enabled"],
+                previous_subagent["feature_enabled"],
+            )
+            if feature_rollback is not None:
+                rollback.append(feature_rollback)
+            if previous_subagent["agents_table_was_absent"]:
+                rollback.append(
+                    {
+                        "keyPath": "agents",
+                        "value": None,
+                        "mergeStrategy": "replace",
+                    }
+                )
+            else:
+                rollback.extend(
+                    edit
+                    for key, snapshot_key in (
+                        ("agents_enabled", "agents_enabled"),
+                        ("model", "model"),
+                        ("effort", "effort"),
+                    )
+                    if (
+                        edit := snapshot_edit(
+                            PRESET_SUBAGENT_KEY_PATHS[key],
+                            previous_subagent[snapshot_key],
+                        )
+                    )
+                    is not None
+                )
+        managed["subagent"] = managed_subagent
+
     state = {
         "schema": state_schema,
         "policy_version": state_schema,
@@ -2074,13 +2556,13 @@ def _prepare_setup_state(
         "planner": planner,
         "advisor": advisor,
         "designer": designer,
+        "token_profile": selected_profile,
+        "preset": preset,
         "managed": managed,
         "previous": previous,
         "scalar_origin": scalar_origin,
         "managed_feature": managed_feature,
     }
-    if state_schema == PROFILE_STATE_SCHEMA:
-        state["token_profile"] = selected_profile
     return state, edits, rollback
 
 
@@ -2104,6 +2586,37 @@ def _restore_pre_repair_hints(
     current = _current_values(user_config)
     if any(current[field] != value for field, value in expected.items()):
         raise ConfigurationError("pre-repair hint restoration could not be verified")
+
+
+def _rollback_setup_transaction(
+    app: AppServer,
+    rollback: list[dict[str, Any]],
+    version: str | None,
+    state_path: Path,
+    previous_state: dict[str, Any] | None,
+    expected_new_state: dict[str, Any],
+) -> None:
+    """Restore config plus the exact prior state after post-write verification fails."""
+
+    rollback_result = _batch_write(
+        app,
+        rollback,
+        version,
+        reload_user_config=True,
+    )
+    if rollback_result.get("status") not in {"ok", "okOverridden"}:
+        raise ConfigurationError(
+            "unexpected rollback status " f"{rollback_result.get('status')!r}"
+        )
+    saved_state = _read_state(state_path)
+    if saved_state != expected_new_state:
+        raise ConfigurationError(
+            "Saved routing state changed concurrently; refusing to replace or remove it."
+        )
+    if previous_state is None:
+        _remove_state(state_path)
+    else:
+        _write_state(state_path, previous_state)
 
 
 def _repair(
@@ -2133,8 +2646,8 @@ def _repair(
             return 0
         raise ConfigurationError(
             "Routing repair permits only managed mode/usage drift; another owned "
-            "control or Fable launcher setting changed. The compatibility launcher "
-            "is shared by bundled Claude routes."
+            "control, Luna subagent setting, or Fable launcher setting changed. "
+            "The compatibility launcher is shared by bundled Claude routes."
         )
 
     if any(not _is_managed(current[field]) for field in ("mode", "usage")):
@@ -2155,11 +2668,15 @@ def _repair(
         _strict_equal(current["mcp"].get(server, MISSING), enabled)
         for server, enabled in managed_mcp.items()
     )
-    if not controls_match or not mcp_matches:
+    profile_controls_match = (
+        not _preset_manages_callable_subagent(state)
+        or _preset_subagent_matches(state, current, strict_agents_table=True)
+    )
+    if not controls_match or not mcp_matches or not profile_controls_match:
         raise ConfigurationError(
             "Routing repair permits only managed mode/usage drift; another owned "
-            "control or Fable launcher setting changed. The compatibility launcher "
-            "is shared by bundled Claude routes."
+            "control, Luna subagent setting, or Fable launcher setting changed. "
+            "The compatibility launcher is shared by bundled Claude routes."
         )
 
     if isinstance(state.get("scalar_origin"), bool):
@@ -2270,7 +2787,11 @@ def _repair(
             "The user routing fields changed after Codex accepted the repair. That "
             "newer edit was preserved; saved restore state remains available."
         )
-    if not _managed_matches(state, effective_current):
+    if not _managed_matches(
+        state,
+        effective_current,
+        strict_agents_table=False,
+    ):
         try:
             _restore_pre_repair_hints(
                 app,
@@ -2401,6 +2922,42 @@ def _disable(
                 )
                 if edit is not None
             )
+        if _preset_manages_callable_subagent(state):
+            previous_subagent = previous.get("subagent")
+            if not isinstance(previous_subagent, dict):
+                raise ConfigurationError(
+                    "Preset routing state has no Luna subagent restore data."
+                )
+            feature_edit = snapshot_edit(
+                PRESET_SUBAGENT_KEY_PATHS["feature_enabled"],
+                previous_subagent["feature_enabled"],
+            )
+            if feature_edit is not None:
+                edits.append(feature_edit)
+            if previous_subagent["agents_table_was_absent"]:
+                edits.append(
+                    {
+                        "keyPath": "agents",
+                        "value": None,
+                        "mergeStrategy": "replace",
+                    }
+                )
+            else:
+                edits.extend(
+                    edit
+                    for key, snapshot_key in (
+                        ("agents_enabled", "agents_enabled"),
+                        ("model", "model"),
+                        ("effort", "effort"),
+                    )
+                    if (
+                        edit := snapshot_edit(
+                            PRESET_SUBAGENT_KEY_PATHS[key],
+                            previous_subagent[snapshot_key],
+                        )
+                    )
+                    is not None
+                )
         print("Will restore the pre-setup values of every owned routing field.")
     if not apply:
         print("Dry run only. Re-run with --disable --apply after reviewing this preview.")
@@ -2408,6 +2965,17 @@ def _disable(
     result = _batch_write(app, edits, version, reload_user_config=True)
     if result.get("status") not in {"ok", "okOverridden"}:
         raise ConfigurationError(f"Unexpected config write status: {result.get('status')!r}")
+    if state is not None:
+        read_result = app.request(
+            "config/read",
+            {"includeLayers": True, "cwd": str(Path.cwd().resolve())},
+        )
+        restored_config, _ = _user_layer(read_result)
+        if not _owned_restore_matches(state, _current_values(restored_config)):
+            raise ConfigurationError(
+                "Disable write completed but owned restore values could not be "
+                "verified; saved state was retained."
+            )
     _remove_state(state_path)
     print("Native routing disabled. Start a new Codex task to clear the loaded policy.")
     return 0
@@ -2431,6 +2999,9 @@ def main() -> int:
         compatibility = _compatibility_report(
             binaries,
             args.allow_incompatible_client or args.disable,
+            require_luna_subagent_defaults=(
+                args.preset == TERRA_LUNA_SOL_ESCALATION_PRESET
+            ),
         )
         native_overrides = bool(
             compatibility
@@ -2456,10 +3027,7 @@ def main() -> int:
             state = _read_state(state_path)
             _validate_state_config(state, app.config_path)
             saved_token_profile = (
-                state.get("token_profile")
-                if isinstance(state, dict)
-                and state.get("schema") == PROFILE_STATE_SCHEMA
-                else None
+                state.get("token_profile") if isinstance(state, dict) else None
             )
             active_token_profile = (
                 args.token_profile
@@ -2478,9 +3046,12 @@ def main() -> int:
                     args.apply,
                 )
 
+            _guard_preset_transition(state, args.preset)
+
             catalog: dict[str, dict[str, Any]] = {}
             if (
-                args.executor_model
+                args.preset
+                or args.executor_model
                 or args.planner_model
                 or args.advisor_model
                 or args.designer_model
@@ -2491,7 +3062,21 @@ def main() -> int:
                     if not args.confirm_unlisted_models:
                         raise
 
-            if args.executor_model:
+            if args.preset:
+                executor_effort = resolve_model_effort(
+                    "Executor",
+                    TERRA_LUNA_SOL_ESCALATION_EXECUTOR_MODEL,
+                    TERRA_LUNA_SOL_ESCALATION_EXECUTOR_EFFORT,
+                    catalog,
+                    False,
+                    require_catalog_effort=True,
+                )
+                executor = {
+                    "kind": "model",
+                    "model": TERRA_LUNA_SOL_ESCALATION_EXECUTOR_MODEL,
+                    "effort": executor_effort,
+                }
+            elif args.executor_model:
                 executor_effort = resolve_model_effort(
                     "Executor",
                     args.executor_model,
@@ -2595,10 +3180,11 @@ def main() -> int:
                     "effort": designer_effort,
                 }
             validate_planning_routes(planner, advisor)
-            require_direct_route_capability(
-                (executor, planner, advisor, designer),
-                supported=native_overrides,
-            )
+            if not args.preset:
+                require_direct_route_capability(
+                    (executor, planner, advisor, designer),
+                    supported=native_overrides,
+                )
             subscription_prerequisites = {
                 (route["model"], route["effort"])
                 for route in (planner, advisor)
@@ -2621,6 +3207,7 @@ def main() -> int:
                 advisor,
                 designer,
                 active_token_profile,
+                preset=args.preset,
             )
             new_state, edits, rollback = _prepare_setup_state(
                 config,
@@ -2634,7 +3221,8 @@ def main() -> int:
                 app.config_path,
                 args.replace_existing_policy,
                 args.token_profile,
-                native_overrides,
+                native_overrides and not bool(args.preset),
+                preset=args.preset,
             )
             print(f"Config: {app.config_path}")
             print("Orchestrator: model selected when each Codex task starts")
@@ -2644,6 +3232,30 @@ def main() -> int:
             print(f"Designer: {_route_summary(designer) if designer else 'none'}")
             if active_token_profile is not None:
                 print(f"Token profile: {active_token_profile}")
+            if args.preset == TERRA_LUNA_SOL_ESCALATION_PRESET:
+                print(f"Preset: {TERRA_LUNA_SOL_ESCALATION_PRESET}")
+                print(
+                    "Preset root: expected "
+                    f"{TERRA_LUNA_SOL_ESCALATION_ROOT_MODEL}@"
+                    f"{TERRA_LUNA_SOL_ESCALATION_ROOT_EFFORT} - select it when the "
+                    "task starts; setup does not verify it."
+                )
+                print(
+                    "Preset escalation Advisor: "
+                    f"{TERRA_LUNA_SOL_ESCALATION_ADVISOR_MODEL}@"
+                    f"{TERRA_LUNA_SOL_ESCALATION_ADVISOR_EFFORT} - only for the "
+                    "documented high-risk triggers; not a saved Advisor seat."
+                )
+                print(
+                    "Preset Luna default subagent: "
+                    f"{TERRA_LUNA_SOL_ESCALATION_EXECUTOR_MODEL}@"
+                    f"{TERRA_LUNA_SOL_ESCALATION_EXECUTOR_EFFORT} - multi-agent "
+                    "tools enabled; omit explicit model and effort when spawning."
+                )
+                print(
+                    "Concurrency: no preset-imposed limit; existing platform and user "
+                    "settings remain unmanaged."
+                )
             if args.planner_fable and args.planner_effort in FABLE_EFFORT_ALIASES:
                 print(
                     f"Planner effort alias: {args.planner_effort} -> "
@@ -2732,18 +3344,47 @@ def main() -> int:
                     f"Could not persist restore state; config write was rolled back: {state_exc}"
                 ) from state_exc
 
-            verify_result = app.request(
-                "config/read",
-                {"includeLayers": True, "cwd": str(workspace)},
-            )
-            verify_config, verify_version = _user_layer(verify_result)
-            verify_current = _current_values(verify_config)
-            effective_config = verify_result.get("config")
-            effective_current = _current_values(
-                effective_config if isinstance(effective_config, dict) else {}
-            )
+            try:
+                verify_result = app.request(
+                    "config/read",
+                    {"includeLayers": True, "cwd": str(workspace)},
+                )
+                verify_config, verify_version = _user_layer(verify_result)
+                if verify_version is None:
+                    raise ConfigurationError(
+                        "Could not obtain the user config version during readback."
+                    )
+                verify_current = _current_values(verify_config)
+                effective_config = verify_result.get("config")
+                effective_current = _current_values(
+                    effective_config if isinstance(effective_config, dict) else {}
+                )
+            except (ConfigurationError, OSError, KeyError, TypeError) as readback_exc:
+                try:
+                    _rollback_setup_transaction(
+                        app,
+                        rollback,
+                        result.get("version"),
+                        state_path,
+                        state,
+                        new_state,
+                    )
+                except (ConfigurationError, OSError) as rollback_exc:
+                    raise ConfigurationError(
+                        "Codex accepted the write but configuration readback failed, "
+                        f"and automatic rollback failed: {rollback_exc}"
+                    ) from readback_exc
+                raise ConfigurationError(
+                    "Codex accepted the write but configuration readback failed; "
+                    "the prior config and restore state were reinstated: "
+                    f"{readback_exc}"
+                ) from readback_exc
             user_matches = _managed_matches(new_state, verify_current)
-            effective_matches = _managed_matches(new_state, effective_current)
+            effective_matches = _managed_matches(
+                new_state,
+                effective_current,
+                strict_agents_table=False,
+            )
             if not user_matches:
                 raise ConfigurationError(
                     "The user routing fields changed after Codex accepted the write. "
@@ -2753,21 +3394,14 @@ def main() -> int:
                 )
             if not effective_matches:
                 try:
-                    rollback_result = _batch_write(
+                    _rollback_setup_transaction(
                         app,
                         rollback,
                         verify_version,
-                        reload_user_config=True,
+                        state_path,
+                        state,
+                        new_state,
                     )
-                    if rollback_result.get("status") not in {"ok", "okOverridden"}:
-                        raise ConfigurationError(
-                            "unexpected rollback status "
-                            f"{rollback_result.get('status')!r}"
-                        )
-                    if state is None:
-                        _remove_state(state_path)
-                    else:
-                        _write_state(state_path, state)
                 except (ConfigurationError, OSError) as rollback_exc:
                     raise ConfigurationError(
                         "Codex accepted the write but current-workspace effective "
@@ -2779,11 +3413,19 @@ def main() -> int:
                     "effective readback did not match; the prior config and restore "
                     "state were reinstated."
                 )
-            print(
-                "Native routing policy installed. Start a new Codex task, select a "
-                "v2 model such as current Sol or Terra as orchestrator, and use "
-                "Codex normally."
-            )
+            if args.preset == TERRA_LUNA_SOL_ESCALATION_PRESET:
+                print(
+                    "Native routing preset installed. Start a new Codex task, select "
+                    f"{TERRA_LUNA_SOL_ESCALATION_ROOT_MODEL}@"
+                    f"{TERRA_LUNA_SOL_ESCALATION_ROOT_EFFORT} as the root, and use "
+                    "Codex normally."
+                )
+            else:
+                print(
+                    "Native routing policy installed. Start a new Codex task, select a "
+                    "v2 model such as current Sol or Terra as orchestrator, and use "
+                    "Codex normally."
+                )
             return 0
     except (ConfigurationError, OSError, KeyError, TypeError) as exc:
         print(f"error: {exc}", file=sys.stderr)

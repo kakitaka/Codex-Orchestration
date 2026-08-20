@@ -1,14 +1,18 @@
 # Configuration and fallback
 
-Token-efficiency helpers are opt-in except static Skill slimming and CI lint. Existing setup without a token profile retains schema 5 and legacy behavior.
+Token-efficiency helpers are opt-in except static Skill slimming and CI lint. Existing schemas remain readable without status-time migration; new setup writes combined schema 8 while an omitted token profile retains legacy behavior.
 
 ## Native profile
 
-After confirming the active binary and shared clients, preview then apply the existing native setup with `--token-profile lean|balanced|quality|legacy`. Omitting the option:
+After confirming the active binary and shared clients, preview then apply native setup with `--token-profile lean|balanced|quality|legacy`. Omitting the option:
 
-- keeps new/legacy schema-5 state at schema 5;
-- preserves an already saved schema-6 profile;
+- records a nullable profile on new schema-8 state;
+- preserves an already saved schema-6 or schema-8 profile during explicit setup;
 - never silently chooses a new profile.
+
+The validator accepts historical schemas 1–5, disambiguates the two exact
+schema-6 shapes (`token_profile` versus `preset`), and accepts callable preset
+schema 7. Read-only status never rewrites those files.
 
 Profiles govern Advisor-loop and estimated packet/wave budgets only. Model/effort precedence remains user, applicable `AGENTS.md`, configured route, profile recommendation.
 

@@ -105,7 +105,7 @@ class SkillContractTests(unittest.TestCase):
             "relevant snippets -> split into independent packets"
         )
         self.assertIn(remediation, delegation)
-        self.assertIn("schema 6", provider_reference)
+        self.assertIn("schema-6", provider_reference)
         self.assertIn("token_profile", provider_reference)
         for profile in ("legacy", "lean", "balanced", "quality"):
             self.assertIn(f"`{profile}`", provider_reference)
@@ -131,6 +131,42 @@ class SkillContractTests(unittest.TestCase):
         self.assertIn(f"{invocation} --update", SKILL)
         self.assertIn("current-task override", SKILL)
         self.assertIn("no longer needs to invoke this skill", SKILL)
+
+    def test_terra_luna_sol_escalation_preset_is_strict_and_nonroutine(self) -> None:
+        prompt = "setup preset: Terra-Luna-Sol Escalation"
+        self.assertIn(prompt, SKILL)
+        self.assertIn(prompt, README)
+        self.assertIn("--preset terra-luna-sol-escalation", SKILL)
+        self.assertIn("gpt-5.6-terra` at `max`", SKILL)
+        self.assertIn("gpt-5.6-luna` at `max`", SKILL)
+        self.assertIn("gpt-5.6-sol` at `max`", SKILL)
+        self.assertIn("Ordinary work has no Advisor approval loop", SKILL)
+        self.assertIn("security, auth, or\nsecrets", SKILL)
+        self.assertIn("database schema or destructive migration", SKILL)
+        self.assertIn("public API or\nbackward-compatibility risk", SKILL)
+        self.assertIn("cross-subsystem architecture change", SKILL)
+        self.assertIn("repeated\nimplementation or test failures", SKILL)
+        self.assertIn("unresolved root cause", SKILL)
+        self.assertIn("high-risk release", SKILL)
+        self.assertIn("explicit user request", SKILL)
+        self.assertIn("same-provider inheritance", SKILL)
+        self.assertIn("do not substitute a model", SKILL)
+        self.assertIn("never writes a worker or concurrency\nlimit", SKILL)
+        self.assertIn("features.multi_agent = true", SKILL)
+        self.assertIn("agents.enabled = true", SKILL)
+        self.assertIn("agents.default_subagent_model", SKILL)
+        self.assertIn("agents.default_subagent_reasoning_effort", SKILL)
+        self.assertIn("omitting direct `model` and `reasoning_effort`", SKILL)
+        self.assertIn("Entering or leaving the preset boundary", SKILL)
+        self.assertIn("features.multi_agent = true", README)
+        self.assertIn("Schema 8 is the combined current write contract", REFERENCE)
+        self.assertIn("paired callable-Luna snapshots", REFERENCE)
+        self.assertIn("TERRA_LUNA_SOL_ESCALATION_PRESET", NATIVE_SCRIPT)
+        self.assertIn("TERRA_LUNA_SOL_ESCALATION_MULTI_AGENT_ENABLED", NATIVE_SCRIPT)
+        self.assertIn("TERRA_LUNA_SOL_ESCALATION_SUBAGENT_ENABLED", NATIVE_SCRIPT)
+        self.assertIn("TERRA_LUNA_SOL_ESCALATION_PRESET", ROUTING_STATE)
+        self.assertIn("TERRA_LUNA_SOL_ESCALATION_MULTI_AGENT_ENABLED", ROUTING_STATE)
+        self.assertIn("TERRA_LUNA_SOL_ESCALATION_SUBAGENT_ENABLED", ROUTING_STATE)
 
     def test_current_task_model_is_the_only_orchestrator(self) -> None:
         self.assertIn("already the orchestrator", SKILL)
@@ -309,7 +345,7 @@ Executor — GPT-5.6 Sol high: Activated
         self.assertIn("This policy does not create or change a Goal", NATIVE_SCRIPT)
 
     def test_mixed_client_compatibility_is_capability_detected(self) -> None:
-        self.assertIn("capability-tests the complete four-field preset", SKILL)
+        self.assertIn("Capability-test the four core fields", SKILL)
         self.assertIn("isolated `CODEX_HOME`", REFERENCE)
         self.assertIn("--allow-incompatible-client", SKILL)
         self.assertIn("Disable must remain available", SKILL)

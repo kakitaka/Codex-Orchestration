@@ -25,6 +25,7 @@ These facts were source-checked and runtime-tested on July 10, 2026. Always capa
 | `hide_spawn_agent_metadata = false` | Shows `agent_type`, `model`, `reasoning_effort`, and `service_tier` on v2 spawn | Required for direct route control; it does not select a route alone. |
 | `expose_spawn_agent_model_overrides = true` | Keeps direct `model` and `reasoning_effort` inputs exposed when the active schema provides this control | Capability-detected. `false` is `DISABLED`; absence is `UNSUPPORTED`, never a healthy direct route. |
 | `tool_namespace = "agents"` | On live-tested Desktop `0.144.0-alpha.4`, the default `collaboration` namespace rejected expanded model/effort metadata; `agents` accepted it and spawned Luna at `xhigh`. | Required for this validated direct-routing path. It changes the callable namespace but does not select Luna. |
+| Terra–Luna–Sol default route | The named preset reversibly sets `features.multi_agent = true`, `agents.enabled = true`, and Luna @ Max default model/effort. | A spawn that omits direct model and effort can resolve Luna even when the current tool schema does not expose a Luna override; explicit overrides still win. |
 | `usage_hint_text` | Appended to the spawn tool description | Carries the exact Planner/Advisor/Executor routes where the root chooses children. |
 | `multi_agent_mode_hint_text` | Replaces the default proactive/explicit mode hint and is sent to root and child tasks | Must contain both root and child boundaries. |
 | Claude Fable 5 MCP route | Root-directed `create_plan`, `revise_plan`, and `review_plan` tools invoke the authenticated Claude Code CLI headlessly with no model tools | Built-in cross-provider Planner or Advisor exception; current MCP requests do not provide caller identity, so caller isolation is policy-enforced. |
@@ -34,6 +35,10 @@ These facts were source-checked and runtime-tested on July 10, 2026. Always capa
 | Older CLI 0.142.5 | Rejects `multi_agent_mode_hint_text` as an unknown feature-table field | Never write the global native policy without checking every known shared-config client. |
 
 The installer does not infer this from version strings. It launches each detected binary with an isolated `CODEX_HOME` and probes the four core fields plus `expose_spawn_agent_model_overrides` when that client exposes it. That is a config-compatibility check, not proof of a live child route.
+
+For the Terra–Luna–Sol preset it additionally probes the stable multi-agent flag and
+all three default-subagent fields. A checked client that rejects any of those fields
+blocks profile setup even when `--allow-incompatible-client` was supplied.
 
 ## Why `enabled = true` is omitted
 
@@ -47,7 +52,12 @@ Forcing `features.multi_agent_v2.enabled = true` can:
 
 If the user's config uses the older scalar form `multi_agent_v2 = true|false`, the configurator temporarily converts that value to the equivalent table form and records the original scalar. Disable restores the exact boolean only if no other table fields were added afterward.
 
-## What the managed fields do
+The profile does not set `features.multi_agent_v2.enabled`. Its reversible
+`features.multi_agent = true` and `[agents]` controls exist only to make the exact
+Luna default route callable. It never writes `agents.max_threads` or
+`agents.max_concurrent_threads_per_session`.
+
+## What the managed routing fields do
 
 The control surface and the route are separate:
 
@@ -85,6 +95,11 @@ never elevates a route. A valid structured requirement overrides configured and
 recommended routes, while an explicit user model or effort still wins independently. For the fallback
 recommendation, `auditor`, `advisor`, and `reviewer` roles have a Sol High
 floor; Max is an escalation, not their default.
+
+The Terra–Luna–Sol preset is intentionally different: its executor call omits
+direct `model` and `reasoning_effort`, letting the saved same-provider Luna @ Max
+defaults resolve the child. Status can confirm the configuration is effective but
+must not call it live-verified until such a spawn is observed.
 
 For a durable custom-agent route it uses:
 
@@ -178,7 +193,7 @@ Restore state lives at:
 ~/.codex/.codex-orchestration-routing.json
 ```
 
-It contains the prior and managed values of the four routing fields, chosen Planner/Advisor/Executor routes, schema/version markers, scalar-conversion metadata when needed, and config path. When Claude Fable 5 or Claude Opus 5 is selected for either planning seat, it also records only the plugin-scoped MCP launcher overrides that setup touched. It never copies provider definitions, auth stores, account identifiers, or credentials. A normal clean setup contains generated policy text, the namespace value, seat IDs, and restoration metadata. Explicit replacement must retain the user's exact old hint text so disable can restore it; routing hints must never contain credentials. State is written with a same-directory atomic replacement and restrictive file mode where supported. If persistence fails after config apply, the configurator rolls the config back using the returned version.
+It contains the prior and managed values of the four routing fields, chosen Planner/Advisor/Executor routes, schema/version markers, scalar-conversion metadata when needed, and config path. Schema 7 adds paired snapshots for the Luna profile's stable multi-agent flag and default-subagent leaves, including whether it created an absent `[agents]` table. When Claude Fable 5 or Claude Opus 5 is selected for either planning seat, it also records only the plugin-scoped MCP launcher overrides that setup touched. It never copies provider definitions, auth stores, account identifiers, or credentials. A normal clean setup contains generated policy text, the namespace value, seat IDs, and restoration metadata. Explicit replacement must retain the user's exact old hint text so disable can restore it; routing hints must never contain credentials. State is written with a same-directory atomic replacement and restrictive file mode where supported. If persistence fails after config apply, the configurator rolls the config back using the returned version.
 
 Disable compares every current managed value before restoration. If the user edited a managed field after setup, it stops instead of erasing that work. Without state, each surviving marker proves ownership only of that hint string. Disable may safely remove the marked string or strings, but it leaves metadata visibility and the tool namespace unchanged because their previous values are unknown.
 
@@ -269,7 +284,7 @@ check itself reports authentication unavailable.
 
 The saved policy authorizes the root to call these planning tools and prohibits children from doing so. Current MCP requests provide no caller identity to the server, so that specific caller boundary is instruction-enforced, not server-authenticated. The bridge mechanically uses the same full saved-state validator as native status/repair/disable, restricts the operation surface, and runs the selected Claude model without tools or persistence.
 
-Saved state compatibility is explicit: schema 1 must carry policy version 1 and predates Fable and Planner; schema 2 must carry policy version 2 and may authorize only the historical Fable Advisor shape; schema 3 must carry policy version 3 and adds Planner; schema 4 must carry policy version 4 and adds the optional direct-model Designer route; schema 5 must carry policy version 5 and adds the Opus-only `claude_subscription` planning route while keeping Fable's legacy route shape unchanged; schema 6 must carry policy version 6 and adds the optional `token_profile` field. Schema-6 profiles are exactly `legacy`, `lean`, `balanced`, or `quality`; omitting a profile preserves schema-5 behavior and never performs an implicit migration. Schema and policy values must be actual JSON integers, not booleans or floats. Legacy state cannot contain fields introduced later; nested snapshots, scalar conversion, MCP launchers, and routes must match an emitted contract; and managed policy strings must carry the plugin marker before status, seat change, disable, or the bridge trusts them. Designer cannot use a bundled Claude route or a persistent unqualified agent name. Planner/Advisor may contain at most one bundled Claude subscription seat. Unknown extensions intentionally fail closed.
+Saved state compatibility is explicit: schemas 1–5 retain their historical exact contracts. Two historical schema-6 contracts are accepted only by exact, non-overlapping top-level shape: one carries `token_profile`; the other carries nullable `preset`. Schema 7 carries the preset plus its paired callable-Luna snapshots. Schema 8 is the combined current write contract and carries nullable `token_profile` and `preset`. Status validates schemas 1–7 without rewriting them. The only preset is `terra-luna-sol-escalation`; when present in schema 7 or 8 it seals a direct `gpt-5.6-luna@max` Executor, no persisted Planner, Advisor, or Designer, and exact paired snapshots for `features.multi_agent`, `agents.enabled`, and the default subagent model and effort. It never persists a root model or escalation Advisor. Schema and policy values must be actual JSON integers, not booleans or floats. Legacy state cannot contain fields introduced later; nested snapshots, scalar conversion, MCP launchers, and routes must match an emitted contract; and managed policy strings must carry the plugin marker before status, seat change, disable, or the bridge trusts them. Designer cannot use a bundled Claude route or a persistent unqualified agent name. Planner/Advisor may contain at most one bundled Claude subscription seat. Unknown extensions intentionally fail closed.
 
 The token-profile limits are advisory packet/wave gates, not model downgrades:
 

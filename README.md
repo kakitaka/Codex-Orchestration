@@ -63,7 +63,7 @@ Results depend on the models, task, context, retries, and available parallel wor
 
 ## Token-efficient operation
 
-Version 0.10.0 keeps the same root/Planner/Advisor/Designer/Executor contracts but
+Version 0.11.0 keeps the same root/Planner/Advisor/Designer/Executor contracts but
 loads only a small stable Skill router plus references needed by the current
 operation. Cross-model children receive deterministic repository-relative
 `TASK_PACKET_V1` packets with `fork_turns="none"`, never a full conversation fork.
@@ -110,6 +110,34 @@ Start an ordinary Codex prompt with the literal skill label
 `$codex-orchestration:codex-orchestration`. These examples are prompts for Codex,
 not terminal commands. You can also browse installed skills with Codex's built-in
 `/skills` discovery.
+
+Use the Terra–Luna–Sol escalation profile when the task root is Terra at Max,
+Luna implements at Max, and Sol must remain outside ordinary planning:
+
+```text
+$codex-orchestration:codex-orchestration setup preset: Terra-Luna-Sol Escalation
+```
+
+Start the next task with **GPT-5.6 Terra** at **Max** in Codex's normal model
+picker. The profile cannot persist or prove the root selection. It persists
+**GPT-5.6 Luna @ Max** as Executor; Planner, Advisor, and Designer remain unset.
+To make Luna callable through the saved default-subagent route, it reversibly sets
+`features.multi_agent = true`, `agents.enabled = true`,
+`agents.default_subagent_model = "gpt-5.6-luna"`, and
+`agents.default_subagent_reasoning_effort = "max"`. Delegate by omitting a direct
+model and effort override, so Codex resolves those defaults. This is configuration
+evidence, not proof of a live spawn. Normal work has no Advisor approval loop and
+never invokes Sol. The root may make
+one fresh, no-history Sol @ Max audit only for security, auth, or secret handling;
+database schema or destructive migration; public API or backward-compatibility
+risk; cross-subsystem architecture changes; repeated implementation or test
+failures; an unresolved root cause; a high-risk release; or an explicit user
+request. Before that call, verify the same provider and current callable
+capability. If Sol is unavailable, stop the escalation rather than substituting a
+model. The profile imposes no worker or concurrency limit; any existing Codex or
+user limit remains unchanged. `status`, `repair`, and `disable` retain their normal
+restore-state behavior. To enter or leave this profile, first run `disable --apply`,
+then perform a fresh setup; this protects prior subagent settings and custom roles.
 
 Use Fable 5 to plan, Sol to advise, and Luna to implement:
 
@@ -194,6 +222,11 @@ $codex-orchestration:codex-orchestration setup designer: GPT-5.6 Terra High, exe
 
 $codex-orchestration:codex-orchestration setup executor: GPT-5.6 Luna Extra High
 ```
+
+The escalation profile is intentionally not an ordinary Advisor configuration:
+do not combine it with individual seat settings. It validates the exact Luna
+catalog capability before writing policy and fails closed if that capability is
+missing.
 
 ## Bring another model into Codex
 
@@ -350,8 +383,8 @@ lets the natural `Designer: Kimi K3` label enter the External Model lifecycle;
 version **0.7.2 or newer** uses the concise per-role activation confirmation;
 version **0.8.0 or newer** uses sealed direct CLI invocation for READY External
 Model roles; version **0.9.0 or newer** adds Claude Opus 5 subscription routing.
-Version **0.10.0 or newer** adds progressive context loading and optional
-token-efficiency helpers without changing legacy setup when no profile is selected.
+Version **0.11.0 or newer** adds progressive context loading and optional
+token-efficiency helpers while retaining legacy routing behavior when no profile is selected.
 Confirm with
 `codex plugin list --json`, then restart Codex Desktop and start a new task.
 

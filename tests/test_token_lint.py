@@ -138,6 +138,35 @@ class TokenLintTests(unittest.TestCase):
             any(finding.code == "ACCIDENTAL_MAX_DEFAULT" for finding in findings)
         )
 
+    def test_only_exact_reviewed_preset_effort_constants_allow_max(self) -> None:
+        root = self._clean_root()
+        scripts = root / "plugins" / "codex-orchestration" / "skills" / "codex-orchestration" / "scripts"
+        scripts.mkdir(parents=True)
+        routing = scripts / "routing_state.py"
+        routing.write_text(
+            'TERRA_LUNA_SOL_ESCALATION_ROOT_EFFORT = "max"\n'
+            'TERRA_LUNA_SOL_ESCALATION_EXECUTOR_EFFORT = "max"\n'
+            'TERRA_LUNA_SOL_ESCALATION_ADVISOR_EFFORT = "max"\n',
+            encoding="utf-8",
+        )
+        self.assertFalse(
+            any(
+                finding.code == "ACCIDENTAL_MAX_DEFAULT"
+                for finding in self._scan_fixture(root)
+            )
+        )
+
+        routing.write_text(
+            'TERRA_LUNA_SOL_ESCALATION_WORKER_EFFORT = "max"\n',
+            encoding="utf-8",
+        )
+        self.assertTrue(
+            any(
+                finding.code == "ACCIDENTAL_MAX_DEFAULT"
+                for finding in self._scan_fixture(root)
+            )
+        )
+
     def test_artifact_and_mcp_defaults(self) -> None:
         root = self._clean_root()
         state = root / ".codex-state"

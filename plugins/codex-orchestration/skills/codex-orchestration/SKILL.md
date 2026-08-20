@@ -79,6 +79,7 @@ Generate packets deterministically with repository-relative normalized paths and
 These are Codex prompts, not shell commands:
 
 ```text
+$codex-orchestration:codex-orchestration setup preset: Terra-Luna-Sol Escalation
 $codex-orchestration:codex-orchestration setup executor: GPT-5.6 Luna Extra High
 $codex-orchestration:codex-orchestration setup planner: Claude Fable 5 High, advisor: GPT-5.6 Sol High, executor: GPT-5.6 Luna Extra High
 $codex-orchestration:codex-orchestration status
@@ -92,4 +93,3 @@ Natural-language availability questions trigger read-only discovery only. Exampl
 ## Resources
 
 Helper scripts live in `scripts/`; provider manifests in `providers/`. Run helpers only after reading the routed lifecycle/security reference. Use current-host capability detection rather than assuming a version supports a field.
-Native setup capability-tests the complete four-field preset in an isolated `CODEX_HOME`; direct model overrides receive their own feature probe.

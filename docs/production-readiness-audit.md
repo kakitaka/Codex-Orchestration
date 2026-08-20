@@ -44,3 +44,20 @@ Audit date: 2026-07-12. Baseline: `a674a81` (`0.4.0`).
 - The two cross-provider storage systems cannot be committed atomically by the current public interfaces. Status and bounded managed-role cleanup provide recovery without deleting edited or user-owned files.
 
 These are platform boundaries, not hidden guarantees. A future Codex-native executor selector or transactional custom-agent API would justify revisiting them.
+
+## Terra–Luna–Sol escalation preset threat model
+
+The `terra-luna-sol-escalation` preset protects the routing state, the user's
+pre-existing configuration, provider boundaries, and the distinction between an
+expected root selection and a proven runtime identity.
+
+| Threat | Control | Residual boundary |
+| --- | --- | --- |
+| A caller combines a profile with a different seat or lifecycle command. | Argument validation rejects the conflict before binary discovery, catalog probing, config reads, or writes. | The profile is deliberately all-or-nothing; use normal setup for a different route. |
+| A catalog lacks exact Luna @ Max capability. | Setup fails closed before a policy or state write; no fallback model is selected. | A successful catalog probe is not proof of a later live child. |
+| A profile state is forged, incomplete, or altered. | Schema 7 accepts only the exact preset name, Luna @ Max Executor, null Planner/Advisor/Designer, and exact paired snapshots for the multi-agent/default-subagent controls; malformed state blocks repair and disable writes. | Schemas 1–6 remain readable but do not claim callable Luna defaults. |
+| Luna defaults are saved while the multi-agent feature is disabled or the client cannot parse them. | The profile reversibly manages `features.multi_agent`, `agents.enabled`, and exact Luna @ Max defaults, probes every known client before writes, and rejects aliases or fallback. | Configuration readback is not proof of a later live spawn. |
+| Policy drift, a higher-layer override, or a concurrent edit changes the effective route. | Existing compare-and-swap, readback, rollback, and restore-state validation remain mandatory for setup and repair; profile rollback restores config and prior state together. | The active Codex host can still reject future route metadata. |
+| Sol becomes a hidden normal approval gate or cross-provider bypass. | The policy names only eight escalation triggers, requires `fork_turns = "none"`, same-provider inheritance, and callable-capability verification; unavailable Sol has no substitute. | Caller identity on model calls remains instruction-enforced. |
+| The profile silently changes throughput or user limits. | It writes no max worker or concurrency setting and preserves existing user/platform limits. | Codex platform limits still govern actual scheduling. |
+| A claimed Terra root is mistaken for persisted or live proof. | Policy labels Terra @ Max as an expected next-task selection only and keeps the selected task model as root. | Runtime confirmation requires a separately observed live task. |
