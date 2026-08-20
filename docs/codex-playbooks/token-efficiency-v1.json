@@ -12,7 +12,7 @@
     },
     {
       "path": "plugins/codex-orchestration/skills/codex-orchestration/scripts/context_index.py",
-      "blob": "07e11a1beb9fa49818b476c1eb0b136b0c88ab66",
+      "blob": "b5224f36314ca6ce8ca6d832612488696261ef4a",
       "symbols": ["ContextIndex", "RepeatedReadError", "git_blob_id"],
       "headings": [],
       "failure_labels": ["excluded_path", "repeated_read", "stale_blob"],
@@ -36,7 +36,7 @@
     },
     {
       "path": "plugins/codex-orchestration/skills/codex-orchestration/scripts/task_packet.py",
-      "blob": "26a0fe4f8142541ffec5b6a508d6bc969e1aa0ae",
+      "blob": "e09e8c559500718b9f35cdd510a057a97ab44599",
       "symbols": ["DuplicatePacketRegistry", "PacketBudget", "TaskPacket", "WaveBudget", "build_task_packet"],
       "headings": [],
       "failure_labels": ["duplicate_packet", "hard_budget", "secret_like_material", "unstable_static_prefix"],

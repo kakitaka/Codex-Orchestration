@@ -115,7 +115,12 @@ _STATIC_TIME_RE = re.compile(
     r"\b\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?\b"
 )
 _STATIC_ABSOLUTE_RE = re.compile(
-    r"(?:\b[A-Za-z]:[\\/]|(?<![A-Za-z0-9])/(?:Users|home|tmp|private/tmp|var/tmp)/)",
+    r"(?:"
+    r"\b[A-Za-z]:[\\/]"
+    r"|(?<![A-Za-z0-9:])\\\\[^\\/\s]+[\\/][^\\/\s]+"
+    r"|(?<![A-Za-z0-9:])//[^/\s]+/[^/\s]+"
+    r"|(?<![A-Za-z0-9:/])/(?!/)[A-Za-z0-9._~-][^\s'\"`]*"
+    r")",
     re.IGNORECASE,
 )
 

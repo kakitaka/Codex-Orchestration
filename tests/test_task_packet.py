@@ -100,6 +100,10 @@ class TaskPacketTests(unittest.TestCase):
             {"goal": "Inspect C:\\Users\\alice\\repo"},
             {"known_facts": ["checkout is D:\\work\\repo"]},
             {"constraints": ["read /home/alice/private"]},
+            {"constraints": ["read /root/private"]},
+            {"known_facts": ["checkout is /workspace/alice/repo"]},
+            {"goal": r"Inspect \\server\private\repo"},
+            {"goal": "Inspect //server/private/repo"},
             {"validation_command": "python C:\\Users\\alice\\validate.py"},
             {"expected_output": "write /tmp/alice/report.json"},
         )

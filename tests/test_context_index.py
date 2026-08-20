@@ -100,6 +100,32 @@ class ContextIndexTests(unittest.TestCase):
                     (str(index.INDEX_FORMAT_VERSION),),
                 )
 
+    def test_column_and_index_schema_mismatches_are_rebuilt(self) -> None:
+        mutations = {
+            "column": "ALTER TABLE files RENAME COLUMN language TO lang",
+            "index": "DROP INDEX symbols_name",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for label, statement in mutations.items():
+                with self.subTest(label=label):
+                    database = root / f"{label}.sqlite"
+                    with index.ContextIndex(root, db_path=database):
+                        pass
+                    with contextlib.closing(sqlite3.connect(database)) as connection:
+                        connection.execute(statement)
+                        connection.commit()
+                    with index.ContextIndex(root, db_path=database) as context:
+                        self.assertEqual(context.query("missing"), [])
+                    self.assertTrue(
+                        list(root.glob(f"{label}.sqlite.sqlite-schema-*"))
+                    )
+                    with contextlib.closing(sqlite3.connect(database)) as connection:
+                        self.assertEqual(
+                            index._schema_signature(connection),
+                            index._expected_schema_signature(),
+                        )
+
     def test_sensitive_generated_lock_and_binary_paths_are_excluded(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

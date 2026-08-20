@@ -31,16 +31,32 @@ class TokenLintTests(unittest.TestCase):
         (root / "src" / "app.py").write_text("print('targeted')\n", encoding="utf-8")
         return root
 
+    def _scan_fixture(
+        self, root: Path, *, max_findings: int = token_lint.DEFAULT_MAX_FINDINGS
+    ) -> list[token_lint.Finding]:
+        tracked = sorted(
+            path.relative_to(root).as_posix()
+            for path in root.rglob("*")
+            if path.is_file() and not path.is_symlink()
+        )
+        result = token_lint.subprocess.CompletedProcess(
+            args=["git", "ls-files"],
+            returncode=0,
+            stdout=("\0".join(tracked) + "\0").encode("utf-8"),
+        )
+        with patch.object(token_lint.subprocess, "run", return_value=result):
+            return token_lint.scan(root, max_findings=max_findings)
+
     def test_clean_minimal_fixture(self) -> None:
         root = self._clean_root()
-        self.assertEqual(token_lint.scan(root), [])
+        self.assertEqual(self._scan_fixture(root), [])
 
     def test_budgets_and_broken_reference(self) -> None:
         root = self._clean_root()
         (root / "SKILL.md").write_text("x" * (token_lint.MAX_SKILL_BYTES + 1), encoding="utf-8")
         (root / "AGENTS.md").write_text("# Rules\n" + "line\n" * (token_lint.MAX_AGENTS_LINES + 1), encoding="utf-8")
         (root / "src" / "broken.md").write_text("[missing](nope.md)\n", encoding="utf-8")
-        codes = {finding.code for finding in token_lint.scan(root)}
+        codes = {finding.code for finding in self._scan_fixture(root)}
         self.assertIn("SKILL_BYTES", codes)
         self.assertIn("AGENTS_LINES", codes)
         self.assertIn("BROKEN_REFERENCE", codes)
@@ -50,7 +66,7 @@ class TokenLintTests(unittest.TestCase):
         block = "A stable instruction block that should only be present once. " * 8
         (root / "src" / "one.md").write_text(block, encoding="utf-8")
         (root / "src" / "two.md").write_text(block, encoding="utf-8")
-        findings = token_lint.scan(root)
+        findings = self._scan_fixture(root)
         self.assertTrue(any(finding.code == "DUPLICATE_PROMPT_BLOCK" for finding in findings))
 
     def test_runtime_regression_classes(self) -> None:
@@ -73,7 +89,7 @@ class TokenLintTests(unittest.TestCase):
             "home = Path.home()\n",
             encoding="utf-8",
         )
-        codes = {finding.code for finding in token_lint.scan(root)}
+        codes = {finding.code for finding in self._scan_fixture(root)}
         for code in (
             "ACCIDENTAL_MAX_DEFAULT",
             "FORK_TURNS_ALL",
@@ -92,7 +108,7 @@ class TokenLintTests(unittest.TestCase):
         (root / "SKILL.md").write_text(
             "# Skill\n\nreasoning_effort = max\n", encoding="utf-8"
         )
-        findings = token_lint.scan(root)
+        findings = self._scan_fixture(root)
         self.assertTrue(
             any(finding.code == "ACCIDENTAL_MAX_DEFAULT" for finding in findings)
         )
@@ -106,7 +122,7 @@ class TokenLintTests(unittest.TestCase):
             json.dumps({"mcpServers": {"all": {"include_all_tools": True, "tools": ["*"]}}}),
             encoding="utf-8",
         )
-        codes = {finding.code for finding in token_lint.scan(root)}
+        codes = {finding.code for finding in self._scan_fixture(root)}
         self.assertIn("COMMITTED_CODEX_STATE", codes)
         self.assertIn("BROAD_MCP_DEFAULT", codes)
 
@@ -151,7 +167,6 @@ class TokenLintTests(unittest.TestCase):
 
     def test_git_discovery_failure_fails_closed_without_filesystem_scan(self) -> None:
         root = self._clean_root()
-        (root / ".git").mkdir()
         private = root / "private-untracked.py"
         private.write_text("AKIA" + "A" * 16, encoding="utf-8")
         with patch.object(token_lint.subprocess, "run", side_effect=OSError("git missing")):
@@ -163,7 +178,7 @@ class TokenLintTests(unittest.TestCase):
         root = self._clean_root()
         secret = "AKIA" + "A" * 16
         (root / "src" / "leak.txt").write_text(secret, encoding="utf-8")
-        findings = token_lint.scan(root)
+        findings = self._scan_fixture(root)
         secret_findings = [item for item in findings if item.code == "SECRET_LITERAL"]
         self.assertEqual(len(secret_findings), 1)
         self.assertNotIn(secret, str(secret_findings[0]))
@@ -172,10 +187,10 @@ class TokenLintTests(unittest.TestCase):
         root = self._clean_root()
         for index in range(10):
             (root / "src" / f"bad{index}.py").write_text("DEFAULT_EFFORT = 'max'\n", encoding="utf-8")
-        findings = token_lint.scan(root, max_findings=3)
+        findings = self._scan_fixture(root, max_findings=3)
         self.assertEqual(len(findings), 3)
         self.assertEqual(findings, sorted(findings, key=lambda finding: (finding.path, finding.line, finding.code, finding.message)))
-        self.assertEqual(len(token_lint.scan(root, max_findings=0)), 0)
+        self.assertEqual(len(self._scan_fixture(root, max_findings=0)), 0)
 
 
 if __name__ == "__main__":

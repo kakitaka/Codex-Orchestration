@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import functools
 import hashlib
 import json
 import ntpath
@@ -45,16 +46,48 @@ except ImportError:  # direct script/module import
 
 
 INDEX_FORMAT_VERSION = 1
-_INDEX_TABLE_NAMES = frozenset(
-    {
-        "index_meta",
-        "files",
-        "headings",
-        "symbols",
-        "dependencies",
-        "adr_playbooks",
-    }
-)
+_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS index_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS files (
+    path TEXT PRIMARY KEY,
+    blob_id TEXT NOT NULL,
+    language TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS headings (
+    path TEXT NOT NULL,
+    level INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    line INTEGER NOT NULL,
+    FOREIGN KEY(path) REFERENCES files(path) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS symbols (
+    path TEXT NOT NULL,
+    name TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    line INTEGER NOT NULL,
+    FOREIGN KEY(path) REFERENCES files(path) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS dependencies (
+    path TEXT NOT NULL,
+    name TEXT NOT NULL,
+    FOREIGN KEY(path) REFERENCES files(path) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS adr_playbooks (
+    path TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    title TEXT NOT NULL,
+    status TEXT NOT NULL,
+    validated_at TEXT NOT NULL,
+    source_files TEXT NOT NULL,
+    FOREIGN KEY(path) REFERENCES files(path) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS headings_name ON headings(name);
+CREATE INDEX IF NOT EXISTS symbols_name ON symbols(name);
+CREATE INDEX IF NOT EXISTS dependencies_name ON dependencies(name);
+"""
 DEFAULT_SOURCE_MAX_BYTES = 4 * 1024 * 1024
 DEFAULT_QUERY_LIMIT = 50
 MAX_REPOSITORY_PATH_BYTES = 8 * 1024 * 1024
@@ -160,6 +193,32 @@ def git_blob_id(data: bytes) -> str:
 def _db_lock(path: str) -> threading.RLock:
     with _DB_LOCKS_GUARD:
         return _DB_LOCKS.setdefault(path, threading.RLock())
+
+
+def _schema_signature(connection: sqlite3.Connection) -> tuple[tuple[str, ...], ...]:
+    """Return the exact user table/index definition without row content."""
+
+    rows = connection.execute(
+        "SELECT type, name, tbl_name, sql FROM sqlite_master "
+        "WHERE type IN ('table', 'index') AND name NOT LIKE 'sqlite_%' "
+        "ORDER BY type, name"
+    )
+    return tuple(
+        (
+            str(row[0]),
+            str(row[1]),
+            str(row[2]),
+            re.sub(r"\s+", " ", str(row[3]).strip()).casefold(),
+        )
+        for row in rows
+    )
+
+
+@functools.lru_cache(maxsize=1)
+def _expected_schema_signature() -> tuple[tuple[str, ...], ...]:
+    with contextlib.closing(sqlite3.connect(":memory:")) as connection:
+        connection.executescript(_SCHEMA_SQL)
+        return _schema_signature(connection)
 
 
 def _clean_text(value: Any, *, field: str, max_length: int = 512) -> str:
@@ -467,16 +526,13 @@ class ContextIndex:
 
     def _create_schema(self) -> None:
         with self._lock:
-            existing_tables = {
-                str(row[0])
-                for row in self._connection.execute(
-                    "SELECT name FROM sqlite_master "
-                    "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
-                )
-            }
-            if existing_tables and existing_tables != _INDEX_TABLE_NAMES:
-                raise CorruptIndexError("context index table schema mismatch")
-            if existing_tables:
+            existing_signature = _schema_signature(self._connection)
+            if (
+                existing_signature
+                and existing_signature != _expected_schema_signature()
+            ):
+                raise CorruptIndexError("context index logical schema mismatch")
+            if existing_signature:
                 meta_rows = [
                     (str(row[0]), str(row[1]))
                     for row in self._connection.execute(
@@ -485,51 +541,8 @@ class ContextIndex:
                 ]
                 if meta_rows != [("format_version", str(INDEX_FORMAT_VERSION))]:
                     raise CorruptIndexError("context index format version mismatch")
-            self._connection.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS index_meta (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS files (
-                    path TEXT PRIMARY KEY,
-                    blob_id TEXT NOT NULL,
-                    language TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS headings (
-                    path TEXT NOT NULL,
-                    level INTEGER NOT NULL,
-                    name TEXT NOT NULL,
-                    line INTEGER NOT NULL,
-                    FOREIGN KEY(path) REFERENCES files(path) ON DELETE CASCADE
-                );
-                CREATE TABLE IF NOT EXISTS symbols (
-                    path TEXT NOT NULL,
-                    name TEXT NOT NULL,
-                    kind TEXT NOT NULL,
-                    line INTEGER NOT NULL,
-                    FOREIGN KEY(path) REFERENCES files(path) ON DELETE CASCADE
-                );
-                CREATE TABLE IF NOT EXISTS dependencies (
-                    path TEXT NOT NULL,
-                    name TEXT NOT NULL,
-                    FOREIGN KEY(path) REFERENCES files(path) ON DELETE CASCADE
-                );
-                CREATE TABLE IF NOT EXISTS adr_playbooks (
-                    path TEXT PRIMARY KEY,
-                    kind TEXT NOT NULL,
-                    title TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    validated_at TEXT NOT NULL,
-                    source_files TEXT NOT NULL,
-                    FOREIGN KEY(path) REFERENCES files(path) ON DELETE CASCADE
-                );
-                CREATE INDEX IF NOT EXISTS headings_name ON headings(name);
-                CREATE INDEX IF NOT EXISTS symbols_name ON symbols(name);
-                CREATE INDEX IF NOT EXISTS dependencies_name ON dependencies(name);
-                """
-            )
-            if not existing_tables:
+            self._connection.executescript(_SCHEMA_SQL)
+            if not existing_signature:
                 self._connection.execute(
                     "INSERT INTO index_meta(key, value) VALUES (?, ?)",
                     ("format_version", str(INDEX_FORMAT_VERSION)),

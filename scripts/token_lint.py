@@ -107,16 +107,8 @@ def _iter_files(root: Path) -> Iterator[Path]:
                 continue
 
 
-def _git_metadata_exists(root: Path) -> bool:
-    current = root.resolve()
-    for candidate in (current, *current.parents):
-        if (candidate / ".git").exists():
-            return True
-    return False
-
-
-def _git_tracked_paths(root: Path) -> set[str] | None:
-    """Return Git-tracked paths, or ``None`` for a non-Git fixture."""
+def _git_tracked_paths(root: Path) -> set[str]:
+    """Return the authoritative Git-tracked paths or fail closed."""
 
     try:
         completed = subprocess.run(
@@ -131,12 +123,9 @@ def _git_tracked_paths(root: Path) -> set[str] | None:
             raise ValueError("tracked path list exceeds bound")
         return {item for item in raw.decode("utf-8", "strict").split("\0") if item}
     except (OSError, subprocess.SubprocessError, UnicodeDecodeError, ValueError):
-        # A non-Git fixture retains the historical filesystem behavior.  Once
-        # a Git worktree is known, discovery failure is not permission to
-        # inspect arbitrary local files as repository content.
-        if _git_metadata_exists(root):
-            raise GitTrackingUnavailable("git ls-files unavailable")
-        return None
+        # A failed or non-Git root has no safe filesystem fallback: arbitrary
+        # local files may hold private state unrelated to repository content.
+        raise GitTrackingUnavailable("git ls-files unavailable")
 
 
 def _is_spec(path: Path) -> bool:
@@ -493,7 +482,7 @@ def scan(root: str | Path, *, max_findings: int = DEFAULT_MAX_FINDINGS) -> list[
         ]
     for path in _iter_files(base):
         relative_name = path.relative_to(base).as_posix()
-        if tracked_paths is not None and relative_name not in tracked_paths:
+        if relative_name not in tracked_paths:
             # Git is the only authority for repository scope.  Do not inspect
             # unrelated untracked files, including private runtime state.
             continue
