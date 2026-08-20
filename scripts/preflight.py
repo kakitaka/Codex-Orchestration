@@ -7,13 +7,26 @@ import argparse
 import os
 from pathlib import Path
 import re
-import subprocess
 import sys
 from typing import NamedTuple
 
 
+HELPER_SCRIPTS = (
+    Path(__file__).resolve().parents[1]
+    / "plugins"
+    / "codex-orchestration"
+    / "skills"
+    / "codex-orchestration"
+    / "scripts"
+)
+if str(HELPER_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(HELPER_SCRIPTS))
+from bounded_run import run_bounded  # noqa: E402
+
+
 ROOT = Path(__file__).resolve().parents[1]
 MAX_OUTPUT_CHARS = 12_000
+MAX_COMMAND_BYTES = 128 * 1024
 ACTIVE_ENV = "CODEX_ORCHESTRATION_PREFLIGHT_ACTIVE"
 CI_TARGETS = {"quality", "test", "lifecycle", "legacy", "portability"}
 LOCAL_TARGETS = {"quick", "full"}
@@ -23,6 +36,18 @@ PORTABILITY_BASE_MODULES = (
     "tests.test_inspect_models",
     "tests.test_packaging",
     "tests.test_skill_contract",
+    "tests.test_bounded_run",
+    "tests.test_token_lint",
+    "tests.test_token_benchmark",
+    "tests.test_playbook_staleness",
+    "tests.test_full_test_gate",
+    "tests.test_preflight",
+    "tests.test_release_check",
+    "tests.test_token_hook",
+    "tests.test_session_telemetry",
+    "tests.test_safe_state",
+    "tests.test_context_index",
+    "tests.test_validation_cache",
 )
 ROUTING_PORTABILITY_MODULES = (
     "tests.test_native_routing",
@@ -64,38 +89,36 @@ def run_command(
 ) -> CheckResult:
     """Run one bounded argv-only subprocess and normalize its result."""
     try:
-        completed = subprocess.run(
+        completed = run_bounded(
             arguments,
             cwd=root,
             env=env,
-            capture_output=True,
-            text=True,
-            check=False,
             timeout=timeout,
-            shell=False,
+            max_bytes=MAX_COMMAND_BYTES,
+            head_bytes=48 * 1024,
+            tail_bytes=48 * 1024,
         )
-    except OSError as exc:
-        return CheckResult(name, "FAIL", f"could not start {arguments!r}: {exc}")
-    except subprocess.TimeoutExpired as exc:
-        output = "\n".join(
-            part
-            for part in (
-                exc.stdout if isinstance(exc.stdout, str) else "",
-                exc.stderr if isinstance(exc.stderr, str) else "",
-            )
-            if part
-        )
-        detail = f"timed out after {timeout}s"
-        if output:
-            detail += f": {_clip(output)}"
-        return CheckResult(name, "FAIL", detail)
-    output = "\n".join(part for part in (completed.stdout, completed.stderr) if part)
+    except (OSError, TypeError, ValueError) as exc:
+        return CheckResult(name, "FAIL", f"bounded command rejected: {type(exc).__name__}")
+    output_parts = [completed.first]
+    if completed.last and completed.last != completed.first:
+        output_parts.extend(["...[bounded output middle omitted]...", completed.last])
+    output = "\n".join(part for part in output_parts if part)
     clipped = _clip(output)
-    if completed.returncode != 0:
+    if completed.exit_category == "start_error":
+        return CheckResult(name, "FAIL", "could not start command")
+    if completed.exit_category == "cleanup_error":
+        return CheckResult(name, "FAIL", "process-tree cleanup could not be verified")
+    if completed.exit_category == "timeout":
+        detail = f"timed out after {timeout}s"
+        return CheckResult(name, "FAIL", detail + (f": {clipped}" if clipped else ""))
+    if completed.exit_category == "output_limit":
+        return CheckResult(name, "FAIL", "output exceeded bounded command limit" + (f": {clipped}" if clipped else ""))
+    if completed.exit_code != 0:
         return CheckResult(
             name,
             "FAIL",
-            f"exit {completed.returncode}" + (f": {clipped}" if clipped else ""),
+            f"exit {completed.exit_code}" + (f": {clipped}" if clipped else ""),
         )
     if zero_tests_fail and re.search(r"\bRan\s+0\s+tests?\b", output):
         return CheckResult(name, "FAIL", "test command discovered zero tests")
@@ -137,9 +160,9 @@ def unittest_check(
 ) -> CheckResult:
     arguments = _python("-m", "unittest")
     if modules is None:
-        arguments.extend(["discover", "-s", "tests", "-v"])
+        arguments.extend(["discover", "-s", "tests"])
     else:
-        arguments.extend(["-v", *modules])
+        arguments.extend(modules)
     return run_command(
         name,
         arguments,
@@ -184,11 +207,52 @@ def attestation_check(
     )
 
 
+def token_lint_check(root: Path) -> CheckResult:
+    return run_command(
+        "token-lint",
+        _python("scripts/token_lint.py", "--root", str(root)),
+        root=root,
+        timeout=90,
+    )
+
+
+def playbook_staleness_check(root: Path) -> CheckResult:
+    return run_command(
+        "playbook-staleness",
+        _python("scripts/check_playbook_staleness.py", "--repo-root", str(root)),
+        root=root,
+        timeout=90,
+    )
+
+
+def token_benchmark_check(root: Path) -> CheckResult:
+    return run_command(
+        "token-benchmark",
+        _python("scripts/token_benchmark.py", "--repo-root", str(root)),
+        root=root,
+        timeout=90,
+    )
+
+
+def tooling_security_tests(root: Path, *, timeout: int = 600) -> CheckResult:
+    modules = [
+        "tests.test_token_hook",
+        "tests.test_session_telemetry",
+        "tests.test_bounded_run",
+        "tests.test_full_test_gate",
+        "tests.test_preflight",
+        "tests.test_release_check",
+    ]
+    return unittest_check(root, "tooling-security-tests", modules, timeout=timeout)
+
+
 def quick_checks(root: Path, *, base_sha: str, head_sha: str | None) -> list[CheckResult]:
     results = [
         run_command(
             "git-diff-check", ["git", "diff", "--check", "HEAD"], root=root, timeout=30
         ),
+        token_lint_check(root),
+        playbook_staleness_check(root),
         compile_check(root),
         ruff_check(root, ci=False),
     ]
@@ -198,6 +262,21 @@ def quick_checks(root: Path, *, base_sha: str, head_sha: str | None) -> list[Che
         "tests.test_routing_state",
         "tests.test_release_check",
         "tests.test_review_attestation",
+        "tests.test_task_packet",
+        "tests.test_token_budget",
+        "tests.test_token_profiles",
+        "tests.test_token_lint",
+        "tests.test_playbook_staleness",
+        "tests.test_bounded_run",
+        "tests.test_full_test_gate",
+        "tests.test_token_hook",
+        "tests.test_safe_state",
+        "tests.test_context_index",
+        "tests.test_validation_cache",
+        "tests.test_session_telemetry",
+        "tests.test_token_efficiency_integration",
+        "tests.test_token_efficiency_security",
+        "tests.test_token_benchmark",
     ]
     if os.environ.get(ACTIVE_ENV) != "1":
         modules.append("tests.test_preflight")
@@ -225,7 +304,16 @@ def full_local_checks(
     root: Path, *, base_sha: str, head_sha: str | None
 ) -> list[CheckResult]:
     results = quick_checks(root, base_sha=base_sha, head_sha=head_sha)
-    results.append(unittest_check(root, "full-tests", timeout=900))
+    results.append(token_benchmark_check(root))
+    results.append(
+        run_command(
+            "full-tests",
+            _python("scripts/full_test_gate.py", "--repo-root", str(root)),
+            root=root,
+            timeout=1000,
+        )
+    )
+    results.append(tooling_security_tests(root, timeout=600))
     codex = _codex_available(root)
     if codex.status == "FAIL" and "could not start" in codex.detail:
         results.append(
@@ -280,6 +368,9 @@ def ci_checks(
             ]
         return [
             ruff_check(root, ci=True),
+            token_lint_check(root),
+            playbook_staleness_check(root),
+            token_benchmark_check(root),
             release_check(
                 root,
                 base_sha=base_sha,
@@ -294,7 +385,15 @@ def ci_checks(
             ),
         ]
     if target == "test":
-        return [compile_check(root), unittest_check(root, "full-tests", timeout=900)]
+        return [
+            compile_check(root),
+            run_command(
+                "full-test-differential",
+                _python("scripts/full_test_gate.py", "--repo-root", str(root)),
+                root=root,
+                timeout=1000,
+            ),
+        ]
     if target == "lifecycle":
         return [
             run_command(

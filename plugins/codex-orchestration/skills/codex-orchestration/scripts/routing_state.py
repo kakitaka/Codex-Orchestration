@@ -10,9 +10,15 @@ from __future__ import annotations
 import re
 from typing import Any
 
+try:
+    from token_profiles import PROFILE_NAMES
+except ImportError:  # pragma: no cover - package-style import fallback
+    from .token_profiles import PROFILE_NAMES
+
 
 MANAGED_MARKER = "[codex-orchestration managed-policy v1]"
 ROUTING_TOOL_NAMESPACE = "agents"
+NATIVE_MODEL_OVERRIDE_FIELD = "expose_spawn_agent_model_overrides"
 FABLE_MODEL = "claude-fable-5"
 FABLE_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
 OPUS_MODEL = "claude-opus-5"
@@ -25,7 +31,7 @@ FABLE_SERVERS = frozenset(
     }
 )
 
-_SCHEMA_POLICY_PAIRS = {1: 1, 2: 2, 3: 3, 4: 4, 5: 5}
+_SCHEMA_POLICY_PAIRS = {1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6}
 _MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+/@-]{0,199}$")
 _AGENT_RE = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
 _EFFORT_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
@@ -191,15 +197,17 @@ def _validate_scalar_conversion(state: dict[str, Any], managed: dict[str, Any]) 
 
     _require(type(scalar_origin) is bool, "scalar origin must be null or boolean")
     _require(type(managed_feature) is dict, "scalar conversion must save a table")
+    expected_feature_keys = {
+        "enabled",
+        "hide_spawn_agent_metadata",
+        "tool_namespace",
+        "multi_agent_mode_hint_text",
+        "usage_hint_text",
+    }
+    if "model_overrides" in managed:
+        expected_feature_keys.add(NATIVE_MODEL_OVERRIDE_FIELD)
     _require(
-        set(managed_feature)
-        == {
-            "enabled",
-            "hide_spawn_agent_metadata",
-            "tool_namespace",
-            "multi_agent_mode_hint_text",
-            "usage_hint_text",
-        },
+        set(managed_feature) == expected_feature_keys,
         "managed scalar conversion table has the wrong shape",
     )
     _require(
@@ -227,10 +235,22 @@ def _validate_scalar_conversion(state: dict[str, Any], managed: dict[str, Any]) 
         and managed_feature["usage_hint_text"] == managed["usage"],
         "managed scalar conversion usage is forged",
     )
+    if "model_overrides" in managed:
+        _require(
+            managed_feature[NATIVE_MODEL_OVERRIDE_FIELD] is True,
+            "managed scalar conversion model override is forged",
+        )
+
+
+def _validate_token_profile(value: Any) -> None:
+    _require(
+        type(value) is str and value in PROFILE_NAMES,
+        "token profile is unsupported",
+    )
 
 
 def validate_routing_state(value: Any) -> dict[str, Any]:
-    """Validate and return one exact, complete persisted schema 1 through 5.
+    """Validate and return one exact, complete persisted schema 1 through 6.
 
     Unknown keys and future extensions are rejected intentionally. Callers must
     perform their own secure file read and any caller-specific path/seat checks.
@@ -254,6 +274,8 @@ def validate_routing_state(value: Any) -> dict[str, Any]:
         expected_top.add("planner")
     if schema >= 4:
         expected_top.add("designer")
+    if schema >= 6:
+        expected_top.add("token_profile")
     _require(set(value) == expected_top, "top-level state shape is unsupported")
     _require(value["managed_by"] == "codex-orchestration", "state owner is invalid")
     _require(
@@ -262,6 +284,8 @@ def validate_routing_state(value: Any) -> dict[str, Any]:
         and "\x00" not in value["config_file"],
         "config path is invalid",
     )
+    if schema >= 6:
+        _validate_token_profile(value.get("token_profile"))
 
     _validate_route(value["executor"], seat="executor", schema=schema)
     planner = value.get("planner")
@@ -285,14 +309,27 @@ def validate_routing_state(value: Any) -> dict[str, Any]:
     _require(type(previous) is dict, "previous state must be an object")
     managed_has_mcp = "mcp" in managed
     previous_has_mcp = "mcp" in previous
+    managed_has_overrides = "model_overrides" in managed
+    previous_has_overrides = "model_overrides" in previous
     _require(managed_has_mcp == previous_has_mcp, "MCP state and restore data must pair")
     _require(not managed_has_mcp or schema >= 2, "schema 1 cannot contain MCP state")
+    _require(
+        managed_has_overrides == previous_has_overrides,
+        "model override state and restore data must pair",
+    )
+    _require(
+        not managed_has_overrides or schema >= 5,
+        "legacy schema cannot contain model override state",
+    )
 
     expected_managed = set(_BASE_MANAGED_KEYS)
     expected_previous = set(_BASE_PREVIOUS_KEYS)
     if managed_has_mcp:
         expected_managed.add("mcp")
         expected_previous.add("mcp")
+    if managed_has_overrides:
+        expected_managed.add("model_overrides")
+        expected_previous.add("model_overrides")
     _require(set(managed) == expected_managed, "managed state has the wrong shape")
     _require(set(previous) == expected_previous, "restore state has the wrong shape")
     _require(_has_marker_first_line(managed["mode"]), "managed mode marker is invalid")
@@ -302,6 +339,11 @@ def validate_routing_state(value: Any) -> dict[str, Any]:
         managed["namespace"] == ROUTING_TOOL_NAMESPACE,
         "managed namespace is invalid",
     )
+    if managed_has_overrides:
+        _require(
+            managed["model_overrides"] is True,
+            "managed model override must be true",
+        )
 
     for key, expected_type in (
         ("mode", str),
@@ -310,6 +352,8 @@ def validate_routing_state(value: Any) -> dict[str, Any]:
         ("namespace", str),
     ):
         _validate_snapshot(previous[key], expected_type)
+    if managed_has_overrides:
+        _validate_snapshot(previous["model_overrides"], bool)
 
     subscription_routes = [
         route

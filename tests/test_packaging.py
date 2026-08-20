@@ -15,6 +15,15 @@ PLUGIN_ROOT = REPO_ROOT / "plugins" / "codex-orchestration"
 SKILL_ROOT = PLUGIN_ROOT / "skills" / "codex-orchestration"
 
 
+def skill_corpus() -> str:
+    core = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+    references = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted((SKILL_ROOT / "references").glob("*.md"))
+    )
+    return core + "\n" + references
+
+
 class PackagingTests(unittest.TestCase):
     def test_pull_request_review_attestation_is_strict_json(self) -> None:
         template = (REPO_ROOT / ".github/pull_request_template.md").read_text(
@@ -55,14 +64,14 @@ class PackagingTests(unittest.TestCase):
         pre_commit = REPO_ROOT / ".githooks/pre-commit"
         pre_push = REPO_ROOT / ".githooks/pre-push"
 
-        self.assertEqual(
-            pre_commit.read_text(encoding="utf-8"),
-            "#!/bin/sh\nexec python3 scripts/preflight.py quick\n",
-        )
-        self.assertEqual(
-            pre_push.read_text(encoding="utf-8"),
-            "#!/bin/sh\nexec python3 scripts/preflight.py full\n",
-        )
+        pre_commit_text = pre_commit.read_text(encoding="utf-8")
+        pre_push_text = pre_push.read_text(encoding="utf-8")
+        for text, target in ((pre_commit_text, "quick"), (pre_push_text, "full")):
+            self.assertIn("command -v python3", text)
+            self.assertIn("python3 -c 'import sys'", text)
+            self.assertIn("command -v python", text)
+            self.assertIn("python -c 'import sys'", text)
+            self.assertIn(f"scripts/preflight.py {target}", text)
         for hook in (pre_commit, pre_push):
             index = subprocess.run(
                 ["git", "ls-files", "--stage", hook.relative_to(REPO_ROOT).as_posix()],
@@ -123,7 +132,9 @@ class PackagingTests(unittest.TestCase):
 
         self.assertIn('python-version: ["3.11", "3.13"]', ci)
         self.assertIn("name: portability (${{ matrix.os }})", ci)
-        self.assertIn("os: [macos-latest, windows-latest]", ci)
+        self.assertIn(
+            "os: [ubuntu-latest, macos-latest, windows-latest]", ci
+        )
         for module in (
             "tests.test_external_cli_trust",
             "tests.test_external_configurator",
@@ -201,20 +212,99 @@ class PackagingTests(unittest.TestCase):
             "github/codeql-action/analyze@02c5e83432fe5497fd85b873b6c9f16a8578e1d9"
         )
 
-        self.assertEqual(ci.count(checkout), 5)
+        self.assertEqual(ci.count(checkout), 7)
         self.assertEqual(codeql.count(checkout), 1)
-        self.assertEqual(ci.count(setup_python), 5)
+        self.assertEqual(ci.count(setup_python), 7)
         self.assertEqual(codeql.count(setup_python), 0)
         self.assertEqual(ci.count(setup_node), 2)
         self.assertEqual(codeql.count(codeql_init), 1)
         self.assertEqual(codeql.count(codeql_analyze), 1)
-        self.assertIn("@openai/codex@0.144.1", ci)
+        self.assertIn("@openai/codex@0.147.0", ci)
         self.assertIn("@openai/codex@0.142.5", ci)
         self.assertRegex(ci, r"(?ms)^permissions:\n  contents: read\n\njobs:")
         self.assertRegex(
             codeql,
             r"(?ms)^permissions:\n  contents: read\n  security-events: write\n\njobs:",
         )
+        self.assert_metrics_and_single_required_gate_are_fail_closed()
+
+    def assert_metrics_and_single_required_gate_are_fail_closed(self) -> None:
+        workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(
+            encoding="utf-8"
+        )
+        coverage_config = (REPO_ROOT / ".coveragerc").read_text(encoding="utf-8")
+        mutation_config = (REPO_ROOT / "cosmic-ray.toml").read_text(
+            encoding="utf-8"
+        )
+        requirements = (REPO_ROOT / "requirements-metrics.txt").read_text(
+            encoding="utf-8"
+        )
+        owners = (REPO_ROOT / ".github/CODEOWNERS").read_text(encoding="utf-8")
+        gate_docs = (REPO_ROOT / "docs/ci-quality-gate.md").read_text(
+            encoding="utf-8"
+        )
+        attributes = (REPO_ROOT / ".gitattributes").read_text(encoding="utf-8")
+
+        trigger_block = workflow.split("permissions:", 1)[0]
+        self.assertNotRegex(trigger_block, r"(?m)^\s+paths(?:-ignore)?:")
+        self.assertNotIn("pull_request_target", trigger_block)
+        self.assertEqual(workflow.count("\n  required-gate:\n"), 1)
+        gate = workflow.split("\n  required-gate:\n", 1)[1]
+        self.assertIn("name: required-gate", gate)
+        self.assertIn("if: ${{ always() }}", gate)
+        self.assertNotIn("continue-on-error", workflow)
+        for dependency in (
+            "quality",
+            "test",
+            "plugin-lifecycle",
+            "legacy-client-guard",
+            "portability",
+            "coverage",
+            "mutation",
+        ):
+            self.assertIn(f"      - {dependency}\n", gate)
+            self.assertIn(f"needs.{dependency}.result", gate)
+        self.assertEqual(gate.count('test "$result" = "success"'), 1)
+
+        self.assertIn("branch = True", coverage_config)
+        self.assertIn("fail_under = 68.0", coverage_config)
+        self.assertIn("    scripts", coverage_config)
+        self.assertIn(
+            "plugins/codex-orchestration/skills/codex-orchestration/scripts",
+            coverage_config,
+        )
+        self.assertIn("python -m coverage json", workflow)
+        self.assertIn("python -m coverage report", workflow)
+
+        self.assertIn('module-path = "plugins/codex-orchestration/skills/', mutation_config)
+        self.assertIn("external_cli_trust.py", mutation_config)
+        self.assertIn('test-command = "python -m unittest tests.test_external_cli_trust"', mutation_config)
+        self.assertIn("timeout = 5.0", mutation_config)
+        self.assertNotIn("--fail-over", workflow)
+        self.assertEqual(requirements.count("coverage==7.15.3"), 1)
+        self.assertEqual(requirements.count("cosmic-ray==8.4.6"), 1)
+        self.assertIn(
+            "do not fall back to a candidate-defined check name", gate_docs
+        )
+        self.assertIn(
+            "tests/baselines/windows-ee43f3a.json text eol=lf", attributes
+        )
+
+        artifact = (
+            "actions/upload-artifact@"
+            "ea165f8d65b6e75b540449e92b4886f43607fa02"
+        )
+        self.assertEqual(workflow.count(artifact), 2)
+        for protected in (
+            "/.github/ @Cjbuilds",
+            "/.gitattributes @Cjbuilds",
+            "/scripts/ @Cjbuilds",
+            "/tests/ @Cjbuilds",
+            "/.coveragerc @Cjbuilds",
+            "/cosmic-ray.toml @Cjbuilds",
+            "/requirements-metrics.txt @Cjbuilds",
+        ):
+            self.assertIn(protected, owners)
 
     def test_quality_uses_immutable_comparison_shas_and_no_replaced_inline_checks(self) -> None:
         workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(
@@ -251,11 +341,11 @@ class PackagingTests(unittest.TestCase):
                 encoding="utf-8"
             )
         )
-        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        skill = skill_corpus()
 
         self.assertEqual(manifest["name"], "codex-orchestration")
         self.assertEqual(manifest["skills"], "./skills/")
-        self.assertEqual(manifest["version"], "0.9.3")
+        self.assertEqual(manifest["version"], "0.10.0")
         self.assertEqual(manifest["mcpServers"], "./.mcp.json")
         self.assertRegex(
             manifest["version"],
@@ -278,9 +368,75 @@ class PackagingTests(unittest.TestCase):
         self.assertFalse((SKILL_ROOT / "scripts" / "update_plugin.py").exists())
         self.assertIn("config/batchWrite", native.read_text(encoding="utf-8"))
         self.assertIn('"--repair"', native.read_text(encoding="utf-8"))
-        self.assertIn('"version": "0.9.3"', native.read_text(encoding="utf-8"))
+        self.assertIn('"version": "0.10.0"', native.read_text(encoding="utf-8"))
         self.assertIn("validate_routing_state", routing_state.read_text(encoding="utf-8"))
         self.assertIn("Standalone custom agent", custom.read_text(encoding="utf-8"))
+
+    def test_token_efficiency_helpers_and_progressive_references_are_packaged(self) -> None:
+        scripts = SKILL_ROOT / "scripts"
+        required_scripts = {
+            "bounded_run.py",
+            "context_index.py",
+            "safe_state.py",
+            "session_telemetry.py",
+            "task_packet.py",
+            "token_budget.py",
+            "token_hook.py",
+            "token_profiles.py",
+            "validation_cache.py",
+        }
+        self.assertFalse(
+            required_scripts.difference(path.name for path in scripts.glob("*.py"))
+        )
+
+        references = SKILL_ROOT / "references"
+        required_references = {
+            "compatibility-contract.md",
+            "custom-roles.md",
+            "delegation.md",
+            "invocation-and-routing.md",
+            "native-lifecycle.md",
+            "planner-advisor-workflow.md",
+            "security-and-state.md",
+            "token-efficiency.md",
+            "troubleshooting.md",
+        }
+        self.assertFalse(
+            required_references.difference(path.name for path in references.glob("*.md"))
+        )
+        self.assertLessEqual((SKILL_ROOT / "SKILL.md").stat().st_size, 12 * 1024)
+        for document in (
+            "architecture.md",
+            "configuration.md",
+            "measurement.md",
+            "threat-model.md",
+        ):
+            self.assertTrue(
+                (REPO_ROOT / "docs" / "token-efficiency" / document).is_file()
+            )
+
+    def test_token_efficiency_tests_use_the_stdlib_runner(self) -> None:
+        for name in (
+            "test_safe_state.py",
+            "test_bounded_run.py",
+            "test_context_index.py",
+            "test_full_test_gate.py",
+            "test_playbook_staleness.py",
+            "test_task_packet.py",
+            "test_validation_cache.py",
+            "test_session_telemetry.py",
+            "test_token_benchmark.py",
+            "test_token_hook.py",
+            "test_token_lint.py",
+            "test_token_profiles.py",
+            "test_token_efficiency_integration.py",
+            "test_token_efficiency_security.py",
+            "test_token_budget.py",
+        ):
+            with self.subTest(name=name):
+                source = (REPO_ROOT / "tests" / name).read_text(encoding="utf-8")
+                self.assertNotIn("import pytest", source)
+                self.assertIn("unittest.TestCase", source)
 
     def test_external_model_runtime_and_manifests_are_packaged(self) -> None:
         scripts = SKILL_ROOT / "scripts"
@@ -450,10 +606,10 @@ class PackagingTests(unittest.TestCase):
         self.assertTrue(smoke.is_file())
         self.assertIn("python scripts/preflight.py lifecycle --ci", workflow)
         self.assertIn("@openai/codex@0.142.5", workflow)
-        self.assertIn("@openai/codex@0.144.1", workflow)
+        self.assertIn("@openai/codex@0.147.0", workflow)
         smoke_text = smoke.read_text(encoding="utf-8")
         self.assertIn('OLD_VERSION = "0.5.0"', smoke_text)
-        self.assertIn('NEW_VERSION = "0.9.3"', smoke_text)
+        self.assertIn('NEW_VERSION = "0.10.0"', smoke_text)
         self.assertIn("old Advisor-only cache unexpectedly supports Planner", smoke_text)
         self.assertIn("Upgraded installed skill is missing Planner contract", smoke_text)
         self.assertIn("reused the Advisor-only 0.5.0 cache directory", smoke_text)
@@ -465,7 +621,7 @@ class PackagingTests(unittest.TestCase):
         self.assertIn('"marketplace",\n                    "upgrade"', smoke_text)
 
     def test_current_session_model_is_the_only_orchestrator(self) -> None:
-        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        skill = skill_corpus()
         readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
 
         self.assertIn("already the orchestrator", skill)
@@ -509,7 +665,7 @@ class PackagingTests(unittest.TestCase):
         self.assertLess(value, install)
 
     def test_advisor_protocol_is_bounded_and_root_only(self) -> None:
-        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        skill = skill_corpus()
 
         self.assertIn("PLAN_APPROVED", skill)
         self.assertIn("PLAN_REVISE", skill)
@@ -529,7 +685,7 @@ class PackagingTests(unittest.TestCase):
         self.assertIn("do not need to add an Anthropic API key to Codex", readme)
         self.assertIn("`.codex/agents/`", readme)
         self.assertIn("`~/.codex/agents/`", readme)
-        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        skill = skill_corpus()
         self.assertIn("explicit exact helper allowlist", skill)
         self.assertIn("unknown additional or missing primary model", skill)
 

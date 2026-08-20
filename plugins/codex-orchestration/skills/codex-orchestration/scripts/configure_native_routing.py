@@ -22,7 +22,7 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Any
+from typing import Any, Mapping
 
 from routing_state import (
     FABLE_EFFORTS,
@@ -34,6 +34,12 @@ from routing_state import (
     RoutingStateError,
     validate_routing_state,
 )
+from token_profiles import (
+    PROFILE_NAMES,
+    TokenProfile,
+    get_profile,
+    normalize_profile_name,
+)
 
 try:
     import tomllib
@@ -43,6 +49,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - Python < 3.11
 
 POLICY_VERSION = 5
 STATE_SCHEMA = 5
+PROFILE_STATE_SCHEMA = 6
 ADVISOR_REVIEW_LIMIT = 8
 STATE_FILENAME = ".codex-orchestration-routing.json"
 PROBE_VALUE = "CODEX_ORCHESTRATION_CAPABILITY_PROBE"
@@ -59,6 +66,10 @@ FABLE_SERVERS = {
 }
 RPC_TIMEOUT_SECONDS = 20
 PROBE_TIMEOUT_SECONDS = 15
+NATIVE_MODEL_OVERRIDE_FIELD = "expose_spawn_agent_model_overrides"
+HEALTHY = "HEALTHY"
+DISABLED = "DISABLED"
+UNSUPPORTED = "UNSUPPORTED"
 MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+/@-]{0,199}$")
 AGENT_RE = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
 EFFORT_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
@@ -158,6 +169,14 @@ def parse_args() -> argparse.Namespace:
         default="auto",
         help="Exact supported designer effort, or auto.",
     )
+    parser.add_argument(
+        "--token-profile",
+        choices=PROFILE_NAMES,
+        help=(
+            "Optional token budget profile. Omitting this option preserves the "
+            "legacy schema, or an already saved schema-6 profile."
+        ),
+    )
 
     parser.add_argument("--codex-bin", default="codex")
     parser.add_argument(
@@ -212,6 +231,7 @@ def _validate_args(args: argparse.Namespace) -> None:
             args.planner_effort != "auto",
             args.advisor_effort != "auto",
             args.designer_effort != "auto",
+            getattr(args, "token_profile", None) is not None,
         )
     )
     for action, selected in (
@@ -283,6 +303,9 @@ def _validate_args(args: argparse.Namespace) -> None:
                 f"{label.title()} {value!r} is a reserved Claude model ID; "
                 "select its bundled sealed route instead."
             )
+    requested_profile = getattr(args, "token_profile", None)
+    if requested_profile is not None:
+        normalize_profile_name(requested_profile)
     for label, value in (
         ("executor effort", args.executor_effort),
         ("planner effort", args.planner_effort),
@@ -391,6 +414,73 @@ def supports_native_policy(binary: Path) -> tuple[bool, str]:
     return False, (detail[:240] or f"exit {result.returncode}")
 
 
+def supports_native_model_overrides(binary: Path) -> tuple[bool, str]:
+    """Detect the 0.147 structured spawn-agent model override capability."""
+
+    with tempfile.TemporaryDirectory(prefix="codex-orchestration-override-probe-") as home:
+        env = os.environ.copy()
+        env["CODEX_HOME"] = home
+        try:
+            result = subprocess.run(
+                [
+                    str(binary),
+                    "-c",
+                    f"features.multi_agent_v2.{NATIVE_MODEL_OVERRIDE_FIELD}=true",
+                    "features",
+                    "list",
+                ],
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=PROBE_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return False, str(exc)
+    if result.returncode != 0:
+        detail = " ".join(result.stdout.strip().split())
+        return False, (detail[:240] or f"exit {result.returncode}")
+    # `features list` reports named feature gates, not nested config fields.
+    # A successful isolated config parse is the capability signal; setup and
+    # status then read back the user and effective layers separately.
+    return True, "supported"
+
+
+def native_override_health(
+    config: Mapping[str, Any],
+    *,
+    capability: bool | None,
+) -> str:
+    """Return tri-state override health without treating hidden as healthy."""
+
+    if capability is not True:
+        return UNSUPPORTED
+    value = nested_get(
+        dict(config),
+        "features",
+        "multi_agent_v2",
+        NATIVE_MODEL_OVERRIDE_FIELD,
+    )
+    return HEALTHY if value is True else DISABLED
+
+
+def require_direct_route_capability(
+    routes: tuple[dict[str, Any] | None, ...], *, supported: bool
+) -> None:
+    """Reject direct routes when the spawn override inputs are unavailable."""
+
+    direct = any(
+        isinstance(route, dict) and route.get("kind") == "model"
+        for route in routes
+    )
+    if direct and supported is not True:
+        raise ConfigurationError(
+            "Direct model routes require exposed spawn-agent model overrides. "
+            "Use a verified custom agent or the task-local fallback on this client."
+        )
+
+
 def discover_compatibility_binaries(
     target: Path, explicit: list[str]
 ) -> list[Path]:
@@ -457,7 +547,7 @@ class AppServer:
                     "clientInfo": {
                         "name": "codex_orchestration_installer",
                         "title": "Codex Orchestration Installer",
-                        "version": "0.9.3",
+                        "version": "0.10.0",
                     },
                     "capabilities": {"experimentalApi": True},
                 },
@@ -1125,7 +1215,14 @@ def build_policy(
     planner: dict[str, Any] | None,
     advisor: dict[str, Any] | None,
     designer: dict[str, Any] | None = None,
+    token_profile: str | TokenProfile | None = None,
 ) -> tuple[str, str]:
+    profile = get_profile(token_profile)
+    review_limit = (
+        profile.advisor_loops
+        if token_profile is not None
+        else ADVISOR_REVIEW_LIMIT
+    )
     advisor_review_limit = (
         "zero",
         "one",
@@ -1136,7 +1233,23 @@ def build_policy(
         "six",
         "seven",
         "eight",
-    )[ADVISOR_REVIEW_LIMIT]
+    )[review_limit]
+    review_rounds_instruction = (
+        "Use the single configured Advisor review only; a PLAN_REVISE at the "
+        "one-review limit halts before Executor."
+        if review_limit == 1
+        else (
+            f"For Advisor rounds two through {advisor_review_limit}, send only the "
+            "current plan and version plus a compact cumulative ledger, not prior "
+            "transcripts. Ask the Advisor to confirm or contest dispositions without "
+            "blindly repeating accepted findings."
+        )
+    )
+    review_limit_instruction = (
+        "A PLAN_REVISE at the one-review limit halts before Executor"
+        if review_limit == 1
+        else f"A round-{advisor_review_limit} PLAN_REVISE halts before Executor"
+    )
     has_direct_route = executor["kind"] == "model" or (
         planner is not None and planner["kind"] == "model"
     ) or (
@@ -1202,9 +1315,9 @@ If you are the root task model, you are the orchestrator. Own intent, planning, 
 
 {designer_mode}
 
-The root owns the plan version, cumulative findings ledger, review count, validation, adjudication, and release to Executor. There is no Finalizer seat. For Advisor rounds two through {advisor_review_limit}, send only the current plan and version plus a compact cumulative ledger, not prior transcripts. Ask the Advisor to confirm or contest dispositions without blindly repeating accepted findings. Reject a stale plan version or an invalid or incomplete ledger and halt before Executor.
+The root owns the plan version, cumulative findings ledger, review count, validation, adjudication, and release to Executor. There is no Finalizer seat. {review_rounds_instruction} Reject a stale plan version or an invalid or incomplete ledger and halt before Executor.
 
-On PLAN_REVISE, record the latest finding IDs before revision. After the Planner returns, validate and merge each INCORPORATED or reasoned REJECTED disposition into the cumulative ledger before another Advisor call. A round-{advisor_review_limit} PLAN_REVISE halts before Executor and produces a non-approval artifact containing the latest plan and version, full ledger, latest findings, and choices available to the user. It must not claim approval. Any required Planner or Advisor route failure also halts before Executor. Only an explicit current-task best-effort instruction changes failure handling: Planner failure permits the root to take over planning for the remaining rounds; Advisor failure may proceed only with the result labeled NOT_ADVISOR_APPROVED. No best-effort setting is persisted.
+On PLAN_REVISE, record the latest finding IDs before revision. After the Planner returns, validate and merge each INCORPORATED or reasoned REJECTED disposition into the cumulative ledger before another Advisor call. {review_limit_instruction} and produces a non-approval artifact containing the latest plan and version, full ledger, latest findings, and choices available to the user. It must not claim approval. Any required Planner or Advisor route failure also halts before Executor. Only an explicit current-task best-effort instruction changes failure handling: Planner failure permits the root to take over planning for the remaining rounds; Advisor failure may proceed only with the result labeled NOT_ADVISOR_APPROVED. No best-effort setting is persisted.
 
 When executor delegation materially improves speed, cost, quality, or context isolation, use only the configured executor route. Give each executor one bounded, self-contained packet with objective, relevant facts, constraints, owned files or read-only scope, dependencies, acceptance criteria, verification, and handoff format. Inspect every handoff, integrate it, and run final checks yourself.
 
@@ -1278,6 +1391,18 @@ Never use fork_turns = "all" with model, reasoning_effort, or agent_type: a full
 
 If you are a spawned child, do not call this tool or create descendants. Finish only your assigned packet and return to the root.
 """
+    if token_profile is not None:
+        profile_summary = (
+            f"Token profile {profile.name}: Advisor review limit "
+            f"{profile.advisor_loops}; packet soft/hard token budgets "
+            f"{profile.packet_soft_tokens}/{profile.packet_hard_tokens}; "
+            f"wave soft/hard token budgets "
+            f"{profile.wave_soft_tokens}/{profile.wave_hard_tokens}. "
+            "Soft or hard budget exhaustion blocks approval and never releases "
+            "Executor; this profile does not cap worker count."
+        )
+        mode = f"{mode}\n{profile_summary}\n"
+        usage = f"{usage}\n{profile_summary}\n"
     return mode, usage
 
 
@@ -1288,6 +1413,7 @@ def _compatibility_report(
     incompatible: list[str] = []
     for binary in binaries:
         supported, detail = supports_native_policy(binary)
+        overrides_supported, overrides_detail = supports_native_model_overrides(binary)
         version = binary_version(binary)
         results.append(
             {
@@ -1295,10 +1421,12 @@ def _compatibility_report(
                 "version": version,
                 "supported": supported,
                 "detail": detail,
+                "model_overrides": overrides_supported,
+                "model_overrides_detail": overrides_detail,
             }
         )
         state = "supports native policy" if supported else f"incompatible: {detail}"
-        print(f"Client: {binary} ({version}) — {state}")
+        print(f"Client: {binary} ({version}) - {state}")
         if not supported:
             incompatible.append(f"{binary} ({version})")
     if incompatible and not allow_incompatible:
@@ -1325,6 +1453,12 @@ def _current_values(config: dict[str, Any]) -> dict[str, Any]:
         ),
         "namespace": nested_get(
             config, "features", "multi_agent_v2", "tool_namespace"
+        ),
+        "model_overrides": nested_get(
+            config,
+            "features",
+            "multi_agent_v2",
+            NATIVE_MODEL_OVERRIDE_FIELD,
         ),
         "mcp": {
             server: nested_get(
@@ -1372,6 +1506,8 @@ def _managed_matches(state: dict[str, Any], current: dict[str, Any]) -> bool:
         and current["namespace"] == ROUTING_TOOL_NAMESPACE
     )
     if not base_matches:
+        return False
+    if "model_overrides" in managed and current.get("model_overrides") is not True:
         return False
     managed_mcp = managed.get("mcp")
     if managed_mcp is not None and not all(
@@ -1462,10 +1598,17 @@ def _status(
     require_effective: bool,
 ) -> int:
     clients_compatible = True
+    override_capabilities: list[bool] = []
     for binary in binaries:
         supported, detail = supports_native_policy(binary)
+        override_supported, override_detail = supports_native_model_overrides(binary)
         label = "compatible" if supported else f"incompatible ({detail})"
-        print(f"Client: {binary} ({binary_version(binary)}) — {label}")
+        print(f"Client: {binary} ({binary_version(binary)}) - {label}")
+        print(
+            f"Model overrides: {HEALTHY if override_supported else UNSUPPORTED} "
+            f"({override_detail})"
+        )
+        override_capabilities.append(override_supported)
         clients_compatible = clients_compatible and supported
     with AppServer(target, codex_home) as app:
         workspace = Path.cwd().resolve()
@@ -1479,6 +1622,15 @@ def _status(
         effective = _current_values(
             effective_config if isinstance(effective_config, dict) else {}
         )
+        overrides_capable = bool(override_capabilities) and all(
+            override_capabilities
+        )
+        override_health = native_override_health(
+            config,
+            capability=overrides_capable,
+        )
+        if override_health == HEALTHY and effective["model_overrides"] is not True:
+            override_health = DISABLED
         state_path = app.codex_home / STATE_FILENAME
         state = _read_state(state_path)
         _validate_state_config(state, app.config_path)
@@ -1495,20 +1647,31 @@ def _status(
             )
             if not controls_ready:
                 routing_state = "managed hints found but routing controls are incomplete"
-            elif (
+            else:
+                managed_overrides = (
+                    isinstance(state, dict)
+                    and isinstance(state.get("managed"), dict)
+                    and state["managed"].get("model_overrides") is True
+                )
+            if controls_ready and (
                 effective["mode"] == current["mode"]
                 and effective["usage"] == current["usage"]
                 and effective["metadata"] is False
                 and effective["namespace"] == ROUTING_TOOL_NAMESPACE
+                and (
+                    not managed_overrides
+                    or effective["model_overrides"] is True
+                )
             ):
                 routing_state = f"installed and effective in {workspace}"
-            else:
+            elif controls_ready:
                 routing_state = f"installed but overridden in {workspace}"
         elif current["mode"] is MISSING and current["usage"] is MISSING:
             routing_state = "inactive"
         else:
             routing_state = "partial or user-authored"
         print(f"Native policy: {routing_state}")
+        print(f"Native model override health: {override_health}")
         if routing_state == "managed fields conflict with local restore state":
             print(
                 "Recovery: run --repair as a dry run only when the saved plugin "
@@ -1521,6 +1684,8 @@ def _status(
         print(f"Config: {app.config_path}")
         subscription_available = True
         if state_matches:
+            if state.get("schema") == PROFILE_STATE_SCHEMA:
+                print(f"Token profile: {state['token_profile']}")
             print(f"Executor: {_route_summary(state['executor'])}")
             planner = state.get("planner")
             advisor = state.get("advisor")
@@ -1544,10 +1709,10 @@ def _status(
                     verify_claude_prerequisites(route["model"], route["effort"])
                 except ConfigurationError as exc:
                     subscription_available = False
-                    print(f"{label}: unavailable — {exc}")
+                    print(f"{label}: unavailable - {exc}")
                 else:
                     print(
-                        f"{label}: ready — first-party login; no model call made"
+                        f"{label}: ready - first-party login; no model call made"
                     )
             try:
                 verified = verify_agent_routes(
@@ -1558,13 +1723,13 @@ def _status(
                     advisor,
                 )
             except (ConfigurationError, KeyError, TypeError) as exc:
-                print(f"Custom-agent route: unavailable — {exc}")
+                print(f"Custom-agent route: unavailable - {exc}")
                 agent_routes_available = False
             else:
                 agent_routes_available = True
                 if verified:
                     print(
-                        "Custom-agent route: verified — "
+                        "Custom-agent route: verified - "
                         + ", ".join(str(path) for path in verified)
                     )
         elif routing_state.startswith("installed"):
@@ -1584,7 +1749,7 @@ def _status(
             if name not in referenced_roles
         }
         for issue in role_issues:
-            print(f"Managed custom-agent inspection: unavailable — {issue}")
+            print(f"Managed custom-agent inspection: unavailable - {issue}")
         if orphaned_roles:
             rendered = ", ".join(
                 f"{name} ({path})" for name, path in sorted(orphaned_roles.items())
@@ -1601,8 +1766,17 @@ def _status(
         else:
             print("V2 tool namespace: not routed through agents in this workspace")
         print(
-            "Routing validation: not performed — config compatibility and policy "
+            "Routing validation: not performed - config compatibility and policy "
             "effectiveness do not prove route acceptance or the effective child model"
+        )
+        direct_model_route = state_matches and any(
+            isinstance(route, dict) and route.get("kind") == "model"
+            for route in (
+                state.get("executor") if state else None,
+                state.get("planner") if state else None,
+                state.get("advisor") if state else None,
+                state.get("designer") if state else None,
+            )
         )
         healthy = (
             clients_compatible
@@ -1612,6 +1786,7 @@ def _status(
             and subscription_available
             and not role_issues
             and not orphaned_roles
+            and (not direct_model_route or override_health == HEALTHY)
         )
     return 1 if require_effective and not healthy else 0
 
@@ -1627,11 +1802,26 @@ def _prepare_setup_state(
     designer: dict[str, Any] | None,
     config_path: Path,
     replace_existing: bool,
+    token_profile: str | TokenProfile | None = None,
+    native_overrides: bool = False,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
     current = _current_values(config)
     feature = current["feature"]
     scalar_feature = isinstance(feature, bool)
     _guard_subscription_transition(existing_state, planner, advisor)
+
+    # A profile is opt-in.  Keep the established schema-5 state when no
+    # profile was requested; an existing schema-6 state carries its profile
+    # forward on an omitted option.
+    if token_profile is not None:
+        selected_profile = normalize_profile_name(token_profile)
+        state_schema = PROFILE_STATE_SCHEMA
+    elif isinstance(existing_state, dict) and existing_state.get("schema") == PROFILE_STATE_SCHEMA:
+        selected_profile = normalize_profile_name(existing_state.get("token_profile"))
+        state_schema = PROFILE_STATE_SCHEMA
+    else:
+        selected_profile = None
+        state_schema = STATE_SCHEMA
 
     if existing_state is not None:
         if not _managed_matches(existing_state, current):
@@ -1683,6 +1873,9 @@ def _prepare_setup_state(
             ),
         }
         scalar_origin = feature if scalar_feature else None
+
+    if native_overrides and "model_overrides" not in previous:
+        previous["model_overrides"] = snapshot(current["model_overrides"])
 
     if scalar_feature and existing_state is None:
         replacement = {
@@ -1849,12 +2042,32 @@ def _prepare_setup_state(
         "metadata": False,
         "namespace": ROUTING_TOOL_NAMESPACE,
     }
+    if native_overrides:
+        if scalar_feature:
+            replacement[NATIVE_MODEL_OVERRIDE_FIELD] = True
+            edits[0]["value"] = replacement
+            managed_feature = replacement
+        else:
+            edits.append(
+                {
+                    "keyPath": f"features.multi_agent_v2.{NATIVE_MODEL_OVERRIDE_FIELD}",
+                    "value": True,
+                    "mergeStrategy": "replace",
+                }
+            )
+            rollback_edit = snapshot_edit(
+                f"features.multi_agent_v2.{NATIVE_MODEL_OVERRIDE_FIELD}",
+                snapshot(current["model_overrides"]),
+            )
+            if rollback_edit is not None:
+                rollback.append(rollback_edit)
+        managed["model_overrides"] = True
     if managed_mcp is not None:
         managed["mcp"] = managed_mcp
 
     state = {
-        "schema": STATE_SCHEMA,
-        "policy_version": POLICY_VERSION,
+        "schema": state_schema,
+        "policy_version": state_schema,
         "managed_by": "codex-orchestration",
         "config_file": str(config_path),
         "executor": executor,
@@ -1866,6 +2079,8 @@ def _prepare_setup_state(
         "scalar_origin": scalar_origin,
         "managed_feature": managed_feature,
     }
+    if state_schema == PROFILE_STATE_SCHEMA:
+        state["token_profile"] = selected_profile
     return state, edits, rollback
 
 
@@ -1930,6 +2145,10 @@ def _repair(
     controls_match = (
         current["metadata"] is False
         and current["namespace"] == ROUTING_TOOL_NAMESPACE
+        and (
+            "model_overrides" not in managed
+            or current["model_overrides"] is True
+        )
     )
     managed_mcp = managed.get("mcp")
     mcp_matches = managed_mcp is None or all(
@@ -2165,6 +2384,10 @@ def _disable(
                         "features.multi_agent_v2.usage_hint_text",
                         previous.get("usage", {"known": False}),
                     ),
+                    snapshot_edit(
+                        f"features.multi_agent_v2.{NATIVE_MODEL_OVERRIDE_FIELD}",
+                        previous.get("model_overrides", {"known": False}),
+                    ),
                 )
                 if edit is not None
             ]
@@ -2205,9 +2428,17 @@ def main() -> int:
             )
         # Disable must remain available when the policy itself is what makes an
         # older shared-config client incompatible.
-        _compatibility_report(
+        compatibility = _compatibility_report(
             binaries,
             args.allow_incompatible_client or args.disable,
+        )
+        native_overrides = bool(
+            compatibility
+            and all(
+                item.get("supported") is True
+                and item.get("model_overrides") is True
+                for item in compatibility
+            )
         )
 
         with AppServer(target, args.codex_home) as app:
@@ -2224,6 +2455,17 @@ def main() -> int:
             state_path = app.codex_home / STATE_FILENAME
             state = _read_state(state_path)
             _validate_state_config(state, app.config_path)
+            saved_token_profile = (
+                state.get("token_profile")
+                if isinstance(state, dict)
+                and state.get("schema") == PROFILE_STATE_SCHEMA
+                else None
+            )
+            active_token_profile = (
+                args.token_profile
+                if args.token_profile is not None
+                else saved_token_profile
+            )
             if args.disable:
                 return _disable(app, config, version, state, args.apply)
             if args.repair:
@@ -2353,6 +2595,10 @@ def main() -> int:
                     "effort": designer_effort,
                 }
             validate_planning_routes(planner, advisor)
+            require_direct_route_capability(
+                (executor, planner, advisor, designer),
+                supported=native_overrides,
+            )
             subscription_prerequisites = {
                 (route["model"], route["effort"])
                 for route in (planner, advisor)
@@ -2369,7 +2615,13 @@ def main() -> int:
                 planner,
                 advisor,
             )
-            mode, usage = build_policy(executor, planner, advisor, designer)
+            mode, usage = build_policy(
+                executor,
+                planner,
+                advisor,
+                designer,
+                active_token_profile,
+            )
             new_state, edits, rollback = _prepare_setup_state(
                 config,
                 state,
@@ -2381,6 +2633,8 @@ def main() -> int:
                 designer,
                 app.config_path,
                 args.replace_existing_policy,
+                args.token_profile,
+                native_overrides,
             )
             print(f"Config: {app.config_path}")
             print("Orchestrator: model selected when each Codex task starts")
@@ -2388,6 +2642,8 @@ def main() -> int:
             print(f"Planner: {_route_summary(planner) if planner else 'root'}")
             print(f"Advisor: {_route_summary(advisor) if advisor else 'none'}")
             print(f"Designer: {_route_summary(designer) if designer else 'none'}")
+            if active_token_profile is not None:
+                print(f"Token profile: {active_token_profile}")
             if args.planner_fable and args.planner_effort in FABLE_EFFORT_ALIASES:
                 print(
                     f"Planner effort alias: {args.planner_effort} -> "
@@ -2405,7 +2661,7 @@ def main() -> int:
                     else "Claude Fable 5"
                 )
                 print(
-                    f"{subscription_label} login: ready — first-party; "
+                    f"{subscription_label} login: ready - first-party; "
                     "setup makes no model call"
                 )
             if verified_agents:

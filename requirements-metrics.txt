@@ -1,0 +1,3 @@
+# CI-only metrics tools. Production scripts remain standard-library only.
+coverage==7.15.3
+cosmic-ray==8.4.6

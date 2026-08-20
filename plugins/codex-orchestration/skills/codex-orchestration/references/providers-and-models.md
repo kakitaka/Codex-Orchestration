@@ -23,6 +23,7 @@ These facts were source-checked and runtime-tested on July 10, 2026. Always capa
 | Terra model metadata | `multi_agent_version = v2` | A Terra root also uses the native policy. |
 | Luna model metadata | `multi_agent_version = v1` | Luna is suitable as a v2 child, but a Luna root does not activate this v2 policy. |
 | `hide_spawn_agent_metadata = false` | Shows `agent_type`, `model`, `reasoning_effort`, and `service_tier` on v2 spawn | Required for direct route control; it does not select a route alone. |
+| `expose_spawn_agent_model_overrides = true` | Keeps direct `model` and `reasoning_effort` inputs exposed when the active schema provides this control | Capability-detected. `false` is `DISABLED`; absence is `UNSUPPORTED`, never a healthy direct route. |
 | `tool_namespace = "agents"` | On live-tested Desktop `0.144.0-alpha.4`, the default `collaboration` namespace rejected expanded model/effort metadata; `agents` accepted it and spawned Luna at `xhigh`. | Required for this validated direct-routing path. It changes the callable namespace but does not select Luna. |
 | `usage_hint_text` | Appended to the spawn tool description | Carries the exact Planner/Advisor/Executor routes where the root chooses children. |
 | `multi_agent_mode_hint_text` | Replaces the default proactive/explicit mode hint and is sent to root and child tasks | Must contain both root and child boundaries. |
@@ -32,7 +33,7 @@ These facts were source-checked and runtime-tested on July 10, 2026. Always capa
 | Effective concurrency | Determined by the active Codex version and `agents.max_threads` configuration | This plugin never changes the limit or forces a worker count. |
 | Older CLI 0.142.5 | Rejects `multi_agent_mode_hint_text` as an unknown feature-table field | Never write the global native policy without checking every known shared-config client. |
 
-The installer does not infer this from version strings. It launches each detected binary with an isolated `CODEX_HOME` and probes whether it can parse all four managed fields. That is a config-compatibility check, not proof of a live child route.
+The installer does not infer this from version strings. It launches each detected binary with an isolated `CODEX_HOME` and probes the four core fields plus `expose_spawn_agent_model_overrides` when that client exposes it. That is a config-compatibility check, not proof of a live child route.
 
 ## Why `enabled = true` is omitted
 
@@ -46,11 +47,12 @@ Forcing `features.multi_agent_v2.enabled = true` can:
 
 If the user's config uses the older scalar form `multi_agent_v2 = true|false`, the configurator temporarily converts that value to the equivalent table form and records the original scalar. Disable restores the exact boolean only if no other table fields were added afterward.
 
-## What the four managed fields do
+## What the managed fields do
 
 The control surface and the route are separate:
 
 - `hide_spawn_agent_metadata = false` exposes the model, effort, agent-type, and service-tier spawn inputs;
+- `expose_spawn_agent_model_overrides = true`, when supported, keeps direct model and effort overrides callable;
 - `tool_namespace = "agents"` makes the expanded route callable on the currently validated Desktop build;
 - `multi_agent_mode_hint_text` carries the root/child behavior and safety boundaries;
 - `usage_hint_text` carries the exact optional Planner, optional Advisor, and required Executor routes.
@@ -73,6 +75,16 @@ planner  -> model="gpt-5.6-sol", reasoning_effort="high", fork_turns="none"
 advisor  -> model="gpt-5.6-terra", reasoning_effort="high", fork_turns="none"
 executor -> model="gpt-5.6-luna", reasoning_effort="xhigh", fork_turns="none"
 ```
+
+Route recommendations follow this precedence: explicit user model/effort,
+applicable repository/global `AGENTS.md`, configured route, then the selected
+token-profile recommendation. After parsing an applicable AGENTS rule, callers
+may pass the exact structured `worker_requirement`
+`{"model":"gpt-5.6-luna","effort":"max"}`. Free text, including `Luna Max`,
+never elevates a route. A valid structured requirement overrides configured and
+recommended routes, while an explicit user model or effort still wins independently. For the fallback
+recommendation, `auditor`, `advisor`, and `reviewer` roles have a Sol High
+floor; Max is an escalation, not their default.
 
 For a durable custom-agent route it uses:
 
@@ -257,7 +269,20 @@ check itself reports authentication unavailable.
 
 The saved policy authorizes the root to call these planning tools and prohibits children from doing so. Current MCP requests provide no caller identity to the server, so that specific caller boundary is instruction-enforced, not server-authenticated. The bridge mechanically uses the same full saved-state validator as native status/repair/disable, restricts the operation surface, and runs the selected Claude model without tools or persistence.
 
-Saved state compatibility is explicit: schema 1 must carry policy version 1 and predates Fable and Planner; schema 2 must carry policy version 2 and may authorize only the historical Fable Advisor shape; schema 3 must carry policy version 3 and adds Planner; schema 4 must carry policy version 4 and adds the optional direct-model Designer route; schema 5 must carry policy version 5 and adds the Opus-only `claude_subscription` planning route while keeping Fable's legacy route shape unchanged. Schema and policy values must be actual JSON integers, not booleans or floats. Legacy state cannot contain fields introduced later; nested snapshots, scalar conversion, MCP launchers, and routes must match an emitted contract; and managed policy strings must carry the plugin marker before status, seat change, disable, or the bridge trusts them. Designer cannot use a bundled Claude route or a persistent unqualified agent name. Planner/Advisor may contain at most one bundled Claude subscription seat. Unknown extensions intentionally fail closed.
+Saved state compatibility is explicit: schema 1 must carry policy version 1 and predates Fable and Planner; schema 2 must carry policy version 2 and may authorize only the historical Fable Advisor shape; schema 3 must carry policy version 3 and adds Planner; schema 4 must carry policy version 4 and adds the optional direct-model Designer route; schema 5 must carry policy version 5 and adds the Opus-only `claude_subscription` planning route while keeping Fable's legacy route shape unchanged; schema 6 must carry policy version 6 and adds the optional `token_profile` field. Schema-6 profiles are exactly `legacy`, `lean`, `balanced`, or `quality`; omitting a profile preserves schema-5 behavior and never performs an implicit migration. Schema and policy values must be actual JSON integers, not booleans or floats. Legacy state cannot contain fields introduced later; nested snapshots, scalar conversion, MCP launchers, and routes must match an emitted contract; and managed policy strings must carry the plugin marker before status, seat change, disable, or the bridge trusts them. Designer cannot use a bundled Claude route or a persistent unqualified agent name. Planner/Advisor may contain at most one bundled Claude subscription seat. Unknown extensions intentionally fail closed.
+
+The token-profile limits are advisory packet/wave gates, not model downgrades:
+
+| Profile | Advisor reviews | Packet soft/hard | Wave soft/hard |
+| --- | ---: | ---: | ---: |
+| `legacy` | 8 | unlimited / unlimited | unlimited / unlimited |
+| `lean` | 1 | 3,000 / 6,000 | 12,000 / 20,000 |
+| `balanced` | 2 | 5,000 / 9,000 | 24,000 / 36,000 |
+| `quality` | 4 | 8,000 / 14,000 | 48,000 / 72,000 |
+
+Hard-budget rejection must expose the ordered remediation `deduplicate
+repeated evidence -> replace full source/logs with bounded relevant snippets ->
+split into independent packets`; it never silently truncates or releases work.
 
 Fable setup defaults to `high`. It accepts the Claude Code effort values `low`, `medium`, `high`, `xhigh`, and `max`; the user-facing label `ultra` normalizes to the effective Claude Code value `max` because the CLI has no separate Ultra setting. Setup checks the installed CLI's advertised choices before persisting the route. The bridge reads only the normalized saved value, so tool callers cannot raise the effort at review time. Existing saved `max` routes remain compatible.
 
@@ -303,7 +328,7 @@ Even when the write API requests user-config reload, this transient installer ca
 
 A personal policy can be overridden by a trusted project's `.codex/config.toml` or a managed layer. Run status from the target workspace. “Policy installed” describes the user layer; “effective in this workspace” additionally confirms that no higher-precedence layer replaces the managed fields there. Neither status proves that the model selected for a future task activates v2.
 
-Named profile-v2 files are separate selected user layers. The default command does not start App Server with `--profile`, so its write/readback does not verify a named profile. A profile user must inspect that layer separately and ensure it does not override the four routing fields, or use the task-local fallback.
+Named profile-v2 files are separate selected user layers. The default command does not start App Server with `--profile`, so its write/readback does not verify a named profile. A profile user must inspect that layer separately and ensure it does not override the capability-detected routing fields, or use the task-local fallback.
 
 ## Concurrency and service tier
 

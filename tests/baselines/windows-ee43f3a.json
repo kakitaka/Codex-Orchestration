@@ -1,0 +1,184 @@
+{
+  "schema": 1,
+  "commit": "ee43f3a522460888fa7c4174f53e9e5b4980267c",
+  "platform": "win32",
+  "rationale": "Native-Windows baseline failures at the specification commit are limited to POSIX metadata/link fixtures, extensionless fake executables, and launcher selection fixtures; no token-efficiency test is exempt.",
+  "owner": "Codex-Orchestration maintainers",
+  "expires": "2026-11-30",
+  "entries": [
+    {
+      "kind": "ERROR",
+      "node": "test_configure_orchestration.ConfigureOrchestrationTests.test_atomic_update_preserves_security_metadata",
+      "signature": "configure_orchestration.ConfigurationError: Transactional apply failed; committed files were restored: Configuration changed while preparing the update: <TMP> No files were modified; preview again.",
+      "occurrences": 1
+    },
+    {
+      "kind": "ERROR",
+      "node": "test_configure_orchestration.ConfigureOrchestrationTests.test_interrupt_after_durable_commit_marker_never_rolls_back",
+      "signature": "configure_orchestration.ConfigurationError: Transactional apply failed; committed files were restored: Configuration changed while preparing the update: <TMP> No files were modified; preview again.",
+      "occurrences": 1
+    },
+    {
+      "kind": "ERROR",
+      "node": "test_configure_orchestration.ConfigureOrchestrationTests.test_keyboard_interrupt_rolls_back_before_propagating",
+      "signature": "configure_orchestration.ConfigurationError: Transactional apply failed; committed files were restored: Configuration changed while preparing the update: <TMP> No files were modified; preview again.",
+      "occurrences": 1
+    },
+    {
+      "kind": "ERROR",
+      "node": "test_inspect_models.InspectModelsTests.test_catalog_reports_exact_binary_version_and_source",
+      "signature": "RuntimeError: Codex executable not found: <TMP>",
+      "occurrences": 1
+    },
+    {
+      "kind": "ERROR",
+      "node": "test_native_routing.NativeRoutingTests.test_repair_refuses_fable_launcher_enablement_drift",
+      "signature": "KeyError: 'fable-advisor-python3'",
+      "occurrences": 1
+    },
+    {
+      "kind": "ERROR",
+      "node": "test_native_routing.NativeRoutingTests.test_repair_refuses_integer_substitution_for_fable_boolean",
+      "signature": "KeyError: 'fable-advisor-python3'",
+      "occurrences": 1
+    },
+    {
+      "kind": "FAIL",
+      "node": "test_configure_orchestration.ConfigureOrchestrationTests.test_atomic_deletion_rejects_a_late_external_hardlink",
+      "signature": "AssertionError: \"rollback was incomplete\" does not match \"Transactional apply failed; committed files were restored: Configuration changed while preparing the update: <TMP> No files were modified; preview again.\"",
+      "occurrences": 1
+    },
+    {
+      "kind": "FAIL",
+      "node": "test_configure_orchestration.ConfigureOrchestrationTests.test_catalog_subprocesses_have_timeouts_and_json_shape_is_validated",
+      "signature": "AssertionError: \"timed out\" does not match \"Codex executable not found: <TMP>\"",
+      "occurrences": 1
+    },
+    {
+      "kind": "FAIL",
+      "node": "test_configure_orchestration.ConfigureOrchestrationTests.test_concurrent_metadata_change_is_preserved_and_aborts_publish",
+      "signature": "AssertionError: \"metadata changed\" does not match \"Transactional apply failed; committed files were restored: Configuration changed while preparing the update: <TMP> No files were modified; preview again.\"",
+      "occurrences": 1
+    },
+    {
+      "kind": "FAIL",
+      "node": "test_configure_orchestration.ConfigureOrchestrationTests.test_content_change_in_final_prepublication_window_is_preserved",
+      "signature": "AssertionError: \"content or metadata changed\" does not match \"Transactional apply failed; committed files were restored: Configuration changed while preparing the update: <TMP> No files were modified; preview again.\"",
+      "occurrences": 1
+    },
+    {
+      "kind": "FAIL",
+      "node": "test_configure_orchestration.ConfigureOrchestrationTests.test_delete_rollback_preserves_original_inode_and_xattrs",
+      "signature": "AssertionError: False is not true",
+      "occurrences": 1
+    },
+    {
+      "kind": "FAIL",
+      "node": "test_configure_orchestration.ConfigureOrchestrationTests.test_incomplete_rollback_keeps_recovery_copy",
+      "signature": "AssertionError: \"rollback was incomplete.*recovery journal kept at\" does not match \"Transactional apply failed; committed files were restored: Configuration changed while preparing the update: <TMP> No files were modified; preview again.\"",
+      "occurrences": 1
+    },
+    {
+      "kind": "FAIL",
+      "node": "test_configure_orchestration.ConfigureOrchestrationTests.test_late_link_to_original_never_receives_new_bytes",
+      "signature": "AssertionError: \"hard-link race|metadata changed\" does not match \"Transactional apply failed; committed files were restored: Configuration changed while preparing the update: <TMP> No files were modified; preview again.\"",
+      "occurrences": 1
+    },
+    {
+      "kind": "FAIL",
+      "node": "test_configure_orchestration.ConfigureOrchestrationTests.test_low_level_staging_requests_binary_descriptors_when_available",
+      "signature": "AssertionError: b'new/r/n' != b'new/n'",
+      "occurrences": 1
+    },
+    {
+      "kind": "FAIL",
+      "node": "test_configure_orchestration.ConfigureOrchestrationTests.test_metadata_change_in_final_prepublication_window_is_preserved",
+      "signature": "AssertionError: \"metadata changed\" does not match \"Transactional apply failed; committed files were restored: Configuration changed while preparing the update: <TMP> No files were modified; preview again.\"",
+      "occurrences": 1
+    },
+    {
+      "kind": "FAIL",
+      "node": "test_configure_orchestration.ConfigureOrchestrationTests.test_prepared_fallback_recovery_is_idempotent_after_replace",
+      "signature": "AssertionError: KeyboardInterrupt not raised",
+      "occurrences": 1
+    },
+    {
+      "kind": "FAIL",
+      "node": "test_configure_orchestration.ConfigureOrchestrationTests.test_prepared_recovery_refuses_metadata_tampered_staged_backup",
+      "signature": "AssertionError: ConfigurationError not raised",
+      "occurrences": 1
+    },
+    {
+      "kind": "FAIL",
+      "node": "test_configure_orchestration.ConfigureOrchestrationTests.test_prepared_recovery_uses_verified_staged_backup",
+      "signature": "AssertionError: 438 != 384",
+      "occurrences": 1
+    },
+    {
+      "kind": "FAIL",
+      "node": "test_configure_orchestration.ConfigureOrchestrationTests.test_staged_content_change_is_rejected_before_publication",
+      "signature": "AssertionError: \"metadata changed before publication\" does not match \"Transactional apply failed; committed files were restored: Configuration changed while preparing the update: <TMP> No files were modified; preview again.\"",
+      "occurrences": 1
+    },
+    {
+      "kind": "FAIL",
+      "node": "test_inspect_models.InspectModelsTests.test_invalid_utf8_subprocess_output_fails_cleanly",
+      "signature": "AssertionError: \"invalid UTF-8\" does not match \"Codex executable not found: <TMP>\"",
+      "occurrences": 1
+    },
+    {
+      "kind": "FAIL",
+      "node": "test_inspect_models.InspectModelsTests.test_malformed_catalog_shapes_fail_cleanly",
+      "signature": "AssertionError: \"invalid model entry at index 0\" does not match \"Codex executable not found: <TMP>\"",
+      "occurrences": 2
+    },
+    {
+      "kind": "FAIL",
+      "node": "test_inspect_models.InspectModelsTests.test_malformed_catalog_shapes_fail_cleanly",
+      "signature": "AssertionError: \"models array\" does not match \"Codex executable not found: <TMP>\"",
+      "occurrences": 1
+    },
+    {
+      "kind": "FAIL",
+      "node": "test_inspect_models.InspectModelsTests.test_malformed_catalog_shapes_fail_cleanly",
+      "signature": "AssertionError: \"root is not an object\" does not match \"Codex executable not found: <TMP>\"",
+      "occurrences": 1
+    },
+    {
+      "kind": "FAIL",
+      "node": "test_inspect_models.InspectModelsTests.test_malformed_reasoning_effort_fails_cleanly",
+      "signature": "AssertionError: \"invalid reasoning level\" does not match \"Codex executable not found: <TMP>\"",
+      "occurrences": 1
+    },
+    {
+      "kind": "FAIL",
+      "node": "test_inspect_models.InspectModelsTests.test_provider_id_is_validated_before_command_execution",
+      "signature": "AssertionError: \"Invalid provider ID\" does not match \"Codex executable not found: <TMP>\"",
+      "occurrences": 1
+    },
+    {
+      "kind": "FAIL",
+      "node": "test_inspect_models.InspectModelsTests.test_timeout_is_reported_without_hanging",
+      "signature": "AssertionError: \"timed out\" does not match \"Codex executable not found: <TMP>\"",
+      "occurrences": 1
+    },
+    {
+      "kind": "FAIL",
+      "node": "test_native_routing.NativeRoutingTests.test_fable_planner_with_gpt_advisor_uses_one_launcher_and_restores",
+      "signature": "AssertionError: False is not true",
+      "occurrences": 1
+    },
+    {
+      "kind": "FAIL",
+      "node": "test_native_routing.NativeRoutingTests.test_fable_setup_status_update_and_disable_restore_mcp_policy",
+      "signature": "AssertionError: False is not true",
+      "occurrences": 1
+    },
+    {
+      "kind": "FAIL",
+      "node": "test_native_routing.NativeRoutingTests.test_opus_setup_status_update_and_disable_are_no_model_call",
+      "signature": "AssertionError: {'effort': 'xhigh', 'kind': 'claude_subscri[62 chars]hon'} != {'kind': 'claude_subscription', 'model': 'c[63 chars]on3'}",
+      "occurrences": 1
+    }
+  ]
+}

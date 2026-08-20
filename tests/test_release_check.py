@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -68,8 +69,35 @@ class TempRepository:
 
 
 class ReleaseCheckTests(unittest.TestCase):
+    def test_disk_reader_rejects_hardlinked_release_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            scope = Path(temporary)
+            root = scope / "repo"
+            root.mkdir()
+            outside = scope / "outside.json"
+            outside.write_text('{"version":"1.0.0"}\n', encoding="utf-8")
+            target = root / "metadata.json"
+            os.link(outside, target)
+            with self.assertRaisesRegex(
+                RELEASE.ReleaseCheckError, "not a regular file"
+            ):
+                RELEASE._disk_reader(root)("metadata.json")
+
+    def test_git_text_is_decoded_as_utf8_not_host_locale(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=["git", "show"],
+            returncode=0,
+            stdout="token efficiency — stable\n".encode("utf-8"),
+            stderr=b"",
+        )
+        with mock.patch.object(RELEASE.subprocess, "run", return_value=completed):
+            self.assertEqual(
+                RELEASE._git(Path.cwd(), ["show", "HEAD:README.md"]),
+                "token efficiency — stable\n",
+            )
+
     def test_checkout_release_metadata_is_consistent(self) -> None:
-        self.assertEqual(RELEASE.run_check(REPO_ROOT, require_tag=False), "0.9.3")
+        self.assertEqual(RELEASE.run_check(REPO_ROOT, require_tag=False), "0.10.0")
 
     def test_unreleased_checkout_is_not_tag_ready(self) -> None:
         with self.assertRaisesRegex(RELEASE.ReleaseCheckError, "not tagged"):

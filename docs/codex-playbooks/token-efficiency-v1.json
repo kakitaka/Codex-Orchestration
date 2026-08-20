@@ -1,0 +1,70 @@
+{
+  "version": 1,
+  "name": "token-efficiency-v1",
+  "entries": [
+    {
+      "path": "plugins/codex-orchestration/skills/codex-orchestration/scripts/bounded_run.py",
+      "blob": "5c46b78da41f524fd57d49ab5fad55690eb742cf",
+      "symbols": ["BoundedResult", "StreamingRedactor", "run_bounded"],
+      "headings": [],
+      "failure_labels": ["output_limit", "start_error", "timeout"],
+      "validation": "python -m unittest tests.test_bounded_run"
+    },
+    {
+      "path": "plugins/codex-orchestration/skills/codex-orchestration/scripts/context_index.py",
+      "blob": "44186ed39ca1d7257b276a19e2ef22b7069390f1",
+      "symbols": ["ContextIndex", "RepeatedReadError", "git_blob_id"],
+      "headings": [],
+      "failure_labels": ["excluded_path", "repeated_read", "stale_blob"],
+      "validation": "python -m unittest tests.test_context_index"
+    },
+    {
+      "path": "plugins/codex-orchestration/skills/codex-orchestration/scripts/safe_state.py",
+      "blob": "be2c7c074d6cc60c37934f069cc6a2ec0ede1d28",
+      "symbols": ["UnsafePathError", "read_json", "update_json", "write_json"],
+      "headings": [],
+      "failure_labels": ["corrupt_json", "path_escape", "symlink_or_reparse"],
+      "validation": "python -m unittest tests.test_safe_state"
+    },
+    {
+      "path": "plugins/codex-orchestration/skills/codex-orchestration/scripts/session_telemetry.py",
+      "blob": "8f955e9e52d51877047683f4d0fe6ade517e5b69",
+      "symbols": ["SessionLaneManager", "TelemetryStore", "validate_telemetry_event"],
+      "headings": [],
+      "failure_labels": ["capability_mismatch", "corrupt_lane", "forbidden_telemetry_field"],
+      "validation": "python -m unittest tests.test_session_telemetry"
+    },
+    {
+      "path": "plugins/codex-orchestration/skills/codex-orchestration/scripts/task_packet.py",
+      "blob": "6b4518c0d196c50ca48a5114cd781cdc9ba3f1c3",
+      "symbols": ["DuplicatePacketRegistry", "PacketBudget", "TaskPacket", "WaveBudget", "build_task_packet"],
+      "headings": [],
+      "failure_labels": ["duplicate_packet", "hard_budget", "secret_like_material", "unstable_static_prefix"],
+      "validation": "python -m unittest tests.test_task_packet"
+    },
+    {
+      "path": "plugins/codex-orchestration/skills/codex-orchestration/scripts/token_hook.py",
+      "blob": "da3fbb5d163b19c2a4bc2eeb1d70c00d7635b2a1",
+      "symbols": ["process_payload"],
+      "headings": [],
+      "failure_labels": ["malformed_input", "noisy_command", "unsupported_event"],
+      "validation": "python -m unittest tests.test_token_hook"
+    },
+    {
+      "path": "plugins/codex-orchestration/skills/codex-orchestration/scripts/token_profiles.py",
+      "blob": "c0380e47249f62334fef1251e5741b2d669360de",
+      "symbols": ["TokenProfile", "recommend_route", "resolve_route"],
+      "headings": [],
+      "failure_labels": ["explicit_override", "profile_escalation"],
+      "validation": "python -m unittest tests.test_token_profiles"
+    },
+    {
+      "path": "plugins/codex-orchestration/skills/codex-orchestration/scripts/validation_cache.py",
+      "blob": "465d7e06763020fc38411feafb54f6056855fb7b",
+      "symbols": ["ValidationCache", "make_validation_key"],
+      "headings": [],
+      "failure_labels": ["failure_hint", "final_bypass", "incomplete_result"],
+      "validation": "python -m unittest tests.test_validation_cache"
+    }
+  ]
+}

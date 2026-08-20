@@ -524,6 +524,17 @@ class NativeRoutingTests(unittest.TestCase):
         ):
             self.assertNotIn(hard_coded, mode)
 
+    def test_profile_policy_uses_its_advisor_limit_and_stops_early(self) -> None:
+        executor = {"kind": "model", "model": "gpt-5.6-luna", "effort": "medium"}
+        advisor = {"kind": "model", "model": "gpt-5.6-sol", "effort": "high"}
+        mode, usage = NATIVE.build_policy(
+            executor, None, advisor, token_profile="lean"
+        )
+        self.assertIn("at most one total Advisor review", mode)
+        self.assertIn("PLAN_APPROVED ends review early", mode)
+        self.assertIn("one-review limit halts before Executor", mode)
+        self.assertIn("Token profile lean", usage)
+
     def test_policy_root_fallback_planner_without_advisor_and_fable_hints(self) -> None:
         executor = {"kind": "model", "model": "gpt-5.6-luna", "effort": "high"}
         advisor = {"kind": "model", "model": "gpt-5.6-terra", "effort": "high"}
@@ -687,6 +698,30 @@ class NativeRoutingTests(unittest.TestCase):
         )
         self.assertTrue(any("usage_hint_text" in value for value in argv))
 
+    def test_model_override_probe_uses_successful_config_parse(self) -> None:
+        completed = subprocess.CompletedProcess(
+            [], 0, stdout="multi_agent_v2 under-development false\n"
+        )
+        with mock.patch.object(NATIVE.subprocess, "run", return_value=completed) as run:
+            supported, detail = NATIVE.supports_native_model_overrides(self.codex)
+        self.assertTrue(supported)
+        self.assertEqual(detail, "supported")
+        self.assertIn(
+            "features.multi_agent_v2.expose_spawn_agent_model_overrides=true",
+            run.call_args.args[0],
+        )
+
+    def test_direct_route_fails_closed_without_model_override_capability(self) -> None:
+        direct = {"kind": "model", "model": "gpt-5.6-luna", "effort": "high"}
+        with self.assertRaisesRegex(NATIVE.ConfigurationError, "Direct model routes"):
+            NATIVE.require_direct_route_capability(
+                (direct, None, None, None), supported=False
+            )
+        NATIVE.require_direct_route_capability(
+            ({"kind": "agent", "agent": "worker"}, None, None, None),
+            supported=False,
+        )
+
     def test_setup_status_and_disable_round_trip(self) -> None:
         preview = self.run_script(
             "--executor-model",
@@ -763,6 +798,23 @@ class NativeRoutingTests(unittest.TestCase):
         self.assertIn("Designer: gpt-5.6-luna@medium", status.stdout)
         self.assertEqual(status.returncode, 0)
 
+    def test_direct_route_requires_effective_model_override(self) -> None:
+        self.run_script("--executor-model", "gpt-5.6-luna", "--apply")
+        config = self.read_fake_config()
+        effective = json.loads(json.dumps(config))
+        effective["features"]["multi_agent_v2"][
+            NATIVE.NATIVE_MODEL_OVERRIDE_FIELD
+        ] = False
+        (self.home / ".fake-effective-config.json").write_text(
+            json.dumps(effective), encoding="utf-8"
+        )
+        status = self.run_script(
+            "--status", "--require-effective", check=False
+        )
+        self.assertEqual(status.returncode, 1)
+        self.assertIn("Native model override health: DISABLED", status.stdout)
+        self.assertIn("installed but overridden", status.stdout)
+
     def test_legacy_state_schemas_upgrade_to_four_without_losing_restore(self) -> None:
         for legacy_schema in (1, 2, 3):
             with self.subTest(schema=legacy_schema):
@@ -773,7 +825,11 @@ class NativeRoutingTests(unittest.TestCase):
 
                 state_path = self.home / NATIVE.STATE_FILENAME
                 legacy = json.loads(state_path.read_text(encoding="utf-8"))
-                original_previous = legacy["previous"]
+                # Build an authentic legacy state.  A schema 1-3 writer could
+                # not have persisted the schema-5 model-override ownership pair.
+                legacy["managed"].pop("model_overrides", None)
+                legacy["previous"].pop("model_overrides", None)
+                original_previous = json.loads(json.dumps(legacy["previous"]))
                 legacy["schema"] = legacy_schema
                 legacy["policy_version"] = legacy_schema
                 if legacy_schema < 3:
@@ -789,6 +845,7 @@ class NativeRoutingTests(unittest.TestCase):
 
                 config = self.read_fake_config()
                 feature = config["features"]["multi_agent_v2"]
+                feature.pop(NATIVE.NATIVE_MODEL_OVERRIDE_FIELD, None)
                 feature["multi_agent_mode_hint_text"] = legacy["managed"]["mode"]
                 feature["usage_hint_text"] = legacy["managed"]["usage"]
                 (self.home / ".fake-user-config.json").write_text(
@@ -807,7 +864,12 @@ class NativeRoutingTests(unittest.TestCase):
                 upgraded = json.loads(state_path.read_text(encoding="utf-8"))
                 self.assertEqual(upgraded["schema"], 5)
                 self.assertEqual(upgraded["policy_version"], 5)
-                self.assertEqual(upgraded["previous"], original_previous)
+                expected_previous = dict(original_previous)
+                expected_previous["model_overrides"] = {
+                    "known": True,
+                    "present": False,
+                }
+                self.assertEqual(upgraded["previous"], expected_previous)
                 self.assertEqual(upgraded["planner"]["model"], "gpt-5.6-sol")
                 self.assertEqual(upgraded["designer"]["model"], "gpt-5.6-luna")
                 if legacy_schema == 2:
@@ -2756,6 +2818,34 @@ class NativeRoutingTests(unittest.TestCase):
         )
         self.assertEqual(shadowed.returncode, 2)
         self.assertIn("shadowed by a project role", shadowed.stderr)
+
+    def test_explicit_token_profile_uses_schema_six_and_is_preserved(self) -> None:
+        setup = self.run_script(
+            "--executor-model",
+            "gpt-5.6-luna",
+            "--token-profile",
+            "lean",
+            "--apply",
+        )
+        self.assertIn("Token profile: lean", setup.stdout)
+        state_path = self.home / NATIVE.STATE_FILENAME
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(state["schema"], 6)
+        self.assertEqual(state["policy_version"], 6)
+        self.assertEqual(state["token_profile"], "lean")
+
+        update = self.run_script(
+            "--executor-model",
+            "gpt-5.6-terra",
+            "--apply",
+        )
+        self.assertNotIn("Token profile: legacy", update.stdout)
+        updated = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(updated["schema"], 6)
+        self.assertEqual(updated["token_profile"], "lean")
+
+        status = self.run_script("--status")
+        self.assertIn("Token profile: lean", status.stdout)
 
 
 if __name__ == "__main__":
