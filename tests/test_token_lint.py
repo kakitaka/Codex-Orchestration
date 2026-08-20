@@ -291,6 +291,7 @@ class TokenLintTests(unittest.TestCase):
 
     def test_secret_literal_is_rejected_without_echo(self) -> None:
         root = self._clean_root()
+        # codeql[py/clear-text-storage-sensitive-data]
         secret = "AKIA" + "A" * 16
         (root / "src" / "leak.txt").write_text(secret, encoding="utf-8")
         findings = self._scan_fixture(root)

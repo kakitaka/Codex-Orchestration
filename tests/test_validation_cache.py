@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+PYTHON_EXECUTABLE = str(Path(sys.executable).resolve(strict=True))
 SCRIPTS = Path(__file__).resolve().parents[1] / "plugins/codex-orchestration/skills/codex-orchestration/scripts"
 sys.path.insert(0, str(SCRIPTS))
 
@@ -21,7 +22,7 @@ def make_key() -> cache.ValidationCacheKey:
     return cache.make_validation_key(
         ["python", "-m", "unittest", "tests"],
         cwd_relative=".",
-        executable=sys.executable,
+        executable=PYTHON_EXECUTABLE,
         executable_version="3.test",
         source_blob_ids={"module.py": digest()},
         lock_hashes={"requirements.txt": digest("b")},
@@ -146,7 +147,7 @@ class ValidationCacheTests(unittest.TestCase):
         with self.assertRaisesRegex(cache.ValidationCacheInputError, "exclusive"):
             cache.make_validation_key(
                 ["python", "-V"],
-                executable=sys.executable,
+                executable=PYTHON_EXECUTABLE,
                 executable_digest=digest("d"),
             )
 
@@ -211,7 +212,7 @@ class ValidationCacheTests(unittest.TestCase):
             validation = cache.ValidationCache(Path(tmp), ttl_seconds=60)
             key = cache.make_validation_key(
                 ["python", "-m", "unittest"],
-                executable=sys.executable,
+                executable=PYTHON_EXECUTABLE,
                 executable_version="3.test",
                 lock_hashes={"requirements.txt": digest("b")},
                 config_hashes={"pyproject.toml": digest("c")},

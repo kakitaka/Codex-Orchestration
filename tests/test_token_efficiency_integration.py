@@ -6,6 +6,7 @@ import time
 import unittest
 from pathlib import Path
 
+PYTHON_EXECUTABLE = str(Path(sys.executable).resolve(strict=True))
 SCRIPTS = Path(__file__).resolve().parents[1] / "plugins/codex-orchestration/skills/codex-orchestration/scripts"
 sys.path.insert(0, str(SCRIPTS))
 
@@ -50,8 +51,8 @@ class TokenEfficiencyIntegrationTests(unittest.TestCase):
                 self.assertEqual([line.replace("\r\n", "\n") for line in live], ["import json\n"])
 
             key = validation_cache.make_validation_key(
-                [sys.executable, "-m", "unittest", "tests.test_worker"],
-                executable=sys.executable,
+                [PYTHON_EXECUTABLE, "-m", "unittest", "tests.test_worker"],
+                executable=PYTHON_EXECUTABLE,
                 executable_version=sys.version.split()[0],
                 source_blob_ids={"src/worker.py": metadata["blob_id"]},
                 lock_hashes={"requirements.txt": "b" * 40},

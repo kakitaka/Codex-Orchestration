@@ -219,7 +219,7 @@ class PackagingTests(unittest.TestCase):
         self.assertEqual(ci.count(setup_node), 2)
         self.assertEqual(codeql.count(codeql_init), 1)
         self.assertEqual(codeql.count(codeql_analyze), 1)
-        self.assertIn("@openai/codex@0.144.1", ci)
+        self.assertIn("@openai/codex@0.147.0", ci)
         self.assertIn("@openai/codex@0.142.5", ci)
         self.assertRegex(ci, r"(?ms)^permissions:\n  contents: read\n\njobs:")
         self.assertRegex(
@@ -595,7 +595,7 @@ class PackagingTests(unittest.TestCase):
         self.assertTrue(smoke.is_file())
         self.assertIn("python scripts/preflight.py lifecycle --ci", workflow)
         self.assertIn("@openai/codex@0.142.5", workflow)
-        self.assertIn("@openai/codex@0.144.1", workflow)
+        self.assertIn("@openai/codex@0.147.0", workflow)
         smoke_text = smoke.read_text(encoding="utf-8")
         self.assertIn('OLD_VERSION = "0.5.0"', smoke_text)
         self.assertIn('NEW_VERSION = "0.10.0"', smoke_text)
