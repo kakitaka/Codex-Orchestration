@@ -10,6 +10,11 @@ from __future__ import annotations
 import re
 from typing import Any
 
+try:
+    from token_profiles import PROFILE_NAMES
+except ImportError:  # pragma: no cover - package-style import fallback
+    from .token_profiles import PROFILE_NAMES
+
 
 MANAGED_MARKER = "[codex-orchestration managed-policy v1]"
 ROUTING_TOOL_NAMESPACE = "agents"
@@ -25,7 +30,7 @@ FABLE_SERVERS = frozenset(
     }
 )
 
-_SCHEMA_POLICY_PAIRS = {1: 1, 2: 2, 3: 3, 4: 4, 5: 5}
+_SCHEMA_POLICY_PAIRS = {1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6}
 _MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+/@-]{0,199}$")
 _AGENT_RE = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
 _EFFORT_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
@@ -229,8 +234,15 @@ def _validate_scalar_conversion(state: dict[str, Any], managed: dict[str, Any]) 
     )
 
 
+def _validate_token_profile(value: Any) -> None:
+    _require(
+        type(value) is str and value in PROFILE_NAMES,
+        "token profile is unsupported",
+    )
+
+
 def validate_routing_state(value: Any) -> dict[str, Any]:
-    """Validate and return one exact, complete persisted schema 1 through 5.
+    """Validate and return one exact, complete persisted schema 1 through 6.
 
     Unknown keys and future extensions are rejected intentionally. Callers must
     perform their own secure file read and any caller-specific path/seat checks.
@@ -254,6 +266,8 @@ def validate_routing_state(value: Any) -> dict[str, Any]:
         expected_top.add("planner")
     if schema >= 4:
         expected_top.add("designer")
+    if schema >= 6:
+        expected_top.add("token_profile")
     _require(set(value) == expected_top, "top-level state shape is unsupported")
     _require(value["managed_by"] == "codex-orchestration", "state owner is invalid")
     _require(
@@ -262,6 +276,8 @@ def validate_routing_state(value: Any) -> dict[str, Any]:
         and "\x00" not in value["config_file"],
         "config path is invalid",
     )
+    if schema >= 6:
+        _validate_token_profile(value.get("token_profile"))
 
     _validate_route(value["executor"], seat="executor", schema=schema)
     planner = value.get("planner")

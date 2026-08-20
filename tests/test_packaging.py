@@ -15,6 +15,15 @@ PLUGIN_ROOT = REPO_ROOT / "plugins" / "codex-orchestration"
 SKILL_ROOT = PLUGIN_ROOT / "skills" / "codex-orchestration"
 
 
+def skill_corpus() -> str:
+    core = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+    references = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted((SKILL_ROOT / "references").glob("*.md"))
+    )
+    return core + "\n" + references
+
+
 class PackagingTests(unittest.TestCase):
     def test_pull_request_review_attestation_is_strict_json(self) -> None:
         template = (REPO_ROOT / ".github/pull_request_template.md").read_text(
@@ -251,11 +260,11 @@ class PackagingTests(unittest.TestCase):
                 encoding="utf-8"
             )
         )
-        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        skill = skill_corpus()
 
         self.assertEqual(manifest["name"], "codex-orchestration")
         self.assertEqual(manifest["skills"], "./skills/")
-        self.assertEqual(manifest["version"], "0.9.3")
+        self.assertEqual(manifest["version"], "0.10.0")
         self.assertEqual(manifest["mcpServers"], "./.mcp.json")
         self.assertRegex(
             manifest["version"],
@@ -278,9 +287,75 @@ class PackagingTests(unittest.TestCase):
         self.assertFalse((SKILL_ROOT / "scripts" / "update_plugin.py").exists())
         self.assertIn("config/batchWrite", native.read_text(encoding="utf-8"))
         self.assertIn('"--repair"', native.read_text(encoding="utf-8"))
-        self.assertIn('"version": "0.9.3"', native.read_text(encoding="utf-8"))
+        self.assertIn('"version": "0.10.0"', native.read_text(encoding="utf-8"))
         self.assertIn("validate_routing_state", routing_state.read_text(encoding="utf-8"))
         self.assertIn("Standalone custom agent", custom.read_text(encoding="utf-8"))
+
+    def test_token_efficiency_helpers_and_progressive_references_are_packaged(self) -> None:
+        scripts = SKILL_ROOT / "scripts"
+        required_scripts = {
+            "bounded_run.py",
+            "context_index.py",
+            "safe_state.py",
+            "session_telemetry.py",
+            "task_packet.py",
+            "token_budget.py",
+            "token_hook.py",
+            "token_profiles.py",
+            "validation_cache.py",
+        }
+        self.assertFalse(
+            required_scripts.difference(path.name for path in scripts.glob("*.py"))
+        )
+
+        references = SKILL_ROOT / "references"
+        required_references = {
+            "compatibility-contract.md",
+            "custom-roles.md",
+            "delegation.md",
+            "invocation-and-routing.md",
+            "native-lifecycle.md",
+            "planner-advisor-workflow.md",
+            "security-and-state.md",
+            "token-efficiency.md",
+            "troubleshooting.md",
+        }
+        self.assertFalse(
+            required_references.difference(path.name for path in references.glob("*.md"))
+        )
+        self.assertLessEqual((SKILL_ROOT / "SKILL.md").stat().st_size, 12 * 1024)
+        for document in (
+            "architecture.md",
+            "configuration.md",
+            "measurement.md",
+            "threat-model.md",
+        ):
+            self.assertTrue(
+                (REPO_ROOT / "docs" / "token-efficiency" / document).is_file()
+            )
+
+    def test_token_efficiency_tests_use_the_stdlib_runner(self) -> None:
+        for name in (
+            "test_safe_state.py",
+            "test_bounded_run.py",
+            "test_context_index.py",
+            "test_full_test_gate.py",
+            "test_playbook_staleness.py",
+            "test_task_packet.py",
+            "test_validation_cache.py",
+            "test_session_telemetry.py",
+            "test_token_benchmark.py",
+            "test_token_hook.py",
+            "test_token_lint.py",
+            "test_token_profiles.py",
+            "test_token_efficiency_integration.py",
+            "test_token_efficiency_security.py",
+            "test_token_budget.py",
+        ):
+            with self.subTest(name=name):
+                source = (REPO_ROOT / "tests" / name).read_text(encoding="utf-8")
+                self.assertNotIn("import pytest", source)
+                self.assertIn("unittest.TestCase", source)
 
     def test_external_model_runtime_and_manifests_are_packaged(self) -> None:
         scripts = SKILL_ROOT / "scripts"
@@ -453,7 +528,7 @@ class PackagingTests(unittest.TestCase):
         self.assertIn("@openai/codex@0.144.1", workflow)
         smoke_text = smoke.read_text(encoding="utf-8")
         self.assertIn('OLD_VERSION = "0.5.0"', smoke_text)
-        self.assertIn('NEW_VERSION = "0.9.3"', smoke_text)
+        self.assertIn('NEW_VERSION = "0.10.0"', smoke_text)
         self.assertIn("old Advisor-only cache unexpectedly supports Planner", smoke_text)
         self.assertIn("Upgraded installed skill is missing Planner contract", smoke_text)
         self.assertIn("reused the Advisor-only 0.5.0 cache directory", smoke_text)
@@ -465,7 +540,7 @@ class PackagingTests(unittest.TestCase):
         self.assertIn('"marketplace",\n                    "upgrade"', smoke_text)
 
     def test_current_session_model_is_the_only_orchestrator(self) -> None:
-        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        skill = skill_corpus()
         readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
 
         self.assertIn("already the orchestrator", skill)
@@ -509,7 +584,7 @@ class PackagingTests(unittest.TestCase):
         self.assertLess(value, install)
 
     def test_advisor_protocol_is_bounded_and_root_only(self) -> None:
-        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        skill = skill_corpus()
 
         self.assertIn("PLAN_APPROVED", skill)
         self.assertIn("PLAN_REVISE", skill)
@@ -529,7 +604,7 @@ class PackagingTests(unittest.TestCase):
         self.assertIn("do not need to add an Anthropic API key to Codex", readme)
         self.assertIn("`.codex/agents/`", readme)
         self.assertIn("`~/.codex/agents/`", readme)
-        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        skill = skill_corpus()
         self.assertIn("explicit exact helper allowlist", skill)
         self.assertIn("unknown additional or missing primary model", skill)
 

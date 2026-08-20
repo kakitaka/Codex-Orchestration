@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.10.0 — Unreleased
+
+- Replace the always-loaded 56 KB orchestration Skill with a sub-12 KiB stable
+  router and operation-specific references while retaining the full published
+  compatibility contract for rare audits.
+- Add deterministic `TASK_PACKET_V1`, profile and wave budgets, duplicate-work
+  detection, staged model/effort recommendations, and schema-6 opt-in profile
+  persistence without changing schema-5 behavior when no profile is selected.
+- Add derived-only blob-keyed knowledge indexing, conservative validation and
+  failure reuse, exact-match local session lanes, privacy-allowlisted token
+  telemetry, and bounded redacted command output.
+- Add current-schema hook fallbacks, token-regression lint, Git-blob playbook
+  staleness checks, threat-model coverage, and malformed/security negative tests.
+
 ## 0.9.3 — Unreleased
 
 - Raise the bounded Advisor approval loop from five to eight reviews while

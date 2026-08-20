@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 import unittest
 
 
@@ -12,7 +13,15 @@ SKILL_ROOT = (
     / "skills"
     / "codex-orchestration"
 )
-SKILL = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+CORE_SKILL = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+REFERENCE_TEXTS = {
+    path.name: path.read_text(encoding="utf-8")
+    for path in sorted((SKILL_ROOT / "references").glob("*.md"))
+}
+# Published contracts may move behind progressive-disclosure routes. Contract
+# assertions cover the routed corpus; core-only assertions below protect the
+# small always-loaded router.
+SKILL = CORE_SKILL + "\n" + "\n".join(REFERENCE_TEXTS.values())
 README = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
 REFERENCE = (SKILL_ROOT / "references" / "providers-and-models.md").read_text(
     encoding="utf-8"
@@ -30,6 +39,80 @@ RELEASE = (REPO_ROOT / "RELEASE.md").read_text(encoding="utf-8")
 
 
 class SkillContractTests(unittest.TestCase):
+    def test_core_skill_is_thin_and_every_dispatched_reference_exists(self) -> None:
+        core_path = SKILL_ROOT / "SKILL.md"
+        self.assertLessEqual(core_path.stat().st_size, 12 * 1024)
+        self.assertLessEqual(len(CORE_SKILL.splitlines()), 160)
+        links = re.findall(r"\]\(references/([^)]+\.md)\)", CORE_SKILL)
+        self.assertGreaterEqual(len(links), 10)
+        self.assertEqual(len(links), len(set(links)))
+        for name in links:
+            with self.subTest(reference=name):
+                self.assertIn(name, REFERENCE_TEXTS)
+                self.assertTrue(REFERENCE_TEXTS[name].strip())
+
+    def test_core_keeps_only_stable_router_invariants(self) -> None:
+        for contract in (
+            "already the orchestrator",
+            "Explicit user instructions win",
+            'fork_turns = "none"',
+            "TASK_PACKET_V1",
+            "PLAN_APPROVED",
+            "Never exceed eight total Advisor reviews",
+            "current user choice, applicable repository/global `AGENTS.md`",
+            "Missing usage remains `NOT_MEASURED`",
+        ):
+            self.assertIn(contract, CORE_SKILL)
+        self.assertNotIn("## External Model roles", CORE_SKILL)
+        self.assertNotIn("## Update the plugin", CORE_SKILL)
+
+    def test_common_references_are_bounded(self) -> None:
+        for name, content in REFERENCE_TEXTS.items():
+            if name in {
+                "compatibility-contract.md",
+                "external-models.md",
+                "providers-and-models.md",
+            }:
+                continue
+            with self.subTest(reference=name):
+                self.assertLessEqual(len(content.encode("utf-8")), 12 * 1024)
+
+    def test_delegation_reference_uses_the_canonical_packet_contract(self) -> None:
+        delegation = REFERENCE_TEXTS["delegation.md"]
+        expected = (
+            "1. `VERSION`\n"
+            "2. `ROLE`\n"
+            "3. `STATIC_RULES`\n"
+            "4. `GOAL`\n"
+            "5. `BASE_REVISION`\n"
+            "6. `FILES_ALLOWED`\n"
+            "7. `FILES_FORBIDDEN`\n"
+            "8. `KNOWN_FACTS`\n"
+            "9. `CONSTRAINTS`\n"
+            "10. `ACCEPTANCE_CRITERIA`\n"
+            "11. `VALIDATION`\n"
+            "12. `OUTPUT_CONTRACT`"
+        )
+        self.assertIn(expected, delegation)
+        self.assertNotIn("VALIDATION_COMMAND", delegation)
+        self.assertNotIn("EXPECTED_OUTPUT", delegation)
+
+    def test_budget_remediation_and_schema_six_are_documented(self) -> None:
+        delegation = REFERENCE_TEXTS["delegation.md"]
+        provider_reference = REFERENCE_TEXTS["providers-and-models.md"]
+        remediation = (
+            "deduplicate repeated evidence -> replace full source/logs with bounded "
+            "relevant snippets -> split into independent packets"
+        )
+        self.assertIn(remediation, delegation)
+        self.assertIn("schema 6", provider_reference)
+        self.assertIn("token_profile", provider_reference)
+        for profile in ("legacy", "lean", "balanced", "quality"):
+            self.assertIn(f"`{profile}`", provider_reference)
+        self.assertIn("worker_requirement", provider_reference)
+        self.assertIn("auditor", provider_reference)
+        self.assertIn("reviewer", provider_reference)
+
     def test_opus_is_a_sealed_subscription_planner_or_advisor(self) -> None:
         self.assertIn("advisor: Claude Opus 5 XHigh", SKILL)
         self.assertIn("--advisor-opus", SKILL)

@@ -34,6 +34,12 @@ from routing_state import (
     RoutingStateError,
     validate_routing_state,
 )
+from token_profiles import (
+    PROFILE_NAMES,
+    TokenProfile,
+    get_profile,
+    normalize_profile_name,
+)
 
 try:
     import tomllib
@@ -43,6 +49,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - Python < 3.11
 
 POLICY_VERSION = 5
 STATE_SCHEMA = 5
+PROFILE_STATE_SCHEMA = 6
 ADVISOR_REVIEW_LIMIT = 8
 STATE_FILENAME = ".codex-orchestration-routing.json"
 PROBE_VALUE = "CODEX_ORCHESTRATION_CAPABILITY_PROBE"
@@ -158,6 +165,14 @@ def parse_args() -> argparse.Namespace:
         default="auto",
         help="Exact supported designer effort, or auto.",
     )
+    parser.add_argument(
+        "--token-profile",
+        choices=PROFILE_NAMES,
+        help=(
+            "Optional token budget profile. Omitting this option preserves the "
+            "legacy schema, or an already saved schema-6 profile."
+        ),
+    )
 
     parser.add_argument("--codex-bin", default="codex")
     parser.add_argument(
@@ -212,6 +227,7 @@ def _validate_args(args: argparse.Namespace) -> None:
             args.planner_effort != "auto",
             args.advisor_effort != "auto",
             args.designer_effort != "auto",
+            getattr(args, "token_profile", None) is not None,
         )
     )
     for action, selected in (
@@ -283,6 +299,9 @@ def _validate_args(args: argparse.Namespace) -> None:
                 f"{label.title()} {value!r} is a reserved Claude model ID; "
                 "select its bundled sealed route instead."
             )
+    requested_profile = getattr(args, "token_profile", None)
+    if requested_profile is not None:
+        normalize_profile_name(requested_profile)
     for label, value in (
         ("executor effort", args.executor_effort),
         ("planner effort", args.planner_effort),
@@ -457,7 +476,7 @@ class AppServer:
                     "clientInfo": {
                         "name": "codex_orchestration_installer",
                         "title": "Codex Orchestration Installer",
-                        "version": "0.9.3",
+                        "version": "0.10.0",
                     },
                     "capabilities": {"experimentalApi": True},
                 },
@@ -1125,7 +1144,14 @@ def build_policy(
     planner: dict[str, Any] | None,
     advisor: dict[str, Any] | None,
     designer: dict[str, Any] | None = None,
+    token_profile: str | TokenProfile | None = None,
 ) -> tuple[str, str]:
+    profile = get_profile(token_profile)
+    review_limit = (
+        profile.advisor_loops
+        if token_profile is not None
+        else ADVISOR_REVIEW_LIMIT
+    )
     advisor_review_limit = (
         "zero",
         "one",
@@ -1136,7 +1162,23 @@ def build_policy(
         "six",
         "seven",
         "eight",
-    )[ADVISOR_REVIEW_LIMIT]
+    )[review_limit]
+    review_rounds_instruction = (
+        "Use the single configured Advisor review only; a PLAN_REVISE at the "
+        "one-review limit halts before Executor."
+        if review_limit == 1
+        else (
+            f"For Advisor rounds two through {advisor_review_limit}, send only the "
+            "current plan and version plus a compact cumulative ledger, not prior "
+            "transcripts. Ask the Advisor to confirm or contest dispositions without "
+            "blindly repeating accepted findings."
+        )
+    )
+    review_limit_instruction = (
+        "A PLAN_REVISE at the one-review limit halts before Executor"
+        if review_limit == 1
+        else f"A round-{advisor_review_limit} PLAN_REVISE halts before Executor"
+    )
     has_direct_route = executor["kind"] == "model" or (
         planner is not None and planner["kind"] == "model"
     ) or (
@@ -1202,9 +1244,9 @@ If you are the root task model, you are the orchestrator. Own intent, planning, 
 
 {designer_mode}
 
-The root owns the plan version, cumulative findings ledger, review count, validation, adjudication, and release to Executor. There is no Finalizer seat. For Advisor rounds two through {advisor_review_limit}, send only the current plan and version plus a compact cumulative ledger, not prior transcripts. Ask the Advisor to confirm or contest dispositions without blindly repeating accepted findings. Reject a stale plan version or an invalid or incomplete ledger and halt before Executor.
+The root owns the plan version, cumulative findings ledger, review count, validation, adjudication, and release to Executor. There is no Finalizer seat. {review_rounds_instruction} Reject a stale plan version or an invalid or incomplete ledger and halt before Executor.
 
-On PLAN_REVISE, record the latest finding IDs before revision. After the Planner returns, validate and merge each INCORPORATED or reasoned REJECTED disposition into the cumulative ledger before another Advisor call. A round-{advisor_review_limit} PLAN_REVISE halts before Executor and produces a non-approval artifact containing the latest plan and version, full ledger, latest findings, and choices available to the user. It must not claim approval. Any required Planner or Advisor route failure also halts before Executor. Only an explicit current-task best-effort instruction changes failure handling: Planner failure permits the root to take over planning for the remaining rounds; Advisor failure may proceed only with the result labeled NOT_ADVISOR_APPROVED. No best-effort setting is persisted.
+On PLAN_REVISE, record the latest finding IDs before revision. After the Planner returns, validate and merge each INCORPORATED or reasoned REJECTED disposition into the cumulative ledger before another Advisor call. {review_limit_instruction} and produces a non-approval artifact containing the latest plan and version, full ledger, latest findings, and choices available to the user. It must not claim approval. Any required Planner or Advisor route failure also halts before Executor. Only an explicit current-task best-effort instruction changes failure handling: Planner failure permits the root to take over planning for the remaining rounds; Advisor failure may proceed only with the result labeled NOT_ADVISOR_APPROVED. No best-effort setting is persisted.
 
 When executor delegation materially improves speed, cost, quality, or context isolation, use only the configured executor route. Give each executor one bounded, self-contained packet with objective, relevant facts, constraints, owned files or read-only scope, dependencies, acceptance criteria, verification, and handoff format. Inspect every handoff, integrate it, and run final checks yourself.
 
@@ -1278,6 +1320,18 @@ Never use fork_turns = "all" with model, reasoning_effort, or agent_type: a full
 
 If you are a spawned child, do not call this tool or create descendants. Finish only your assigned packet and return to the root.
 """
+    if token_profile is not None:
+        profile_summary = (
+            f"Token profile {profile.name}: Advisor review limit "
+            f"{profile.advisor_loops}; packet soft/hard token budgets "
+            f"{profile.packet_soft_tokens}/{profile.packet_hard_tokens}; "
+            f"wave soft/hard token budgets "
+            f"{profile.wave_soft_tokens}/{profile.wave_hard_tokens}. "
+            "Soft or hard budget exhaustion blocks approval and never releases "
+            "Executor; this profile does not cap worker count."
+        )
+        mode = f"{mode}\n{profile_summary}\n"
+        usage = f"{usage}\n{profile_summary}\n"
     return mode, usage
 
 
@@ -1298,7 +1352,7 @@ def _compatibility_report(
             }
         )
         state = "supports native policy" if supported else f"incompatible: {detail}"
-        print(f"Client: {binary} ({version}) — {state}")
+        print(f"Client: {binary} ({version}) - {state}")
         if not supported:
             incompatible.append(f"{binary} ({version})")
     if incompatible and not allow_incompatible:
@@ -1465,7 +1519,7 @@ def _status(
     for binary in binaries:
         supported, detail = supports_native_policy(binary)
         label = "compatible" if supported else f"incompatible ({detail})"
-        print(f"Client: {binary} ({binary_version(binary)}) — {label}")
+        print(f"Client: {binary} ({binary_version(binary)}) - {label}")
         clients_compatible = clients_compatible and supported
     with AppServer(target, codex_home) as app:
         workspace = Path.cwd().resolve()
@@ -1521,6 +1575,8 @@ def _status(
         print(f"Config: {app.config_path}")
         subscription_available = True
         if state_matches:
+            if state.get("schema") == PROFILE_STATE_SCHEMA:
+                print(f"Token profile: {state['token_profile']}")
             print(f"Executor: {_route_summary(state['executor'])}")
             planner = state.get("planner")
             advisor = state.get("advisor")
@@ -1544,10 +1600,10 @@ def _status(
                     verify_claude_prerequisites(route["model"], route["effort"])
                 except ConfigurationError as exc:
                     subscription_available = False
-                    print(f"{label}: unavailable — {exc}")
+                    print(f"{label}: unavailable - {exc}")
                 else:
                     print(
-                        f"{label}: ready — first-party login; no model call made"
+                        f"{label}: ready - first-party login; no model call made"
                     )
             try:
                 verified = verify_agent_routes(
@@ -1558,13 +1614,13 @@ def _status(
                     advisor,
                 )
             except (ConfigurationError, KeyError, TypeError) as exc:
-                print(f"Custom-agent route: unavailable — {exc}")
+                print(f"Custom-agent route: unavailable - {exc}")
                 agent_routes_available = False
             else:
                 agent_routes_available = True
                 if verified:
                     print(
-                        "Custom-agent route: verified — "
+                        "Custom-agent route: verified - "
                         + ", ".join(str(path) for path in verified)
                     )
         elif routing_state.startswith("installed"):
@@ -1584,7 +1640,7 @@ def _status(
             if name not in referenced_roles
         }
         for issue in role_issues:
-            print(f"Managed custom-agent inspection: unavailable — {issue}")
+            print(f"Managed custom-agent inspection: unavailable - {issue}")
         if orphaned_roles:
             rendered = ", ".join(
                 f"{name} ({path})" for name, path in sorted(orphaned_roles.items())
@@ -1601,7 +1657,7 @@ def _status(
         else:
             print("V2 tool namespace: not routed through agents in this workspace")
         print(
-            "Routing validation: not performed — config compatibility and policy "
+            "Routing validation: not performed - config compatibility and policy "
             "effectiveness do not prove route acceptance or the effective child model"
         )
         healthy = (
@@ -1627,11 +1683,25 @@ def _prepare_setup_state(
     designer: dict[str, Any] | None,
     config_path: Path,
     replace_existing: bool,
+    token_profile: str | TokenProfile | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
     current = _current_values(config)
     feature = current["feature"]
     scalar_feature = isinstance(feature, bool)
     _guard_subscription_transition(existing_state, planner, advisor)
+
+    # A profile is opt-in.  Keep the established schema-5 state when no
+    # profile was requested; an existing schema-6 state carries its profile
+    # forward on an omitted option.
+    if token_profile is not None:
+        selected_profile = normalize_profile_name(token_profile)
+        state_schema = PROFILE_STATE_SCHEMA
+    elif isinstance(existing_state, dict) and existing_state.get("schema") == PROFILE_STATE_SCHEMA:
+        selected_profile = normalize_profile_name(existing_state.get("token_profile"))
+        state_schema = PROFILE_STATE_SCHEMA
+    else:
+        selected_profile = None
+        state_schema = STATE_SCHEMA
 
     if existing_state is not None:
         if not _managed_matches(existing_state, current):
@@ -1853,8 +1923,8 @@ def _prepare_setup_state(
         managed["mcp"] = managed_mcp
 
     state = {
-        "schema": STATE_SCHEMA,
-        "policy_version": POLICY_VERSION,
+        "schema": state_schema,
+        "policy_version": state_schema,
         "managed_by": "codex-orchestration",
         "config_file": str(config_path),
         "executor": executor,
@@ -1866,6 +1936,8 @@ def _prepare_setup_state(
         "scalar_origin": scalar_origin,
         "managed_feature": managed_feature,
     }
+    if state_schema == PROFILE_STATE_SCHEMA:
+        state["token_profile"] = selected_profile
     return state, edits, rollback
 
 
@@ -2224,6 +2296,17 @@ def main() -> int:
             state_path = app.codex_home / STATE_FILENAME
             state = _read_state(state_path)
             _validate_state_config(state, app.config_path)
+            saved_token_profile = (
+                state.get("token_profile")
+                if isinstance(state, dict)
+                and state.get("schema") == PROFILE_STATE_SCHEMA
+                else None
+            )
+            active_token_profile = (
+                args.token_profile
+                if args.token_profile is not None
+                else saved_token_profile
+            )
             if args.disable:
                 return _disable(app, config, version, state, args.apply)
             if args.repair:
@@ -2369,7 +2452,13 @@ def main() -> int:
                 planner,
                 advisor,
             )
-            mode, usage = build_policy(executor, planner, advisor, designer)
+            mode, usage = build_policy(
+                executor,
+                planner,
+                advisor,
+                designer,
+                active_token_profile,
+            )
             new_state, edits, rollback = _prepare_setup_state(
                 config,
                 state,
@@ -2381,6 +2470,7 @@ def main() -> int:
                 designer,
                 app.config_path,
                 args.replace_existing_policy,
+                args.token_profile,
             )
             print(f"Config: {app.config_path}")
             print("Orchestrator: model selected when each Codex task starts")
@@ -2388,6 +2478,8 @@ def main() -> int:
             print(f"Planner: {_route_summary(planner) if planner else 'root'}")
             print(f"Advisor: {_route_summary(advisor) if advisor else 'none'}")
             print(f"Designer: {_route_summary(designer) if designer else 'none'}")
+            if active_token_profile is not None:
+                print(f"Token profile: {active_token_profile}")
             if args.planner_fable and args.planner_effort in FABLE_EFFORT_ALIASES:
                 print(
                     f"Planner effort alias: {args.planner_effort} -> "
@@ -2405,7 +2497,7 @@ def main() -> int:
                     else "Claude Fable 5"
                 )
                 print(
-                    f"{subscription_label} login: ready — first-party; "
+                    f"{subscription_label} login: ready - first-party; "
                     "setup makes no model call"
                 )
             if verified_agents:

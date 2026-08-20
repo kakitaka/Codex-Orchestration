@@ -61,6 +61,40 @@ Planner and Advisor can work through several revisions. Codex stops as soon as t
 
 Results depend on the models, task, context, retries, and available parallel work. The speed and limit figures are targets, not guarantees.
 
+## Token-efficient operation
+
+Version 0.10.0 keeps the same root/Planner/Advisor/Designer/Executor contracts but
+loads only a small stable Skill router plus references needed by the current
+operation. Cross-model children receive deterministic repository-relative
+`TASK_PACKET_V1` packets with `fork_turns="none"`, never a full conversation fork.
+
+Optional local helpers provide derived-only Git-blob knowledge lookup,
+validation/failure reuse, exact-match session lanes, bounded redacted tool output,
+and privacy-allowlisted usage counters. Runtime state stays under ignored
+`.codex-state/`; it never stores conversation text, raw prompts, source snippets,
+raw command logs, credentials, or absolute user paths. Final and security-critical
+validation always runs fresh.
+
+Token profiles constrain estimated packet/wave budgets and Advisor-loop length;
+they never override an explicit user choice, applicable `AGENTS.md`, or an existing
+configured route. The recommendation ladder starts with Luna Medium and escalates
+only when evidence or risk requires it. Missing live token counters remain
+`NOT_MEASURED`, so static estimates are never presented as provider cache hits or
+billed savings.
+
+Prompt-cache hits are provider/runtime behavior, not a guarantee. Git-backed
+playbooks and references still consume input tokens whenever their full text is
+sent, so load only the reference selected for the operation. Hooks are opt-in and
+retain Codex's normal workspace-trust check; remove or disable an incompatible
+hook and use the bounded helper directly. Persistent routing remains preview-first,
+requires explicit apply, verifies effective config, and rolls back its owned
+change when state persistence fails.
+
+See [architecture](docs/token-efficiency/architecture.md),
+[configuration](docs/token-efficiency/configuration.md),
+[measurement](docs/token-efficiency/measurement.md), and the
+[threat model](docs/token-efficiency/threat-model.md).
+
 ## Install
 
 ```bash
@@ -316,6 +350,8 @@ lets the natural `Designer: Kimi K3` label enter the External Model lifecycle;
 version **0.7.2 or newer** uses the concise per-role activation confirmation;
 version **0.8.0 or newer** uses sealed direct CLI invocation for READY External
 Model roles; version **0.9.0 or newer** adds Claude Opus 5 subscription routing.
+Version **0.10.0 or newer** adds progressive context loading and optional
+token-efficiency helpers without changing legacy setup when no profile is selected.
 Confirm with
 `codex plugin list --json`, then restart Codex Desktop and start a new task.
 

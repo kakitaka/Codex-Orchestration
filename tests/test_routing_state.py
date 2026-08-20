@@ -299,6 +299,32 @@ class RoutingStateTests(unittest.TestCase):
             with self.subTest(label=label), self.assertRaises(STATE.RoutingStateError):
                 STATE.validate_routing_state(state)
 
+    def test_schema_six_persists_one_valid_token_profile(self) -> None:
+        state = genuine_state(5)
+        state["schema"] = 6
+        state["policy_version"] = 6
+        state["token_profile"] = "balanced"
+        self.assertIs(STATE.validate_routing_state(state), state)
+
+        for profile in (None, "", "future", 1, True):
+            with self.subTest(profile=profile):
+                invalid = deepcopy(state)
+                invalid["token_profile"] = profile
+                with self.assertRaises(STATE.RoutingStateError):
+                    STATE.validate_routing_state(invalid)
+
+    def test_schema_six_requires_profile_and_legacy_schemas_reject_it(self) -> None:
+        state = genuine_state(5)
+        state["schema"] = 6
+        state["policy_version"] = 6
+        with self.assertRaises(STATE.RoutingStateError):
+            STATE.validate_routing_state(state)
+
+        legacy = genuine_state(5)
+        legacy["token_profile"] = "lean"
+        with self.assertRaises(STATE.RoutingStateError):
+            STATE.validate_routing_state(legacy)
+
 
 if __name__ == "__main__":
     unittest.main()

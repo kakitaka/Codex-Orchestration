@@ -114,7 +114,7 @@ def _git(root: Path, arguments: list[str], *, binary: bool = False) -> str | byt
             command,
             cwd=root,
             capture_output=True,
-            text=not binary,
+            text=False,
             check=False,
             timeout=GIT_TIMEOUT_SECONDS,
             shell=False,
@@ -128,12 +128,16 @@ def _git(root: Path, arguments: list[str], *, binary: bool = False) -> str | byt
         detail = _bounded(stderr.strip()) or "no diagnostic output"
         raise ReleaseCheckError(f"Git command failed: {command!r}: {detail}")
     output = result.stdout
-    if isinstance(output, bytes):
-        if len(output) > MAX_GIT_OUTPUT:
-            raise ReleaseCheckError(f"Git command returned excessive output: {command!r}")
-    elif len(output) > MAX_GIT_OUTPUT:
+    if len(output) > MAX_GIT_OUTPUT:
         raise ReleaseCheckError(f"Git command returned excessive output: {command!r}")
-    return output
+    if binary:
+        return output
+    try:
+        return output.decode("utf-8", "strict")
+    except UnicodeDecodeError as exc:
+        raise ReleaseCheckError(
+            f"Git command returned non-UTF-8 text: {command!r}"
+        ) from exc
 
 
 def resolve_commit(

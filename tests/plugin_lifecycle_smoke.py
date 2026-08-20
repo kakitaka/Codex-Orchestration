@@ -32,7 +32,7 @@ PLUGIN_ID = "codex-orchestration@codex-orchestration"
 MARKETPLACE_NAME = "codex-orchestration"
 OLD_RELEASE = "a1d9c546665c3253cdcaa8fe5c0c060199a6126c"
 OLD_VERSION = "0.5.0"
-NEW_VERSION = "0.9.3"
+NEW_VERSION = "0.10.0"
 COMMAND_TIMEOUT_SECONDS = 60
 
 
@@ -211,8 +211,9 @@ def serve_git(root: Path) -> Iterator[str]:
             raise SmokeFailure("Loopback Git server did not stop cleanly")
 
 
-def write_fake_codex(path: Path) -> None:
-    path.write_text(
+def write_fake_codex(path: Path) -> Path:
+    script_path = path.with_suffix(".py") if os.name == "nt" else path
+    script_path.write_text(
         """#!/usr/bin/env python3
 import json
 import sys
@@ -236,7 +237,15 @@ raise SystemExit(2)
 """,
         encoding="utf-8",
     )
-    path.chmod(0o755)
+    script_path.chmod(0o755)
+    if os.name != "nt":
+        return script_path
+    launcher = path.with_suffix(".cmd")
+    launcher.write_text(
+        f'@"{sys.executable}" "%~dp0\\{script_path.name}" %*\n',
+        encoding="utf-8",
+    )
+    return launcher
 
 
 def installed_entry(payload: dict[str, Any]) -> dict[str, Any]:
@@ -523,9 +532,13 @@ def main() -> int:
                 file_tree(PLUGIN_ROOT),
                 "installed package contents",
             )
-            installed_skill = (
-                installed_root / "skills" / "codex-orchestration" / "SKILL.md"
-            ).read_text(encoding="utf-8")
+            installed_skill_root = installed_root / "skills" / "codex-orchestration"
+            installed_skill = (installed_skill_root / "SKILL.md").read_text(
+                encoding="utf-8"
+            ) + "\n" + "\n".join(
+                path.read_text(encoding="utf-8")
+                for path in sorted((installed_skill_root / "references").glob("*.md"))
+            )
             for expected in (
                 "Explicit seat labels are authoritative",
                 "never reinterpret a supplied `planner:` model as an Advisor",
@@ -698,8 +711,7 @@ def main() -> int:
                 env=env,
             )
 
-            fake_codex = temp / "fake-codex"
-            write_fake_codex(fake_codex)
+            fake_codex = write_fake_codex(temp / "fake-codex")
             configurator = (
                 installed_root
                 / "skills"

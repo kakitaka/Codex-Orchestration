@@ -74,6 +74,14 @@ advisor  -> model="gpt-5.6-terra", reasoning_effort="high", fork_turns="none"
 executor -> model="gpt-5.6-luna", reasoning_effort="xhigh", fork_turns="none"
 ```
 
+Route recommendations follow this precedence: explicit user model/effort,
+applicable repository/global `AGENTS.md`, configured route, then the selected
+token-profile recommendation. A `worker_requirement` such as Luna Max is an
+AGENTS-level requirement: it overrides configured and recommended routes, while
+an explicit user model or effort still wins independently. For the fallback
+recommendation, `auditor`, `advisor`, and `reviewer` roles have a Sol High
+floor; Max is an escalation, not their default.
+
 For a durable custom-agent route it uses:
 
 ```text
@@ -257,7 +265,20 @@ check itself reports authentication unavailable.
 
 The saved policy authorizes the root to call these planning tools and prohibits children from doing so. Current MCP requests provide no caller identity to the server, so that specific caller boundary is instruction-enforced, not server-authenticated. The bridge mechanically uses the same full saved-state validator as native status/repair/disable, restricts the operation surface, and runs the selected Claude model without tools or persistence.
 
-Saved state compatibility is explicit: schema 1 must carry policy version 1 and predates Fable and Planner; schema 2 must carry policy version 2 and may authorize only the historical Fable Advisor shape; schema 3 must carry policy version 3 and adds Planner; schema 4 must carry policy version 4 and adds the optional direct-model Designer route; schema 5 must carry policy version 5 and adds the Opus-only `claude_subscription` planning route while keeping Fable's legacy route shape unchanged. Schema and policy values must be actual JSON integers, not booleans or floats. Legacy state cannot contain fields introduced later; nested snapshots, scalar conversion, MCP launchers, and routes must match an emitted contract; and managed policy strings must carry the plugin marker before status, seat change, disable, or the bridge trusts them. Designer cannot use a bundled Claude route or a persistent unqualified agent name. Planner/Advisor may contain at most one bundled Claude subscription seat. Unknown extensions intentionally fail closed.
+Saved state compatibility is explicit: schema 1 must carry policy version 1 and predates Fable and Planner; schema 2 must carry policy version 2 and may authorize only the historical Fable Advisor shape; schema 3 must carry policy version 3 and adds Planner; schema 4 must carry policy version 4 and adds the optional direct-model Designer route; schema 5 must carry policy version 5 and adds the Opus-only `claude_subscription` planning route while keeping Fable's legacy route shape unchanged; schema 6 must carry policy version 6 and adds the optional `token_profile` field. Schema-6 profiles are exactly `legacy`, `lean`, `balanced`, or `quality`; omitting a profile preserves schema-5 behavior and never performs an implicit migration. Schema and policy values must be actual JSON integers, not booleans or floats. Legacy state cannot contain fields introduced later; nested snapshots, scalar conversion, MCP launchers, and routes must match an emitted contract; and managed policy strings must carry the plugin marker before status, seat change, disable, or the bridge trusts them. Designer cannot use a bundled Claude route or a persistent unqualified agent name. Planner/Advisor may contain at most one bundled Claude subscription seat. Unknown extensions intentionally fail closed.
+
+The token-profile limits are advisory packet/wave gates, not model downgrades:
+
+| Profile | Advisor reviews | Packet soft/hard | Wave soft/hard |
+| --- | ---: | ---: | ---: |
+| `legacy` | 8 | unlimited / unlimited | unlimited / unlimited |
+| `lean` | 1 | 3,000 / 6,000 | 12,000 / 20,000 |
+| `balanced` | 2 | 5,000 / 9,000 | 24,000 / 36,000 |
+| `quality` | 4 | 8,000 / 14,000 | 48,000 / 72,000 |
+
+Hard-budget rejection must expose the ordered remediation `deduplicate
+repeated evidence -> replace full source/logs with bounded relevant snippets ->
+split into independent packets`; it never silently truncates or releases work.
 
 Fable setup defaults to `high`. It accepts the Claude Code effort values `low`, `medium`, `high`, `xhigh`, and `max`; the user-facing label `ultra` normalizes to the effective Claude Code value `max` because the CLI has no separate Ultra setting. Setup checks the installed CLI's advertised choices before persisting the route. The bridge reads only the normalized saved value, so tool callers cannot raise the effort at review time. Existing saved `max` routes remain compatible.
 

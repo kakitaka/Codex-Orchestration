@@ -4,7 +4,7 @@ from contextlib import redirect_stderr, redirect_stdout
 import importlib.util
 import io
 from pathlib import Path
-import subprocess
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -18,20 +18,37 @@ SPEC.loader.exec_module(PREFLIGHT)
 
 
 class PreflightTests(unittest.TestCase):
+    @staticmethod
+    def bounded_result(
+        *,
+        category: str = "ok",
+        code: int | None = 0,
+        first: str = "ok",
+        last: str = "",
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            exit_category=category,
+            exit_code=code,
+            first=first,
+            last=last,
+        )
+
     def test_command_uses_argv_without_shell_and_has_timeout(self) -> None:
-        completed = subprocess.CompletedProcess(["tool"], 0, "ok", "")
-        with mock.patch.object(PREFLIGHT.subprocess, "run", return_value=completed) as run:
+        completed = self.bounded_result()
+        with mock.patch.object(PREFLIGHT, "run_bounded", return_value=completed) as run:
             result = PREFLIGHT.run_command(
                 "example", ["tool", "literal argument"], root=REPO_ROOT, timeout=7
             )
         self.assertEqual(result.status, "PASS")
         self.assertEqual(run.call_args.args[0], ["tool", "literal argument"])
-        self.assertIs(run.call_args.kwargs["shell"], False)
         self.assertEqual(run.call_args.kwargs["timeout"], 7)
+        self.assertEqual(run.call_args.kwargs["max_bytes"], PREFLIGHT.MAX_COMMAND_BYTES)
 
     def test_missing_subprocess_fails_closed(self) -> None:
         with mock.patch.object(
-            PREFLIGHT.subprocess, "run", side_effect=FileNotFoundError("missing")
+            PREFLIGHT,
+            "run_bounded",
+            return_value=self.bounded_result(category="start_error", code=None, first=""),
         ):
             result = PREFLIGHT.run_command(
                 "missing", ["absent-tool"], root=REPO_ROOT, timeout=3
@@ -41,9 +58,9 @@ class PreflightTests(unittest.TestCase):
 
     def test_subprocess_timeout_fails_closed(self) -> None:
         with mock.patch.object(
-            PREFLIGHT.subprocess,
-            "run",
-            side_effect=subprocess.TimeoutExpired(["slow"], 3),
+            PREFLIGHT,
+            "run_bounded",
+            return_value=self.bounded_result(category="timeout", code=-1, first=""),
         ):
             result = PREFLIGHT.run_command(
                 "timeout", ["slow"], root=REPO_ROOT, timeout=3
@@ -52,10 +69,10 @@ class PreflightTests(unittest.TestCase):
         self.assertIn("timed out after 3s", result.detail)
 
     def test_zero_discovered_tests_fail_closed(self) -> None:
-        completed = subprocess.CompletedProcess(
-            ["python", "-m", "unittest"], 0, "", "Ran 0 tests in 0.000s\nOK\n"
+        completed = self.bounded_result(
+            first="Ran 0 tests in 0.000s\nOK\n"
         )
-        with mock.patch.object(PREFLIGHT.subprocess, "run", return_value=completed):
+        with mock.patch.object(PREFLIGHT, "run_bounded", return_value=completed):
             result = PREFLIGHT.run_command(
                 "tests",
                 ["python", "-m", "unittest"],
@@ -118,6 +135,16 @@ class PreflightTests(unittest.TestCase):
                 "attestation_check",
                 return_value=PREFLIGHT.CheckResult("attestation", "PASS"),
             ) as attestation,
+            mock.patch.object(
+                PREFLIGHT,
+                "token_lint_check",
+                return_value=PREFLIGHT.CheckResult("token-lint", "PASS"),
+            ),
+            mock.patch.object(
+                PREFLIGHT,
+                "playbook_staleness_check",
+                return_value=PREFLIGHT.CheckResult("playbook", "PASS"),
+            ),
         ):
             results = PREFLIGHT.ci_checks(
                 "quality",

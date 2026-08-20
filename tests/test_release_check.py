@@ -68,8 +68,21 @@ class TempRepository:
 
 
 class ReleaseCheckTests(unittest.TestCase):
+    def test_git_text_is_decoded_as_utf8_not_host_locale(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=["git", "show"],
+            returncode=0,
+            stdout="token efficiency — stable\n".encode("utf-8"),
+            stderr=b"",
+        )
+        with mock.patch.object(RELEASE.subprocess, "run", return_value=completed):
+            self.assertEqual(
+                RELEASE._git(Path.cwd(), ["show", "HEAD:README.md"]),
+                "token efficiency — stable\n",
+            )
+
     def test_checkout_release_metadata_is_consistent(self) -> None:
-        self.assertEqual(RELEASE.run_check(REPO_ROOT, require_tag=False), "0.9.3")
+        self.assertEqual(RELEASE.run_check(REPO_ROOT, require_tag=False), "0.10.0")
 
     def test_unreleased_checkout_is_not_tag_ready(self) -> None:
         with self.assertRaisesRegex(RELEASE.ReleaseCheckError, "not tagged"):

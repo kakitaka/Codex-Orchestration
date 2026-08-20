@@ -524,6 +524,17 @@ class NativeRoutingTests(unittest.TestCase):
         ):
             self.assertNotIn(hard_coded, mode)
 
+    def test_profile_policy_uses_its_advisor_limit_and_stops_early(self) -> None:
+        executor = {"kind": "model", "model": "gpt-5.6-luna", "effort": "medium"}
+        advisor = {"kind": "model", "model": "gpt-5.6-sol", "effort": "high"}
+        mode, usage = NATIVE.build_policy(
+            executor, None, advisor, token_profile="lean"
+        )
+        self.assertIn("at most one total Advisor review", mode)
+        self.assertIn("PLAN_APPROVED ends review early", mode)
+        self.assertIn("one-review limit halts before Executor", mode)
+        self.assertIn("Token profile lean", usage)
+
     def test_policy_root_fallback_planner_without_advisor_and_fable_hints(self) -> None:
         executor = {"kind": "model", "model": "gpt-5.6-luna", "effort": "high"}
         advisor = {"kind": "model", "model": "gpt-5.6-terra", "effort": "high"}
@@ -2756,6 +2767,34 @@ class NativeRoutingTests(unittest.TestCase):
         )
         self.assertEqual(shadowed.returncode, 2)
         self.assertIn("shadowed by a project role", shadowed.stderr)
+
+    def test_explicit_token_profile_uses_schema_six_and_is_preserved(self) -> None:
+        setup = self.run_script(
+            "--executor-model",
+            "gpt-5.6-luna",
+            "--token-profile",
+            "lean",
+            "--apply",
+        )
+        self.assertIn("Token profile: lean", setup.stdout)
+        state_path = self.home / NATIVE.STATE_FILENAME
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(state["schema"], 6)
+        self.assertEqual(state["policy_version"], 6)
+        self.assertEqual(state["token_profile"], "lean")
+
+        update = self.run_script(
+            "--executor-model",
+            "gpt-5.6-terra",
+            "--apply",
+        )
+        self.assertNotIn("Token profile: legacy", update.stdout)
+        updated = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(updated["schema"], 6)
+        self.assertEqual(updated["token_profile"], "lean")
+
+        status = self.run_script("--status")
+        self.assertIn("Token profile: lean", status.stdout)
 
 
 if __name__ == "__main__":

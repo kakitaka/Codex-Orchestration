@@ -110,3 +110,21 @@ provider endpoints are trusted dependencies. The plugin does not weaken sandbox 
 approval settings and cannot guarantee that policy-guided delegation is
 engine-enforced. See the README and External Models reference for the operational
 contract.
+
+Token-efficiency state is a separate optional local boundary under ignored
+`.codex-state/`. The knowledge index stores only repository-relative paths, Git blob
+IDs, derived heading/symbol/import names, kinds, and line numbers; it never stores
+source or snippets. A requested live range requires containment and current-blob
+revalidation and is never cached. Validation entries store bounded status and
+approved digests, not argv, output, secrets, or absolute paths. Only a complete
+deterministic ordinary pass is reusable; final and security-critical checks bypass
+the cache, and known failures remain hints rather than successful validation.
+
+Session lanes and token telemetry use distinct strict schemas and files. Lane IDs
+are keyed locally and never exported. Telemetry accepts only documented numeric
+usage/counters plus approved packet/blob IDs; it rejects paths, branches, commands,
+prompts, source/snippets, output/logs, environment/auth data, and session, lane, or
+resume identifiers before writing. Bounded command execution uses argv without a
+shell, redacts before optional capped persistence, rejects link/reparse escapes,
+and defaults to no diagnostic log. See `docs/token-efficiency/threat-model.md` for
+assets, residual risk, and required negative tests.
