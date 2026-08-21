@@ -45,6 +45,18 @@ When an authorized client exposes usage, record only:
 
 If any counter is unavailable, store/report `NOT_MEASURED`, not zero. No raw prompt, source, output, command, path, session, or auth data enters measurement artifacts.
 
+## Free passive local report
+
+`scripts/passive_usage_report.py` reads already-written Codex session JSONL and writes nothing. It performs no network or model call, exports numeric aggregates only, and never emits a path, session ID, prompt, source, or tool output. It sums event-level `last_token_usage`; it deliberately ignores cumulative `total_token_usage` so a session is not double-counted.
+
+Compare explicit periods in one command:
+
+```text
+python scripts/passive_usage_report.py --sessions-root <codex-sessions-root> --baseline-start 2026-08-20T03:59:30Z --baseline-end 2026-08-20T14:23:44Z --start 2026-08-20T23:58:05Z --end 2026-08-21T04:27:21Z --pretty
+```
+
+The report gives input/cached/uncached/output token rates, cache-hit ratio, model-and-effort strata, and a monotone high-water estimate of the 10,080-minute quota's percentage-points/hour. Quota percentage and raw token volume are separate measures. Treat before/after deltas as observational until model, effort, and task mix match.
+
 ## Comparison
 
 Report before and after independently for core Skill bytes/lines, selected-reference bytes, deterministic packet bytes, duplicate suppression, advisory validation/failure-cache hits, and bounded output bytes. Bind baseline bytes to the declared Git object and after bytes to the clean benchmark commit. Claim provider cache-hit improvement only from actual cached/input counters; otherwise report architecture readiness plus `NOT_MEASURED`.
