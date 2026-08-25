@@ -138,13 +138,13 @@ class TokenLintTests(unittest.TestCase):
             any(finding.code == "ACCIDENTAL_MAX_DEFAULT" for finding in findings)
         )
 
-    def test_only_exact_reviewed_preset_effort_constants_allow_max(self) -> None:
+    def test_only_escalation_roles_allow_reviewed_preset_max(self) -> None:
         root = self._clean_root()
         scripts = root / "plugins" / "codex-orchestration" / "skills" / "codex-orchestration" / "scripts"
         scripts.mkdir(parents=True)
         routing = scripts / "routing_state.py"
         routing.write_text(
-            'TERRA_LUNA_SOL_ESCALATION_ROOT_EFFORT = "max"\n'
+            'TERRA_LUNA_SOL_ESCALATION_ROOT_EFFORT = "medium"\n'
             'TERRA_LUNA_SOL_ESCALATION_EXECUTOR_EFFORT = "max"\n'
             'TERRA_LUNA_SOL_ESCALATION_ADVISOR_EFFORT = "max"\n',
             encoding="utf-8",
@@ -158,6 +158,17 @@ class TokenLintTests(unittest.TestCase):
 
         routing.write_text(
             'TERRA_LUNA_SOL_ESCALATION_WORKER_EFFORT = "max"\n',
+            encoding="utf-8",
+        )
+        self.assertTrue(
+            any(
+                finding.code == "ACCIDENTAL_MAX_DEFAULT"
+                for finding in self._scan_fixture(root)
+            )
+        )
+
+        routing.write_text(
+            'TERRA_LUNA_SOL_ESCALATION_ROOT_EFFORT = "max"\n',
             encoding="utf-8",
         )
         self.assertTrue(
@@ -247,6 +258,35 @@ class TokenLintTests(unittest.TestCase):
         ):
             findings = token_lint.scan(root)
         self.assertTrue(all("plugins/" not in item.path for item in findings))
+
+    def test_generated_preset_policy_budget_is_enforced(self) -> None:
+        root = self._clean_root()
+        plugin = root / "plugins/codex-orchestration"
+        scripts = plugin / "skills/codex-orchestration/scripts"
+        scripts.mkdir(parents=True)
+        (plugin / ".codex-plugin").mkdir()
+        (plugin / ".codex-plugin/plugin.json").write_text("{}\n", encoding="utf-8")
+        routing = scripts / "configure_native_routing.py"
+        routing.write_text(
+            "PROFILE_STATE_SCHEMA = 6\n"
+            "ADVISOR_REVIEW_LIMIT = 8\n"
+            "PRESET_POLICY_MAX_BYTES = 5000\n"
+            "profile.advisor_loops\n",
+            encoding="utf-8",
+        )
+        codes = {finding.code for finding in self._scan_fixture(root)}
+        self.assertIn("PRESET_POLICY_BUDGET", codes)
+
+        routing.write_text(
+            "PROFILE_STATE_SCHEMA = 6\n"
+            "ADVISOR_REVIEW_LIMIT = 8\n"
+            "PRESET_POLICY_MAX_BYTES = 3200\n"
+            "profile.advisor_loops\n"
+            "if size > PRESET_POLICY_MAX_BYTES: raise RuntimeError\n",
+            encoding="utf-8",
+        )
+        codes = {finding.code for finding in self._scan_fixture(root)}
+        self.assertNotIn("PRESET_POLICY_BUDGET", codes)
 
     def test_markdown_links_use_the_tracked_index_not_untracked_files(self) -> None:
         root = self._clean_root()

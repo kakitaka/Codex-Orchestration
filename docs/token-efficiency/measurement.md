@@ -55,7 +55,11 @@ Compare explicit periods in one command:
 python scripts/passive_usage_report.py --sessions-root <codex-sessions-root> --baseline-start 2026-08-20T03:59:30Z --baseline-end 2026-08-20T14:23:44Z --start 2026-08-20T23:58:05Z --end 2026-08-21T04:27:21Z --pretty
 ```
 
-The report gives input/cached/uncached/output token rates, cache-hit ratio, model-and-effort strata, and a monotone high-water estimate of the 10,080-minute quota's percentage-points/hour. Quota percentage and raw token volume are separate measures. Treat before/after deltas as observational until model, effort, and task mix match.
+The report gives input/cached/uncached/output token rates, cache-hit ratio, input and uncached-input tokens per usage event, model-and-effort strata, root-or-legacy versus worker strata, and fixed task-family strata. Model identifiers must match a bounded current Codex model shape or become `unknown`; arbitrary metadata strings are never exported. The task-family vocabulary is `implementation`, `research`, `audit`, `validation`, `documentation`, `configuration`, `operations`, `testing`, and `other`. Missing or malformed role metadata is treated as `root_or_legacy`; missing or unknown task metadata is treated as `other`. Task-family output is limited to that bounded vocabulary and never emits a raw task name. A monotone high-water estimate of the 10,080-minute quota's percentage-points/hour is also included. Quota percentage and raw token volume are separate measures.
+
+Comparison uses usage-event shares with a fixed absolute tolerance of 0.10 (10 percentage points) for model, effort, their joint distribution, root/worker, and task-family. Any `unknown` model/effort or `other` task-family share is uninformative and returns a `MISSING_*_MIX` reason; it is never accepted as evidence of matched work. A changed or unmeasured composition returns `comparison.status = NOT_COMPARABLE`; the stable `comparison.metrics` keys remain present but all are `NOT_MEASURED`, so no token delta is implied. A like-for-like comparison returns `COMPARABLE` and keeps `interpretation = OBSERVATIONAL_ONLY`.
+
+Quota-rate comparison is `NOT_MEASURED` unless each report has exactly one measured weekly window and both windows have the same normalized reset bucket. Multiple windows, a missing bucket, or different buckets are never combined.
 
 ## Comparison
 

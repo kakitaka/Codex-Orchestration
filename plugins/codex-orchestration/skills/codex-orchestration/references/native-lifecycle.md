@@ -28,11 +28,11 @@ Normal setup stores pre-setup values and rolls back config if state persistence 
 Treat the exact request `setup preset: Terra-Luna-Sol Escalation` as persistent
 native setup for `--preset terra-luna-sol-escalation`. It seals Luna @ Max as the
 default Executor route, leaves Planner, Advisor, and Designer unset, and records no
-root model. The user selects Terra @ Max when starting the next task. Sol @ Max is
+root model. The user selects Terra @ Medium for a normal next task. Sol @ Max is
 an escalation-only audit for the enumerated high-risk cases in
 [providers-and-models.md](providers-and-models.md), never a persisted Advisor.
 
-Exact policy: expected root `gpt-5.6-terra` at `max`; saved Executor
+Exact policy: expected normal root `gpt-5.6-terra` at `medium`; saved Executor
 `gpt-5.6-luna` at `max`; optional escalation Advisor `gpt-5.6-sol` at `max`.
 Ordinary work has no Advisor approval loop. Escalation requires security, auth, or
 secrets; database schema or destructive migration; public API or
@@ -44,8 +44,8 @@ callability; do not substitute a model when either check fails.
 Preview, then apply only after the preview succeeds:
 
 ```text
-python <skill-dir>/scripts/configure_native_routing.py --codex-bin <active-codex-binary> --preset terra-luna-sol-escalation
-python <skill-dir>/scripts/configure_native_routing.py --codex-bin <active-codex-binary> --preset terra-luna-sol-escalation --apply
+python <skill-dir>/scripts/configure_native_routing.py --codex-bin <active-codex-binary> --preset terra-luna-sol-escalation --token-profile lean
+python <skill-dir>/scripts/configure_native_routing.py --codex-bin <active-codex-binary> --preset terra-luna-sol-escalation --token-profile lean --apply
 ```
 
 An optional `--token-profile` may accompany the preset because it controls packet,

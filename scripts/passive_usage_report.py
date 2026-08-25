@@ -29,8 +29,73 @@ MAX_FILES = 4_096
 MAX_FILE_BYTES = 128 * 1024 * 1024
 MAX_LINE_CHARS = 4 * 1024 * 1024
 MAX_TOKEN_COUNT = 10**12
-MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
-EFFORTS = {"low", "medium", "high", "xhigh", "max", "ultra"}
+MAX_METADATA_DEPTH = 8
+MODEL_RE = re.compile(
+    r"(?i)(?:gpt-[0-9]{1,2}(?:\.[0-9]{1,2}){0,2}"
+    r"(?:-(?:luna|terra|sol|codex))?|o[1-9](?:-(?:mini|pro))?|"
+    r"codex-mini-latest)"
+)
+EFFORTS = {"minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
+
+# Composition is compared by usage-event share.  A ten percentage-point
+# absolute difference is the largest change still treated as a like-for-like
+# observation.  This is deliberately fixed and visible in the report docs so
+# a later caller cannot silently tune the comparison to its result.
+MIX_TOLERANCE = 0.10
+ROOT_OR_LEGACY = "root_or_legacy"
+WORKER = "worker"
+ROOT_WORKER_CLASSES = (ROOT_OR_LEGACY, WORKER)
+TASK_FAMILIES = (
+    "implementation",
+    "research",
+    "audit",
+    "validation",
+    "documentation",
+    "configuration",
+    "operations",
+    "testing",
+    "other",
+)
+_TASK_FAMILY_ALIASES = {
+    "implementation": "implementation",
+    "implementation-worker": "implementation",
+    "impl": "implementation",
+    "build": "implementation",
+    "coding": "implementation",
+    "research": "research",
+    "research-worker": "research",
+    "audit": "audit",
+    "review": "audit",
+    "validation": "validation",
+    "verification": "validation",
+    "testing": "testing",
+    "test": "testing",
+    "documentation": "documentation",
+    "docs": "documentation",
+    "configuration": "configuration",
+    "config": "configuration",
+    "operations": "operations",
+    "operation": "operations",
+}
+_WORKER_MARKERS = {
+    "worker",
+    "execution-worker",
+    "implementation-worker",
+    "verification-worker",
+    "research-worker",
+    "subagent",
+    "child",
+    "executor",
+}
+_ROOT_MARKERS = {
+    "root",
+    "root-or-legacy",
+    "root_or_legacy",
+    "legacy",
+    "orchestrator",
+    "main",
+    "parent",
+}
 
 
 class PassiveUsageError(ValueError):
@@ -161,6 +226,12 @@ class UsageTotals:
                 self.reasoning_output_tokens if has_reasoning else None
             ),
             "cache_hit_ratio": cache_hit_ratio,
+            "rates_per_usage_event": {
+                "input_tokens": _per_usage_event(input_tokens, self.usage_events),
+                "uncached_input_tokens": _per_usage_event(
+                    uncached_input_tokens, self.usage_events
+                ),
+            },
             "rates_per_hour": {
                 "usage_events": _per_hour(self.usage_events, period),
                 "input_tokens": _per_hour(input_tokens, period),
@@ -234,6 +305,115 @@ def _safe_effort(value: Any) -> str:
     return value if isinstance(value, str) and value in EFFORTS else "unknown"
 
 
+def _safe_marker(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    # Metadata is used only as a bounded classifier.  Never preserve the raw
+    # value, including when it is malformed or contains user task text.
+    return value.strip().lower()[:128]
+
+
+def _role_from_mapping(
+    payload: Mapping[str, Any], *, _depth: int = 0
+) -> str | None:
+    """Classify explicit role metadata; absent/malformed means legacy root."""
+
+    if _depth >= MAX_METADATA_DEPTH:
+        return None
+    supplied = False
+    for key in ("is_worker", "worker", "worker_mode", "is_subagent"):
+        supplied = supplied or key in payload
+        value = payload.get(key)
+        if type(value) is bool:
+            return WORKER if value else ROOT_OR_LEGACY
+    for key in (
+        "root_worker",
+        "root_or_worker",
+        "agent_role",
+        "execution_role",
+        "task_role",
+        "worker_role",
+        "lane_role",
+        "thread_role",
+        "role_kind",
+        "agent_kind",
+        "agent_type",
+        "thread_source",
+        "role",
+    ):
+        supplied = supplied or key in payload
+        marker = _safe_marker(payload.get(key))
+        if marker in _WORKER_MARKERS or marker.endswith("-worker"):
+            return WORKER
+        if marker in _ROOT_MARKERS:
+            return ROOT_OR_LEGACY
+    source = _mapping(payload.get("source"))
+    if source is not None and "subagent" in source:
+        # Session metadata represents thread source as a tagged mapping.  Key
+        # presence is sufficient; never inspect or export its nested payload.
+        return WORKER
+    for key in ("agent", "worker_metadata", "metadata"):
+        nested = _mapping(payload.get(key))
+        if nested is not None:
+            role = _role_from_mapping(nested, _depth=_depth + 1)
+            if role is not None:
+                return role
+    return ROOT_OR_LEGACY if supplied else None
+
+
+def _task_family_value(value: Any) -> str | None:
+    marker = _safe_marker(value)
+    if not marker:
+        return None
+    return _TASK_FAMILY_ALIASES.get(marker)
+
+
+def _task_family_from_mapping(
+    payload: Mapping[str, Any], *, _depth: int = 0
+) -> str | None:
+    """Read only fixed task-family metadata and discard all raw task labels."""
+
+    if _depth > 3:
+        return "other"
+    for key in (
+        "task_family",
+        "task_packet_family",
+        "task_kind",
+        "task_type",
+        "family",
+        "task_family_name",
+    ):
+        family = _task_family_value(payload.get(key))
+        if family is not None:
+            return family
+        if key in payload and payload.get(key) is not None:
+            # An explicitly supplied but unknown family is still a measured
+            # event in the bounded ``other`` bucket.
+            return "other"
+    for key in ("task", "task_packet", "packet"):
+        nested = _mapping(payload.get(key))
+        if nested is None:
+            if key in payload and payload.get(key) is not None:
+                return "other"
+            continue
+        family = _task_family_from_mapping(nested, _depth=_depth + 1)
+        if family is not None:
+            return family
+    return None
+
+
+def _metadata_update(
+    payload: Mapping[str, Any], role: str, task_family: str
+) -> tuple[str, str]:
+    role_value = _role_from_mapping(payload)
+    family_value = _task_family_from_mapping(payload)
+    if role_value is not None:
+        role = role_value
+    if family_value is not None:
+        task_family = family_value
+    return role, task_family
+
+
 def _round(value: float) -> float:
     return round(value, 6)
 
@@ -242,6 +422,14 @@ def _per_hour(value: int | None, period: Period) -> float | None:
     if value is None or period.duration_seconds <= 0:
         return None
     return _round(value * 3600 / period.duration_seconds)
+
+
+def _per_usage_event(value: int | None, usage_events: int) -> float | None:
+    """Return a token average without treating missing counters as zero."""
+
+    if value is None or usage_events <= 0:
+        return None
+    return _round(value / usage_events)
 
 
 def _is_link_or_reparse(path: Path) -> bool:
@@ -361,13 +549,50 @@ def _period_from_datetimes(start: datetime, end: datetime) -> Period:
     return period
 
 
+def _group_rows(
+    grouped: Mapping[tuple[str, ...], UsageTotals], period: Period, labels: tuple[str, ...]
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for key, usage in sorted(grouped.items()):
+        rows.append(
+            {
+                **dict(zip(labels, key)),
+                **usage.as_dict(period),
+            }
+        )
+    return rows
+
+
+def _shares(counts: Mapping[str, int]) -> dict[str, float]:
+    total = sum(counts.values())
+    if total <= 0:
+        return {}
+    return {
+        label: _round(count / total)
+        for label, count in sorted(counts.items())
+        if count > 0
+    }
+
+
+def _mix_from_rows(rows: Iterable[Mapping[str, Any]], label: str) -> dict[str, float]:
+    counts: dict[str, int] = defaultdict(int)
+    for row in rows:
+        value = row.get(label)
+        events = row.get("usage_events")
+        if isinstance(value, str) and type(events) is int and events > 0:
+            counts[value] += events
+    return _shares(counts)
+
+
 def collect(sessions_root: Path, *, start: datetime, end: datetime) -> dict[str, Any]:
     """Aggregate one explicit period from session JSONL without writing anything."""
 
     period = _period_from_datetimes(start, end)
     stats = ScanStats()
     total = UsageTotals()
-    by_context: dict[tuple[str, str], UsageTotals] = {}
+    by_model_effort: dict[tuple[str, str], UsageTotals] = {}
+    by_root_worker: dict[tuple[str], UsageTotals] = {}
+    by_task_family: dict[tuple[str], UsageTotals] = {}
     weekly_observations: list[RateObservation] = []
     for path in _session_files(sessions_root, period):
         stats.files_seen += 1
@@ -381,6 +606,8 @@ def collect(sessions_root: Path, *, start: datetime, end: datetime) -> dict[str,
             continue
         model = "unknown"
         effort = "unknown"
+        root_worker = ROOT_OR_LEGACY
+        task_family = "other"
         with handle:
             stats.files_read += 1
             for line in handle:
@@ -390,7 +617,7 @@ def collect(sessions_root: Path, *, start: datetime, end: datetime) -> dict[str,
                     continue
                 try:
                     entry = json.loads(line)
-                except json.JSONDecodeError:
+                except (json.JSONDecodeError, RecursionError):
                     stats.malformed_lines += 1
                     continue
                 if not isinstance(entry, Mapping):
@@ -404,6 +631,19 @@ def collect(sessions_root: Path, *, start: datetime, end: datetime) -> dict[str,
                         model = _safe_model(payload.get("model"))
                     if "effort" in payload:
                         effort = _safe_effort(payload.get("effort"))
+                # Metadata is intentionally read only from structured
+                # turn/session/event payloads; response/tool content is never
+                # inspected for classification.
+                if entry.get("type") in {"turn_context", "session_meta", "event_msg"}:
+                    root_worker, task_family = _metadata_update(
+                        payload, root_worker, task_family
+                    )
+                    for metadata_key in ("metadata", "agent", "worker_metadata"):
+                        metadata = _mapping(payload.get(metadata_key))
+                        if metadata is not None:
+                            root_worker, task_family = _metadata_update(
+                                metadata, root_worker, task_family
+                            )
                 timestamp = _log_timestamp(entry.get("timestamp"))
                 if timestamp is None:
                     stats.invalid_timestamps += 1
@@ -415,17 +655,40 @@ def collect(sessions_root: Path, *, start: datetime, end: datetime) -> dict[str,
                 usage = _mapping(info.get("last_token_usage")) if info else None
                 if usage is not None:
                     if total.add(usage):
-                        context = by_context.setdefault((model, effort), UsageTotals())
-                        context.add(usage)
+                        by_model_effort.setdefault((model, effort), UsageTotals()).add(
+                            usage
+                        )
+                        by_root_worker.setdefault((root_worker,), UsageTotals()).add(
+                            usage
+                        )
+                        by_task_family.setdefault((task_family,), UsageTotals()).add(
+                            usage
+                        )
                     else:
                         stats.invalid_usage_events += 1
                 observation = _weekly_observation(payload, timestamp)
                 if observation is not None:
                     weekly_observations.append(observation)
                     stats.rate_observations += 1
-    groups = []
-    for (model, effort), usage in sorted(by_context.items()):
-        groups.append({"model": model, "effort": effort, **usage.as_dict(period)})
+    model_effort_rows = _group_rows(
+        by_model_effort, period, ("model", "effort")
+    )
+    root_worker_rows = _group_rows(by_root_worker, period, ("root_worker",))
+    task_family_rows = _group_rows(by_task_family, period, ("task_family",))
+    usage = total.as_dict(period)
+    usage.update(
+        {
+            "by_model_effort": model_effort_rows,
+            "by_root_worker": root_worker_rows,
+            "by_task_family": task_family_rows,
+            "mix": {
+                "model": _mix_from_rows(model_effort_rows, "model"),
+                "effort": _mix_from_rows(model_effort_rows, "effort"),
+                "root_worker": _mix_from_rows(root_worker_rows, "root_worker"),
+                "task_family": _mix_from_rows(task_family_rows, "task_family"),
+            },
+        }
+    )
     return {
         "schema": 1,
         "measurement_kind": "passive_local_session_log_aggregate",
@@ -438,7 +701,7 @@ def collect(sessions_root: Path, *, start: datetime, end: datetime) -> dict[str,
             "duration_seconds": int(period.duration_seconds),
         },
         "scan": stats.as_dict(),
-        "usage": {**total.as_dict(period), "by_model_effort": groups},
+        "usage": usage,
         "weekly_limit": _weekly_summary(weekly_observations),
     }
 
@@ -462,19 +725,136 @@ def _metric_change(baseline: Any, candidate: Any) -> dict[str, Any]:
     }
 
 
-def _one_weekly_rate(report: Mapping[str, Any]) -> float | None:
+def _reset_bucket(value: Any) -> int | None:
+    if isinstance(value, str):
+        timestamp = _log_timestamp(value)
+        return None if timestamp is None else int(timestamp.timestamp() // 60 * 60)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    if not math.isfinite(number) or number < 0:
+        return None
+    return int(round(number / 60) * 60)
+
+
+def _one_weekly_rate(report: Mapping[str, Any]) -> tuple[float, int] | None:
     weekly_limit = _mapping(report.get("weekly_limit"))
     windows = weekly_limit.get("windows") if weekly_limit else None
-    if not isinstance(windows, list):
+    if not isinstance(windows, list) or len(windows) != 1:
         return None
-    measured = [
-        item.get("used_percent_per_hour")
-        for item in windows
-        if isinstance(item, Mapping)
-        and item.get("status") == "MEASURED"
-        and isinstance(item.get("used_percent_per_hour"), (int, float))
-    ]
-    return float(measured[0]) if len(measured) == 1 else None
+    item = windows[0]
+    if not isinstance(item, Mapping) or item.get("status") != "MEASURED":
+        return None
+    value = item.get("used_percent_per_hour")
+    bucket = _reset_bucket(item.get("reset_at", item.get("reset_bucket")))
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or bucket is None
+    ):
+        return None
+    return float(value), bucket
+
+
+def _normalise_mix(value: Any, *, allowed: set[str] | None = None) -> dict[str, float] | None:
+    if not isinstance(value, Mapping):
+        return None
+    weights: dict[str, float] = {}
+    for label, weight in value.items():
+        if not isinstance(label, str) or (allowed is not None and label not in allowed):
+            return None
+        if isinstance(weight, bool) or not isinstance(weight, (int, float)):
+            return None
+        number = float(weight)
+        if not math.isfinite(number) or number < 0:
+            return None
+        weights[label] = number
+    total = sum(weights.values())
+    if total <= 0:
+        return None
+    return {label: weight / total for label, weight in weights.items() if weight > 0}
+
+
+def _report_mix(
+    usage: Mapping[str, Any], dimension: str, *, allowed: set[str] | None = None
+) -> dict[str, float] | None:
+    mix = _mapping(usage.get("mix"))
+    if mix is not None and dimension in mix:
+        return _normalise_mix(mix.get(dimension), allowed=allowed)
+    rows = usage.get(
+        {
+            "model": "by_model_effort",
+            "effort": "by_model_effort",
+            "model_effort": "by_model_effort",
+            "root_worker": "by_root_worker",
+            "task_family": "by_task_family",
+        }.get(dimension, "")
+    )
+    if not isinstance(rows, list):
+        return None
+    counts: dict[str, int] = defaultdict(int)
+    for row in rows:
+        if not isinstance(row, Mapping):
+            return None
+        events = row.get("usage_events")
+        if type(events) is not int or events < 0:
+            return None
+        if dimension == "model_effort":
+            model = row.get("model")
+            effort = row.get("effort")
+            if not isinstance(model, str) or not isinstance(effort, str):
+                return None
+            item = f"{model}\x1f{effort}"
+        else:
+            label = "root_worker" if dimension == "root_worker" else dimension
+            item = row.get(label)
+            if not isinstance(item, str):
+                return None
+            if allowed is not None and item not in allowed:
+                return None
+        counts[item] += events
+    return _normalise_mix(counts)
+
+
+def _mix_reason(
+    baseline_usage: Mapping[str, Any],
+    candidate_usage: Mapping[str, Any],
+    dimension: str,
+    code: str,
+    *,
+    allowed: set[str] | None = None,
+    uninformative: set[str] | None = None,
+) -> str | None:
+    baseline_mix = _report_mix(baseline_usage, dimension, allowed=allowed)
+    candidate_mix = _report_mix(candidate_usage, dimension, allowed=allowed)
+    if baseline_mix is None or candidate_mix is None:
+        return f"MISSING_{code}"
+    if uninformative is not None and (
+        set(baseline_mix) & uninformative
+        or set(candidate_mix) & uninformative
+    ):
+        return f"MISSING_{code}"
+    labels = set(baseline_mix) | set(candidate_mix)
+    if any(
+        abs(baseline_mix.get(label, 0.0) - candidate_mix.get(label, 0.0))
+        > MIX_TOLERANCE
+        for label in labels
+    ):
+        return f"{code}_MISMATCH"
+    return None
+
+
+def _weekly_comparison_metric(
+    baseline: Mapping[str, Any], candidate: Mapping[str, Any]
+) -> dict[str, Any]:
+    baseline_rate = _one_weekly_rate(baseline)
+    candidate_rate = _one_weekly_rate(candidate)
+    if baseline_rate is None or candidate_rate is None:
+        return _metric_change(None, None)
+    if baseline_rate[1] != candidate_rate[1]:
+        return _metric_change(None, None)
+    return _metric_change(baseline_rate[0], candidate_rate[0])
 
 
 def compare(baseline: Mapping[str, Any], candidate: Mapping[str, Any]) -> dict[str, Any]:
@@ -484,6 +864,105 @@ def compare(baseline: Mapping[str, Any], candidate: Mapping[str, Any]) -> dict[s
     candidate_usage = _mapping(candidate.get("usage")) or {}
     baseline_rates = _mapping(baseline_usage.get("rates_per_hour")) or {}
     candidate_rates = _mapping(candidate_usage.get("rates_per_hour")) or {}
+    reasons = [
+        reason
+        for reason in (
+            _mix_reason(
+                baseline_usage,
+                candidate_usage,
+                "model",
+                "MODEL_MIX",
+                uninformative={"unknown"},
+            ),
+            _mix_reason(
+                baseline_usage,
+                candidate_usage,
+                "effort",
+                "EFFORT_MIX",
+                uninformative={"unknown"},
+            ),
+            _mix_reason(
+                baseline_usage,
+                candidate_usage,
+                "model_effort",
+                "MODEL_EFFORT_MIX",
+            ),
+            _mix_reason(
+                baseline_usage,
+                candidate_usage,
+                "root_worker",
+                "ROOT_WORKER_MIX",
+                allowed=set(ROOT_WORKER_CLASSES),
+            ),
+            _mix_reason(
+                baseline_usage,
+                candidate_usage,
+                "task_family",
+                "TASK_FAMILY_MIX",
+                allowed=set(TASK_FAMILIES),
+                uninformative={"other"},
+            ),
+        )
+        if reason is not None
+    ]
+    baseline_per_event = _mapping(
+        baseline_usage.get("rates_per_usage_event")
+    ) or {}
+    candidate_per_event = _mapping(
+        candidate_usage.get("rates_per_usage_event")
+    ) or {}
+    if reasons:
+        metrics = {
+            name: _metric_change(None, None)
+            for name in (
+                "usage_events_per_hour",
+                "input_tokens_per_usage_event",
+                "uncached_input_tokens_per_usage_event",
+                "uncached_input_tokens_per_hour",
+                "output_tokens_per_hour",
+                "cache_hit_ratio",
+                "weekly_used_percent_per_hour",
+            )
+        }
+    else:
+        metrics = {
+            "usage_events_per_hour": _metric_change(
+                baseline_rates.get("usage_events"),
+                candidate_rates.get("usage_events"),
+            ),
+            "input_tokens_per_usage_event": _metric_change(
+                baseline_per_event.get("input_tokens"),
+                candidate_per_event.get("input_tokens"),
+            ),
+            "uncached_input_tokens_per_usage_event": _metric_change(
+                baseline_per_event.get("uncached_input_tokens"),
+                candidate_per_event.get("uncached_input_tokens"),
+            ),
+            "uncached_input_tokens_per_hour": _metric_change(
+                baseline_rates.get("uncached_input_tokens"),
+                candidate_rates.get("uncached_input_tokens"),
+            ),
+            "output_tokens_per_hour": _metric_change(
+                baseline_rates.get("output_tokens"),
+                candidate_rates.get("output_tokens"),
+            ),
+            "cache_hit_ratio": _metric_change(
+                baseline_usage.get("cache_hit_ratio"),
+                candidate_usage.get("cache_hit_ratio"),
+            ),
+            "weekly_used_percent_per_hour": _weekly_comparison_metric(
+                baseline, candidate
+            ),
+        }
+    comparison: dict[str, Any] = {
+        "status": "COMPARABLE" if not reasons else "NOT_COMPARABLE",
+        "reason_codes": reasons,
+        "metrics": metrics,
+        "notes": [
+            "Quota percentage and raw token counters are different measures.",
+            "Composition is compared by usage-event share with a fixed 10 percentage-point tolerance.",
+        ],
+    }
     return {
         "schema": 1,
         "measurement_kind": "passive_local_session_log_comparison",
@@ -493,30 +972,7 @@ def compare(baseline: Mapping[str, Any], candidate: Mapping[str, Any]) -> dict[s
         "interpretation": "OBSERVATIONAL_ONLY",
         "baseline": baseline,
         "candidate": candidate,
-        "comparison": {
-            "metrics": {
-                "usage_events_per_hour": _metric_change(
-                    baseline_rates.get("usage_events"), candidate_rates.get("usage_events")
-                ),
-                "uncached_input_tokens_per_hour": _metric_change(
-                    baseline_rates.get("uncached_input_tokens"),
-                    candidate_rates.get("uncached_input_tokens"),
-                ),
-                "output_tokens_per_hour": _metric_change(
-                    baseline_rates.get("output_tokens"), candidate_rates.get("output_tokens")
-                ),
-                "cache_hit_ratio": _metric_change(
-                    baseline_usage.get("cache_hit_ratio"), candidate_usage.get("cache_hit_ratio")
-                ),
-                "weekly_used_percent_per_hour": _metric_change(
-                    _one_weekly_rate(baseline), _one_weekly_rate(candidate)
-                ),
-            },
-            "notes": [
-                "Quota percentage and raw token counters are different measures.",
-                "Compare matching model, effort, and task mix before attributing change to policy.",
-            ],
-        },
+        "comparison": comparison,
     }
 
 

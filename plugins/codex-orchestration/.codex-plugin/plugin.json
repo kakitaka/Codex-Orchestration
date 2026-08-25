@@ -1,6 +1,6 @@
 {
   "name": "codex-orchestration",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "description": "Give Codex and audited external models safe, provider-pinned roles.",
   "author": {
     "name": "CJ Zafir",
@@ -36,7 +36,7 @@
       "Efficient execution"
     ],
     "defaultPrompt": [
-      "$codex-orchestration:codex-orchestration setup preset: Terra-Luna-Sol Escalation",
+      "$codex-orchestration:codex-orchestration setup preset: Terra-Luna-Sol Escalation; token profile: lean",
       "$codex-orchestration:codex-orchestration --update",
       "$codex-orchestration:codex-orchestration Planner: Claude Fable 5 High, Designer: Kimi K3"
     ]

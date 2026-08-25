@@ -140,6 +140,23 @@ class BoundedResult:
             "log_error": self.log_error,
         }
 
+    def to_compact_dict(self) -> dict[str, object]:
+        """Return the CLI compact shape without exact boundary copies.
+
+        ``to_dict`` remains the compatibility shape for Python callers and
+        the default CLI output.  The opt-in format omits a combined boundary
+        only when the same value remains in a per-stream boundary.  Mixed
+        stdout/stderr ordering is therefore retained when it adds evidence.
+        """
+        payload = self.to_dict()
+        for combined, stdout_key, stderr_key in (
+            ("first", "stdout_first", "stderr_first"),
+            ("last", "stdout_last", "stderr_last"),
+        ):
+            if payload[combined] in {payload[stdout_key], payload[stderr_key]}:
+                payload.pop(combined)
+        return payload
+
     # Mapping-like access keeps the result convenient for callers that prefer
     # result["exit_category"] over result.exit_category.
     def __getitem__(self, key: str) -> object:
@@ -1607,6 +1624,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-bytes", type=int, default=DEFAULT_MAX_BYTES)
     parser.add_argument("--head-bytes", type=int, default=None)
     parser.add_argument("--tail-bytes", type=int, default=None)
+    parser.add_argument(
+        "--compact-json",
+        action="store_true",
+        help="omit combined first/last fields when a stream field is identical",
+    )
     parser.add_argument("--log-path")
     parser.add_argument("--root")
     parser.add_argument("--state-root")
@@ -1634,7 +1656,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         state_root=args.state_root,
         secrets=args.secret,
     )
-    sys.stdout.write(json.dumps(result.to_dict(), ensure_ascii=False, sort_keys=True) + "\n")
+    payload = result.to_compact_dict() if args.compact_json else result.to_dict()
+    json_kwargs: dict[str, object] = {"ensure_ascii": False, "sort_keys": True}
+    if args.compact_json:
+        json_kwargs["separators"] = (",", ":")
+    sys.stdout.write(json.dumps(payload, **json_kwargs) + "\n")
     return 0 if result.exit_category == "ok" else 1
 
 

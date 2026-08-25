@@ -137,7 +137,7 @@ class SkillContractTests(unittest.TestCase):
         self.assertIn(prompt, SKILL)
         self.assertIn(prompt, README)
         self.assertIn("--preset terra-luna-sol-escalation", SKILL)
-        self.assertIn("gpt-5.6-terra` at `max`", SKILL)
+        self.assertIn("gpt-5.6-terra` at `medium`", SKILL)
         self.assertIn("gpt-5.6-luna` at `max`", SKILL)
         self.assertIn("gpt-5.6-sol` at `max`", SKILL)
         self.assertIn("Ordinary work has no Advisor approval loop", SKILL)

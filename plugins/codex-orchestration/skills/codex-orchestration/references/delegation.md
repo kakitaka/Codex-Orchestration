@@ -49,4 +49,4 @@ User choices, applicable `AGENTS.md`, and configured routes always outrank this 
 
 Prefer targeted commands, `--stat`, `--name-only`, short tracebacks, focused `rg`, and relevant line ranges. Do not put recursive listings, full diffs/logs, verbose tests, huge JSON, or full source files into history.
 
-Use `bounded_run.py` for noisy commands. Default keeps no full log. Optional local diagnostic logs are redacted, capped, contained, ignored by Git, and represented to the model only by error/category, bounded first/last context, and relative path.
+Use `bounded_run.py --compact-json` for noisy model-facing commands. It omits duplicate combined stream boundaries; the default JSON remains for compatibility. Default keeps no full log. Optional local diagnostic logs are redacted, capped, contained, ignored by Git, and represented to the model only by error/category, bounded first/last context, and relative path.

@@ -63,8 +63,15 @@ Results depend on the models, task, context, retries, and available parallel wor
 
 ## Token-efficient operation
 
-Version 0.11.0 keeps the same root/Planner/Advisor/Designer/Executor contracts but
-loads only a small stable Skill router plus references needed by the current
+Version 0.12.0 keeps the same root/Planner/Advisor/Designer/Executor boundaries,
+uses Terra Medium instead of Max as the normal preset root expectation, and
+enforces a compact generated-policy budget. The saved Luna Max worker and Sol Max
+high-risk escalation remain unchanged. The passive report marks mismatched task,
+model, effort, or root/worker mixes non-comparable and refuses quota-rate deltas
+unless reset buckets match, instead of implying causation.
+
+Version 0.11.0 introduced the small stable Skill router. It loads only that
+router plus references needed by the current
 operation. Cross-model children receive deterministic repository-relative
 `TASK_PACKET_V1` packets with `fork_turns="none"`, never a full conversation fork.
 
@@ -111,14 +118,14 @@ Start an ordinary Codex prompt with the literal skill label
 not terminal commands. You can also browse installed skills with Codex's built-in
 `/skills` discovery.
 
-Use the Terra–Luna–Sol escalation profile when the task root is Terra at Max,
+Use the Terra–Luna–Sol escalation profile when the normal task root is Terra at Medium,
 Luna implements at Max, and Sol must remain outside ordinary planning:
 
 ```text
-$codex-orchestration:codex-orchestration setup preset: Terra-Luna-Sol Escalation
+$codex-orchestration:codex-orchestration setup preset: Terra-Luna-Sol Escalation; token profile: lean
 ```
 
-Start the next task with **GPT-5.6 Terra** at **Max** in Codex's normal model
+Start the next task with **GPT-5.6 Terra** at **Medium** in Codex's normal model
 picker. The profile cannot persist or prove the root selection. It persists
 **GPT-5.6 Luna @ Max** as Executor; Planner, Advisor, and Designer remain unset.
 To make Luna callable through the saved default-subagent route, it reversibly sets

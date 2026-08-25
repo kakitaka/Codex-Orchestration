@@ -588,13 +588,18 @@ class NativeRoutingTests(unittest.TestCase):
             preset=NATIVE.TERRA_LUNA_SOL_ESCALATION_PRESET,
         )
 
+        self.assertNotIn("Token profile lean", mode)
+        self.assertIn("Token profile lean", usage)
+        self.assertIn("packet soft/hard 3000/6000", usage)
+        self.assertIn("wave soft/hard 12000/20000", usage)
+        self.assertIn("not worker count", usage)
         for policy in (mode, usage):
-            self.assertIn("Token profile lean", policy)
-            self.assertIn("packet soft/hard token budgets 3000/6000", policy)
-            self.assertIn("wave soft/hard token budgets 12000/20000", policy)
-            self.assertIn("This profile does not cap worker count", policy)
             self.assertNotIn("Advisor review limit", policy)
             self.assertNotIn("blocks approval", policy)
+        self.assertLessEqual(
+            len(mode.encode("utf-8")) + len(usage.encode("utf-8")),
+            NATIVE.PRESET_POLICY_MAX_BYTES,
+        )
 
     def test_terra_luna_sol_preset_policy_is_escalation_only(self) -> None:
         executor = {
@@ -610,11 +615,11 @@ class NativeRoutingTests(unittest.TestCase):
             preset=NATIVE.TERRA_LUNA_SOL_ESCALATION_PRESET,
         )
 
-        self.assertIn("expects gpt-5.6-terra@max", mode)
-        self.assertIn("not runtime verification", mode)
+        self.assertIn("expects gpt-5.6-terra@medium", mode)
+        self.assertIn("runtime verification", mode)
         self.assertIn("no Advisor approval loop", mode)
         self.assertIn("must not invoke gpt-5.6-sol", mode)
-        self.assertIn("public API or backward-compatibility risk", mode)
+        self.assertIn("public API or backward-compatibility risk", mode + usage)
         self.assertIn("no worker or concurrency limit", mode)
         self.assertNotIn("fresh self-contained review call", mode)
         self.assertNotIn("PLAN_REVISE", mode)
@@ -625,6 +630,12 @@ class NativeRoutingTests(unittest.TestCase):
         self.assertNotIn("For an advisor review", usage)
         self.assertIn("omit model and reasoning_effort", usage)
         self.assertNotIn('model = "gpt-5.6-luna"', usage)
+        self.assertIn("verify same-provider identity", usage)
+        self.assertIn("provider-pinned custom agent", usage)
+        self.assertLessEqual(
+            len(mode.encode("utf-8")) + len(usage.encode("utf-8")),
+            NATIVE.PRESET_POLICY_MAX_BYTES,
+        )
 
     def test_preset_setup_status_and_disable_preserve_concurrency(self) -> None:
         preview = self.run_script("--preset", NATIVE.TERRA_LUNA_SOL_ESCALATION_PRESET)

@@ -1,6 +1,19 @@
 # Changelog
 
-## 0.11.0 — Unreleased
+## 0.12.0 — Unreleased
+
+- Compress the always-loaded Terra-Luna-Sol native policy from about 6.0 KiB to
+  under 3.2 KiB, keep route/security boundaries intact, and enforce the
+  generated-policy byte budget in deterministic regression checks.
+- Make Terra Medium the normal root expectation instead of Max. Explicit model
+  and effort choices still win; Luna Max remains the saved bounded-worker route,
+  and Sol Max remains escalation-only.
+- Add free passive post-deployment comparison with per-event and bounded task-mix
+  strata, fail-closed comparability labels, and reset-bucket-safe quota reporting.
+- Add an opt-in compact bounded-run JSON projection that removes exact duplicate
+  combined stream boundaries without breaking the existing API or default CLI.
+
+## 0.11.0 — 2026-08-20
 
 - Replace the always-loaded 56 KB orchestration Skill with a sub-12 KiB stable
   router and operation-specific references while retaining the full published

@@ -56,12 +56,13 @@ except ModuleNotFoundError as exc:  # pragma: no cover - Python < 3.11
     raise SystemExit("Python 3.11 or newer is required (missing tomllib).") from exc
 
 
-PLUGIN_VERSION = "0.11.0"
+PLUGIN_VERSION = "0.12.0"
 POLICY_VERSION = 8
 STATE_SCHEMA = 8
 TOKEN_PROFILE_STATE_SCHEMA = 6
 PROFILE_STATE_SCHEMA = 6  # public compatibility constant used by token lint
 PRESET_STATE_SCHEMA = 7
+PRESET_POLICY_MAX_BYTES = 3_200
 ADVISOR_REVIEW_LIMIT = 8
 STATE_FILENAME = ".codex-orchestration-routing.json"
 PROBE_VALUE = "CODEX_ORCHESTRATION_CAPABILITY_PROBE"
@@ -608,7 +609,7 @@ class AppServer:
                     "clientInfo": {
                         "name": "codex_orchestration_installer",
                         "title": "Codex Orchestration Installer",
-                        "version": "0.11.0",
+                        "version": "0.12.0",
                     },
                     "capabilities": {"experimentalApi": True},
                 },
@@ -1284,6 +1285,54 @@ def _spawn_route(route: dict[str, Any]) -> str:
     )
 
 
+def _build_escalation_preset_policy(
+    profile: TokenProfile,
+    *,
+    include_profile: bool,
+) -> tuple[str, str]:
+    """Render the always-loaded preset without generic unused-seat prose."""
+
+    mode = f"""{MANAGED_MARKER}
+This is routing guidance for Codex multi-agent tools, not a second scheduler.
+
+If you are the root task model, you are the orchestrator. Own intent, planning, architecture, decomposition, integration, review, final validation, Executor release, and the user-facing answer. Codex still decides whether a plan or subagent helps; keep simple, tightly coupled, or context-heavy work at root.
+
+Preset {TERRA_LUNA_SOL_ESCALATION_PRESET} expects {TERRA_LUNA_SOL_ESCALATION_ROOT_MODEL}@{TERRA_LUNA_SOL_ESCALATION_ROOT_EFFORT} for a normal task start. This is neither persisted nor runtime verification. No Planner, Advisor, Designer, or Finalizer seat is configured; root owns those functions. Normal work has no Advisor approval loop and must not invoke {TERRA_LUNA_SOL_ESCALATION_ADVISOR_MODEL}; its exceptional route is defined in the usage hint.
+
+Delegate only independent work that materially improves speed, cost, quality, or context isolation. Use the saved {TERRA_LUNA_SOL_ESCALATION_EXECUTOR_MODEL}@{TERRA_LUNA_SOL_ESCALATION_EXECUTOR_EFFORT} default and a bounded self-contained packet. The preset imposes no worker or concurrency limit.
+
+Explicit user instructions win, including model, effort, agent, or no-subagents choices. This policy does not create a Goal, weaken approvals, alter permissions, or force delegation.
+
+All children are root-directed: stay inside owned scope, report only to root, never spawn descendants, contact other seats, redesign the root plan, or release Executor."""
+
+    profile_line = ""
+    if include_profile:
+        profile_line = (
+            f"\n\nToken profile {profile.name}: packet soft/hard "
+            f"{profile.packet_soft_tokens}/{profile.packet_hard_tokens}; wave "
+            f"soft/hard {profile.wave_soft_tokens}/{profile.wave_hard_tokens}. "
+            "Budgets govern packets and waves, not worker count."
+        )
+    usage = f"""{MANAGED_MARKER}
+Apply these routes only to children the root chooses.
+
+Executor: explicit user and applicable AGENTS route choices win. Otherwise call the exposed spawn tool with fork_turns = "none" and omit model and reasoning_effort so the saved Luna default resolves. Send only objective, known facts, constraints, owned files or read-only scope, dependencies, acceptance criteria, validation, and expected handoff. Inspect every result before integration.
+
+Sol escalation: only for security/auth/secrets, DB schema or destructive migration, public API or backward-compatibility risk, cross-subsystem architecture, repeated implementation/test failures, unresolved root cause, high-risk release, or an explicit user request. Then root may make one fresh Advisor call with model = {json.dumps(TERRA_LUNA_SOL_ESCALATION_ADVISOR_MODEL)}, reasoning_effort = {json.dumps(TERRA_LUNA_SOL_ESCALATION_ADVISOR_EFFORT)}, fork_turns = "none". Immediately before that call, verify the same provider and current callable capability; if either fails, report unavailable and never substitute another model.
+
+No Planner, Advisor, or Designer route is configured. Direct model overrides retain the root provider. Before one, verify same-provider identity; if unknown or different, require a provider-pinned custom agent. Never combine a full-history fork with model, reasoning_effort, or agent_type; it inherits the root route. Never silently substitute a requested route. Explicit current-task choices win.
+
+If you are a spawned child, finish only the supplied packet, report to root, and never call planning tools or create descendants.{profile_line}"""
+
+    size = len(mode.encode("utf-8")) + len(usage.encode("utf-8"))
+    if size > PRESET_POLICY_MAX_BYTES:
+        raise ConfigurationError(
+            f"Generated preset policy is {size} bytes; limit is "
+            f"{PRESET_POLICY_MAX_BYTES}."
+        )
+    return mode, usage
+
+
 def build_policy(
     executor: dict[str, Any],
     planner: dict[str, Any] | None,
@@ -1340,8 +1389,6 @@ def build_policy(
         if has_direct_route
         else "Configured custom agents and MCP seats own their provider routes."
     )
-    preset_mode = ""
-    preset_usage = ""
     if preset is not None:
         if preset != TERRA_LUNA_SOL_ESCALATION_PRESET:
             raise ConfigurationError(f"Unsupported routing preset: {preset!r}.")
@@ -1357,16 +1404,12 @@ def build_policy(
             or designer is not None
         ):
             raise ConfigurationError("Preset routes do not match their sealed contract.")
-        preset_mode = f"""Preset {TERRA_LUNA_SOL_ESCALATION_PRESET} expects {TERRA_LUNA_SOL_ESCALATION_ROOT_MODEL}@{TERRA_LUNA_SOL_ESCALATION_ROOT_EFFORT} as the task-start root. This expectation is not persisted as a root setting and is not runtime verification.
-
-Normal work has no Advisor approval loop and must not invoke {TERRA_LUNA_SOL_ESCALATION_ADVISOR_MODEL}. A fresh {TERRA_LUNA_SOL_ESCALATION_ADVISOR_MODEL}@{TERRA_LUNA_SOL_ESCALATION_ADVISOR_EFFORT} Advisor may be used only for security, authentication, or secret handling; DB schema or destructive migration; public API or backward-compatibility risk; cross-subsystem architecture change; repeated implementation or test failures; unresolved root cause; high-risk release; or explicit user request. This is an instruction-guided escalation route, not a persisted Advisor seat or technical access-control boundary.
-
-The preset enables Codex multi-agent tools and saves {TERRA_LUNA_SOL_ESCALATION_EXECUTOR_MODEL}@{TERRA_LUNA_SOL_ESCALATION_EXECUTOR_EFFORT} as the default subagent route. That default is same-provider only, is not an allowlist, and does not prove a live child until one is spawned without an explicit model or effort override.
-
-The preset imposes no worker or concurrency limit. It does not add, remove, or change platform or user concurrency settings."""
-        preset_usage = f"""Preset {TERRA_LUNA_SOL_ESCALATION_PRESET}: Codex resolves delegated implementation to the saved {TERRA_LUNA_SOL_ESCALATION_EXECUTOR_MODEL}@{TERRA_LUNA_SOL_ESCALATION_EXECUTOR_EFFORT} default. Do not invoke {TERRA_LUNA_SOL_ESCALATION_ADVISOR_MODEL} during normal planning.
-
-Only for security/auth/secrets, DB schema or destructive migration, public API or backward-compatibility risk, cross-subsystem architecture, repeated implementation/test failures, unresolved root cause, high-risk release, or an explicit user request, the root may create one fresh Advisor call with model = {json.dumps(TERRA_LUNA_SOL_ESCALATION_ADVISOR_MODEL)}, reasoning_effort = {json.dumps(TERRA_LUNA_SOL_ESCALATION_ADVISOR_EFFORT)}, fork_turns = \"none\". Immediately before that call, verify the same provider and current callable capability on the exposed child interface. If either check fails, report the route unavailable and never substitute another model."""
+        return _build_escalation_preset_policy(
+            profile,
+            include_profile=token_profile is not None,
+        )
+    preset_mode = ""
+    preset_usage = ""
     planner_mode = (
         "When a plan is needed, the configured Planner drafts it and handles any "
         "Advisor-requested revision. The root supplies a self-contained packet, owns "

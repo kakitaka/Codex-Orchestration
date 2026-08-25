@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from contextlib import redirect_stdout
 import importlib.util
 import io
+import json
 import math
 import os
 from pathlib import Path
@@ -112,6 +114,91 @@ class BoundedRunTests(unittest.TestCase):
                 for line in result.important_lines
             )
         )
+
+    def test_compact_json_cli_omits_combined_boundaries_and_preserves_fields(self) -> None:
+        code = (
+            "import sys; sys.stdout.write("
+            "'ERROR: secret-value-123 ' + 'x' * 256 + '\\n')"
+        )
+        common_args = [
+            "--max-bytes",
+            "1024",
+            "--head-bytes",
+            "32",
+            "--tail-bytes",
+            "32",
+            "--secret",
+            "secret-value-123",
+            "--",
+            sys.executable,
+            "-c",
+            code,
+        ]
+
+        full_stdout = io.StringIO()
+        with redirect_stdout(full_stdout):
+            self.assertEqual(bounded_run.main(common_args), 0)
+        full_text = full_stdout.getvalue()
+        full = json.loads(full_text)
+
+        compact_stdout = io.StringIO()
+        with redirect_stdout(compact_stdout):
+            self.assertEqual(bounded_run.main(["--compact-json", *common_args]), 0)
+        compact_text = compact_stdout.getvalue()
+        compact = json.loads(compact_text)
+
+        self.assertIn("first", full)
+        self.assertIn("last", full)
+        self.assertNotIn("first", compact)
+        self.assertNotIn("last", compact)
+        for field in (
+            "exit_category",
+            "exit_code",
+            "truncated",
+            "bytes_seen",
+            "stdout_first",
+            "stdout_last",
+            "stderr_first",
+            "stderr_last",
+            "important_lines",
+            "log_path",
+            "log_error",
+        ):
+            self.assertIn(field, compact)
+            self.assertEqual(compact[field], full[field])
+        self.assertTrue(any("ERROR:" in line for line in compact["important_lines"]))
+        self.assertNotIn("secret-value-123", compact_text)
+        self.assertLess(len(compact_text.encode("utf-8")), len(full_text.encode("utf-8")))
+
+    def test_to_dict_remains_full_compatibility_shape(self) -> None:
+        result = bounded_run.run_bounded(
+            [sys.executable, "-c", "print('stdout')"], timeout=5, max_bytes=1024
+        )
+        full = result.to_dict()
+        self.assertEqual(
+            result.to_compact_dict(),
+            {key: value for key, value in full.items() if key not in {"first", "last"}},
+        )
+        self.assertIn("first", full)
+        self.assertIn("last", full)
+
+    def test_compact_dict_retains_distinct_mixed_stream_boundaries(self) -> None:
+        result = bounded_run.BoundedResult(
+            exit_category="ok",
+            exit_code=0,
+            truncated=False,
+            first="out\nerr\n",
+            last="err\nout\n",
+            stdout_first="out\n",
+            stdout_last="out\n",
+            stderr_first="err\n",
+            stderr_last="err\n",
+            bytes_seen=8,
+        )
+        full = result.to_dict()
+        compact = result.to_compact_dict()
+        for field in ("first", "last"):
+            self.assertEqual(compact[field], full[field])
 
     def test_oversized_secret_is_rejected_before_process_launch(self) -> None:
         with mock.patch.object(bounded_run.subprocess, "Popen") as popen:

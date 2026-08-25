@@ -409,7 +409,7 @@ _MAX_RE = re.compile(
     r"--(?:reasoning-)?effort\s+|\b(?:default|value)\s*[:=]\s*)[\"']?(max|xhigh)\b"
 )
 _REVIEWED_PRESET_MAX_RE = re.compile(
-    r'^TERRA_LUNA_SOL_ESCALATION_(?:ROOT|EXECUTOR|ADVISOR)_EFFORT = "max"$'
+    r'^TERRA_LUNA_SOL_ESCALATION_(?:EXECUTOR|ADVISOR)_EFFORT = "max"$'
 )
 _FORK_ALL_RE = re.compile(r"(?i)\bfork_turns?\b\s*[=:]\s*[\"']all[\"']")
 _FIXED_WORKER_RE = re.compile(
@@ -627,6 +627,25 @@ def _check_repository_contracts(
             routing_path,
             1 if advisor_limit is None else advisor_limit[1],
             "legacy and profile Advisor limits must remain explicit and bounded",
+        )
+    preset_policy_budget = (
+        _literal_assignment(routing_path, "PRESET_POLICY_MAX_BYTES")
+        if routing_tracked
+        else None
+    )
+    if (
+        preset_policy_budget is None
+        or type(preset_policy_budget[0]) is not int
+        or not 1_024 <= preset_policy_budget[0] <= 4_096
+        or "size > PRESET_POLICY_MAX_BYTES" not in routing_text
+    ):
+        _add(
+            findings,
+            "PRESET_POLICY_BUDGET",
+            root,
+            routing_path,
+            1 if preset_policy_budget is None else preset_policy_budget[1],
+            "generated always-loaded preset policy must enforce a 1-4 KiB byte budget",
         )
 
 

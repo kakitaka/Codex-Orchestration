@@ -32,7 +32,7 @@ The exact helper API chooses names and enforces containment. Lane data and its a
 
 ## Bounded commands
 
-Call `bounded_run.py` with an ordered argv, byte/time bounds, and no diagnostic-log option for normal work. Prefer targeted native command flags first. Enable a diagnostic log only for a concrete debugging need; its path must stay relative to the approved state root.
+Call `bounded_run.py --compact-json` with an ordered argv, byte/time bounds, and no diagnostic-log option for normal model-facing work. The compact projection omits duplicate combined stream boundaries; the default CLI shape remains available for compatibility. Prefer targeted native command flags first. Enable a diagnostic log only for a concrete debugging need; its path must stay relative to the approved state root.
 
 ## Hooks
 

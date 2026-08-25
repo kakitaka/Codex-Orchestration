@@ -79,7 +79,7 @@ Generate packets deterministically with repository-relative normalized paths and
 These are Codex prompts, not shell commands:
 
 ```text
-$codex-orchestration:codex-orchestration setup preset: Terra-Luna-Sol Escalation
+$codex-orchestration:codex-orchestration setup preset: Terra-Luna-Sol Escalation; token profile: lean
 $codex-orchestration:codex-orchestration setup executor: GPT-5.6 Luna Extra High
 $codex-orchestration:codex-orchestration setup planner: Claude Fable 5 High, advisor: GPT-5.6 Sol High, executor: GPT-5.6 Luna Extra High
 $codex-orchestration:codex-orchestration status
